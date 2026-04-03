@@ -59,7 +59,10 @@ pub async fn ping_server(
                 }
                 Ok(resp) => {
                     // Unsolicited response — drain and continue.
-                    tracing::debug!("Received out-of-order response id={}, expected id={id}", resp.id);
+                    tracing::debug!(
+                        "Received out-of-order response id={}, expected id={id}",
+                        resp.id
+                    );
                 }
                 Err(_) => {
                     // Non-JSON or notification line — drain and continue.
@@ -67,7 +70,9 @@ pub async fn ping_server(
                 }
             }
         }
-        Err(anyhow!("Too many non-matching lines from server during ping id={id}"))
+        Err(anyhow!(
+            "Too many non-matching lines from server during ping id={id}"
+        ))
     })
     .await;
 
