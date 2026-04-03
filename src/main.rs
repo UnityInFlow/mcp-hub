@@ -39,8 +39,8 @@ async fn main() -> anyhow::Result<()> {
             let states = output::collect_states_from_handles(&handles);
             output::print_status_table(&states, color);
 
-            // Block on Ctrl+C or SIGTERM (DMN-01).
-            wait_for_shutdown_signal().await?;
+            // Run the interactive foreground loop (stdin commands + shutdown signal).
+            run_foreground_loop(&handles, color).await?;
 
             tracing::info!("Shutting down all servers...");
             shutdown.cancel();
@@ -70,7 +70,147 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+/// Run the interactive foreground loop.
+///
+/// Concurrently reads commands from stdin and waits for a shutdown signal
+/// (Ctrl+C or SIGTERM). Typing `restart <name>` restarts the named server,
+/// `status` reprints the status table, and `help` lists all available commands.
+///
+/// When stdin is closed (e.g. piped input exhausted), the function falls back
+/// to waiting for a shutdown signal so the hub does not exit unexpectedly.
+async fn run_foreground_loop(
+    handles: &[supervisor::ServerHandle],
+    color: bool,
+) -> anyhow::Result<()> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let stdin = BufReader::new(tokio::io::stdin());
+    let mut lines = stdin.lines();
+
+    // Print a hint that commands are available.
+    eprintln!("Type 'help' for available commands, or press Ctrl+C to stop.");
+
+    // Run separate implementations per platform so that `tokio::select!` branches
+    // are uniform (cfg attributes are not supported inside select! arms).
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        // Install the SIGTERM handler once outside the loop.
+        let mut sigterm =
+            signal(SignalKind::terminate()).context("Failed to install SIGTERM handler")?;
+
+        loop {
+            tokio::select! {
+                line = lines.next_line() => {
+                    match line {
+                        Ok(Some(input)) => {
+                            let trimmed = input.trim();
+                            if trimmed.is_empty() {
+                                continue;
+                            }
+                            handle_stdin_command(trimmed, handles, color).await;
+                        }
+                        Ok(None) => {
+                            // stdin closed — fall back to waiting for a signal.
+                            tracing::debug!("stdin closed; waiting for shutdown signal");
+                            wait_for_shutdown_signal().await?;
+                            break;
+                        }
+                        Err(err) => {
+                            tracing::warn!("Error reading stdin: {err}");
+                            wait_for_shutdown_signal().await?;
+                            break;
+                        }
+                    }
+                }
+                result = tokio::signal::ctrl_c() => {
+                    result.context("Failed to listen for Ctrl+C")?;
+                    tracing::info!("Ctrl+C received");
+                    break;
+                }
+                _ = sigterm.recv() => {
+                    tracing::info!("SIGTERM received");
+                    break;
+                }
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        loop {
+            tokio::select! {
+                line = lines.next_line() => {
+                    match line {
+                        Ok(Some(input)) => {
+                            let trimmed = input.trim();
+                            if trimmed.is_empty() {
+                                continue;
+                            }
+                            handle_stdin_command(trimmed, handles, color).await;
+                        }
+                        Ok(None) => {
+                            tracing::debug!("stdin closed; waiting for shutdown signal");
+                            wait_for_shutdown_signal().await?;
+                            break;
+                        }
+                        Err(err) => {
+                            tracing::warn!("Error reading stdin: {err}");
+                            wait_for_shutdown_signal().await?;
+                            break;
+                        }
+                    }
+                }
+                result = tokio::signal::ctrl_c() => {
+                    result.context("Failed to listen for Ctrl+C")?;
+                    tracing::info!("Ctrl+C received");
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Dispatch a single line of stdin input to the appropriate handler.
+async fn handle_stdin_command(input: &str, handles: &[supervisor::ServerHandle], color: bool) {
+    if let Some(name) = input.strip_prefix("restart ") {
+        let name = name.trim();
+        if name.is_empty() {
+            eprintln!("Usage: restart <server-name>");
+            return;
+        }
+        match supervisor::restart_server(handles, name).await {
+            Ok(()) => {
+                eprintln!("Restart signal sent to '{name}'. Waiting for new state...");
+                // Give the supervisor time to stop and re-spawn the process.
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let states = output::collect_states_from_handles(handles);
+                output::print_status_table(&states, color);
+            }
+            Err(err) => {
+                eprintln!("Error: {err}");
+            }
+        }
+    } else if input == "status" {
+        let states = output::collect_states_from_handles(handles);
+        output::print_status_table(&states, color);
+    } else if input == "help" {
+        eprintln!("Available commands:");
+        eprintln!("  restart <name>  — Restart the named server");
+        eprintln!("  status          — Show current server status");
+        eprintln!("  help            — Show this help message");
+        eprintln!("  Ctrl+C          — Shut down all servers and exit");
+    } else {
+        eprintln!("Unknown command: '{input}'. Type 'help' for available commands.");
+    }
+}
+
 /// Wait for either Ctrl+C (SIGINT) or SIGTERM — whichever arrives first.
+///
+/// Used as a fallback when stdin is closed or encounters an error.
 async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
     #[cfg(unix)]
     {
