@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::ChildStdout;
+use tokio::process::{ChildStdin, ChildStdout};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{resolve_env, HubConfig, ServerConfig};
@@ -23,6 +23,8 @@ pub struct SpawnedProcess {
     /// Reserved for the Phase 3 MCP client — the stdout pipe handle.
     /// In Phase 1, callers that do not consume this should spawn a drain task.
     pub stdout: Option<ChildStdout>,
+    /// For MCP ping writes — handed off to the health check task.
+    pub stdin: Option<ChildStdin>,
 }
 
 /// Spawn a child process for an MCP server.
@@ -63,8 +65,9 @@ pub fn spawn_server(
         .id()
         .ok_or_else(|| anyhow::anyhow!("Failed to get PID for '{name}'"))?;
 
-    // Take stdout for Phase 3 MCP client handoff; drain in Phase 1 to prevent blocking.
+    // Take stdout and stdin for the MCP health check task handoff.
     let stdout = child.stdout.take();
+    let stdin = child.stdin.take();
 
     // Drain stderr continuously to prevent pipe-buffer backpressure (PITFALL #2).
     if let Some(stderr) = child.stderr.take() {
@@ -77,7 +80,12 @@ pub fn spawn_server(
         });
     }
 
-    Ok(SpawnedProcess { child, pid, stdout })
+    Ok(SpawnedProcess {
+        child,
+        pid,
+        stdout,
+        stdin,
+    })
 }
 
 /// Gracefully shut down a child process: SIGTERM → 5 s wait → SIGKILL.
