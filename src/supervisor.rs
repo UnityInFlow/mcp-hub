@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{resolve_env, HubConfig, ServerConfig};
 use crate::logs::LogAggregator;
-use crate::types::{BackoffConfig, ProcessState};
+use crate::types::{BackoffConfig, HealthStatus, ProcessState, ServerSnapshot};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Task 1: Process spawning and shutdown
@@ -207,25 +207,37 @@ pub async fn run_server_supervisor(
     config: ServerConfig,
     shutdown: CancellationToken,
     mut cmd_rx: tokio::sync::mpsc::Receiver<SupervisorCommand>,
-    state_tx: tokio::sync::watch::Sender<(ProcessState, Option<u32>)>,
+    state_tx: tokio::sync::watch::Sender<ServerSnapshot>,
     log_agg: Arc<LogAggregator>,
 ) {
     let backoff_cfg = BackoffConfig::default();
     let mut consecutive_failures: u32 = 0;
+    let mut total_restarts: u32 = 0;
 
     // Resolve environment variables once — env_file is static for the lifetime of the process.
     let env = match resolve_env(&config) {
         Ok(e) => e,
         Err(err) => {
             tracing::error!(server = %name, "Failed to resolve env: {err}");
-            let _ = state_tx.send((ProcessState::Fatal, None));
+            state_tx.send_modify(|s| {
+                s.process_state = ProcessState::Fatal;
+                s.pid = None;
+                s.uptime_since = None;
+                s.restart_count = total_restarts;
+            });
             return;
         }
     };
 
     loop {
         // ── Starting ──────────────────────────────────────────────────────────
-        let _ = state_tx.send((ProcessState::Starting, None));
+        state_tx.send_modify(|s| {
+            s.process_state = ProcessState::Starting;
+            s.pid = None;
+            s.uptime_since = None;
+            s.health = HealthStatus::Unknown;
+            s.restart_count = total_restarts;
+        });
 
         let spawned = match spawn_server(&name, &config, &env, Some(Arc::clone(&log_agg))) {
             Ok(s) => s,
@@ -239,18 +251,26 @@ pub async fn run_server_supervisor(
                         "Marked Fatal after {} consecutive failures",
                         consecutive_failures
                     );
-                    let _ = state_tx.send((ProcessState::Fatal, None));
+                    state_tx.send_modify(|s| {
+                        s.process_state = ProcessState::Fatal;
+                        s.pid = None;
+                        s.uptime_since = None;
+                        s.restart_count = total_restarts;
+                    });
                     return;
                 }
 
                 let delay = compute_backoff_delay(consecutive_failures - 1, &backoff_cfg);
-                let _ = state_tx.send((
-                    ProcessState::Backoff {
+                let until = std::time::Instant::now() + delay;
+                state_tx.send_modify(|s| {
+                    s.process_state = ProcessState::Backoff {
                         attempt: consecutive_failures,
-                        until: std::time::Instant::now() + delay,
-                    },
-                    None,
-                ));
+                        until,
+                    };
+                    s.pid = None;
+                    s.uptime_since = None;
+                    s.restart_count = total_restarts;
+                });
 
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}
@@ -272,25 +292,51 @@ pub async fn run_server_supervisor(
         // ── Running ───────────────────────────────────────────────────────────
         let pid = spawned.pid;
         let started_at = std::time::Instant::now();
-        let _ = state_tx.send((ProcessState::Running, Some(pid)));
+        state_tx.send_modify(|s| {
+            s.process_state = ProcessState::Running;
+            s.pid = Some(pid);
+            s.uptime_since = Some(std::time::Instant::now());
+            s.health = HealthStatus::Unknown;
+            s.restart_count = total_restarts;
+        });
 
-        // Drain stdout in Phase 1 to prevent pipe-buffer backpressure (PITFALL #2).
-        // Phase 3 will hand `stdout` to the MCP client instead of draining here.
-        if let Some(stdout) = spawned.stdout {
-            let drain_name = name.clone();
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(stdout).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::debug!(server = %drain_name, "[stdout] {}", line);
-                }
-            });
-        }
-
+        // Spawn the MCP health check task if we have both stdin and stdout.
+        // The health task owns stdin (writes pings) and stdout (reads responses).
+        let health_cancel = shutdown.child_token();
+        let spawned_stdin = spawned.stdin;
+        let spawned_stdout = spawned.stdout;
         let mut child = spawned.child;
+
+        if let (Some(stdin), Some(stdout)) = (spawned_stdin, spawned_stdout) {
+            let health_name = name.clone();
+            let health_tx = state_tx.clone();
+            let interval = config
+                .health_check_interval
+                .unwrap_or(crate::mcp::health::DEFAULT_HEALTH_CHECK_INTERVAL_SECS);
+            let cancel = health_cancel.clone();
+            tokio::spawn(async move {
+                crate::mcp::health::run_health_check_loop(
+                    health_name,
+                    interval,
+                    stdin,
+                    stdout,
+                    health_tx,
+                    cancel,
+                )
+                .await;
+            });
+        } else {
+            // Fallback: drain stdout to prevent pipe-buffer backpressure (PITFALL #2).
+            tracing::warn!(
+                server = %name,
+                "Missing stdin or stdout — health checks disabled for this server"
+            );
+        }
 
         tokio::select! {
             // Child exited on its own (crash or clean exit).
             status = child.wait() => {
+                health_cancel.cancel();
                 let ran_for = started_at.elapsed().as_secs();
                 tracing::warn!(
                     server = %name,
@@ -305,6 +351,7 @@ pub async fn run_server_supervisor(
                 }
 
                 consecutive_failures += 1;
+                total_restarts += 1;
 
                 if consecutive_failures >= backoff_cfg.max_attempts {
                     tracing::error!(
@@ -312,18 +359,26 @@ pub async fn run_server_supervisor(
                         "Marked Fatal after {} consecutive failures",
                         consecutive_failures
                     );
-                    let _ = state_tx.send((ProcessState::Fatal, None));
+                    state_tx.send_modify(|s| {
+                        s.process_state = ProcessState::Fatal;
+                        s.pid = None;
+                        s.uptime_since = None;
+                        s.restart_count = total_restarts;
+                    });
                     return;
                 }
 
                 let delay = compute_backoff_delay(consecutive_failures - 1, &backoff_cfg);
-                let _ = state_tx.send((
-                    ProcessState::Backoff {
+                let until = std::time::Instant::now() + delay;
+                state_tx.send_modify(|s| {
+                    s.process_state = ProcessState::Backoff {
                         attempt: consecutive_failures,
-                        until: std::time::Instant::now() + delay,
-                    },
-                    None,
-                ));
+                        until,
+                    };
+                    s.pid = None;
+                    s.uptime_since = None;
+                    s.restart_count = total_restarts;
+                });
 
                 // Wait out the backoff delay, interruptible by shutdown or Restart command.
                 tokio::select! {
@@ -342,9 +397,19 @@ pub async fn run_server_supervisor(
 
             // Hub-level shutdown (Ctrl+C or SIGTERM).
             _ = shutdown.cancelled() => {
-                let _ = state_tx.send((ProcessState::Stopping, Some(pid)));
+                health_cancel.cancel();
+                state_tx.send_modify(|s| {
+                    s.process_state = ProcessState::Stopping;
+                    // Keep pid for display during stop.
+                    s.restart_count = total_restarts;
+                });
                 shutdown_process(child, pid).await.ok();
-                let _ = state_tx.send((ProcessState::Stopped, None));
+                state_tx.send_modify(|s| {
+                    s.process_state = ProcessState::Stopped;
+                    s.pid = None;
+                    s.uptime_since = None;
+                    s.restart_count = total_restarts;
+                });
                 return;
             }
 
@@ -353,15 +418,30 @@ pub async fn run_server_supervisor(
                 match cmd {
                     Some(SupervisorCommand::Restart) => {
                         tracing::info!(server = %name, "Restart requested");
-                        let _ = state_tx.send((ProcessState::Stopping, Some(pid)));
+                        health_cancel.cancel();
+                        state_tx.send_modify(|s| {
+                            s.process_state = ProcessState::Stopping;
+                            // Keep pid for display during stop.
+                            s.restart_count = total_restarts;
+                        });
                         shutdown_process(child, pid).await.ok();
                         consecutive_failures = 0;
+                        total_restarts += 1;
                         // Continue the outer loop — will re-spawn.
                     }
                     Some(SupervisorCommand::Shutdown) | None => {
-                        let _ = state_tx.send((ProcessState::Stopping, Some(pid)));
+                        health_cancel.cancel();
+                        state_tx.send_modify(|s| {
+                            s.process_state = ProcessState::Stopping;
+                            s.restart_count = total_restarts;
+                        });
                         shutdown_process(child, pid).await.ok();
-                        let _ = state_tx.send((ProcessState::Stopped, None));
+                        state_tx.send_modify(|s| {
+                            s.process_state = ProcessState::Stopped;
+                            s.pid = None;
+                            s.uptime_since = None;
+                            s.restart_count = total_restarts;
+                        });
                         return;
                     }
                 }
@@ -378,8 +458,8 @@ pub async fn run_server_supervisor(
 pub struct ServerHandle {
     /// The name of the server as defined in the config file.
     pub name: String,
-    /// Receiver for the server's latest `(ProcessState, Option<pid>)` snapshot.
-    pub state_rx: tokio::sync::watch::Receiver<(ProcessState, Option<u32>)>,
+    /// Receiver for the server's latest [`ServerSnapshot`].
+    pub state_rx: tokio::sync::watch::Receiver<ServerSnapshot>,
     /// Sender for dispatching [`SupervisorCommand`]s to the supervisor task.
     pub cmd_tx: tokio::sync::mpsc::Sender<SupervisorCommand>,
     /// JoinHandle for the supervisor task itself.
@@ -398,7 +478,11 @@ pub async fn start_all_servers(
     let mut handles = Vec::with_capacity(config.servers.len());
 
     for (name, server_config) in &config.servers {
-        let (state_tx, state_rx) = tokio::sync::watch::channel((ProcessState::Stopped, None));
+        let initial_snapshot = ServerSnapshot {
+            transport: server_config.transport.clone(),
+            ..ServerSnapshot::default()
+        };
+        let (state_tx, state_rx) = tokio::sync::watch::channel(initial_snapshot);
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(8);
         let token = shutdown.child_token();
         let name_owned = name.clone();
@@ -429,7 +513,7 @@ pub async fn wait_for_initial_states(handles: &mut [ServerHandle], timeout: Dura
 
     for handle in handles.iter_mut() {
         loop {
-            let (state, _) = handle.state_rx.borrow().clone();
+            let state = handle.state_rx.borrow().process_state.clone();
             match state {
                 ProcessState::Stopped | ProcessState::Starting => {
                     // Still transitioning — wait for the next change.

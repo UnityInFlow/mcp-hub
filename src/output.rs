@@ -4,7 +4,7 @@ use comfy_table::{Cell, Color, Table};
 use tracing_subscriber::EnvFilter;
 
 use crate::supervisor::ServerHandle;
-use crate::types::ProcessState;
+use crate::types::{ProcessState, ServerSnapshot};
 
 /// Return `true` if colored output should be used.
 ///
@@ -20,12 +20,13 @@ pub fn use_colors(no_color_flag: bool) -> bool {
 
 /// Print a formatted status table for the given list of servers.
 ///
-/// Each row shows the server name, lifecycle state (optionally colored), and PID.
-pub fn print_status_table(servers: &[(String, ProcessState, Option<u32>)], color: bool) {
+/// Each row shows the server name, lifecycle state (optionally colored), PID, and health.
+pub fn print_status_table(servers: &[(String, ServerSnapshot)], color: bool) {
     let mut table = Table::new();
-    table.set_header(vec!["Name", "State", "PID"]);
+    table.set_header(vec!["Name", "State", "PID", "Health"]);
 
-    for (name, state, pid) in servers {
+    for (name, snapshot) in servers {
+        let state = &snapshot.process_state;
         let state_str = state.to_string();
 
         let state_cell = if color {
@@ -45,11 +46,19 @@ pub fn print_status_table(servers: &[(String, ProcessState, Option<u32>)], color
             Cell::new(&state_str)
         };
 
-        let pid_str = pid
+        let pid_str = snapshot
+            .pid
             .map(|p| p.to_string())
             .unwrap_or_else(|| "-".to_string());
 
-        table.add_row(vec![Cell::new(name), state_cell, Cell::new(&pid_str)]);
+        let health_str = snapshot.health.to_string();
+
+        table.add_row(vec![
+            Cell::new(name),
+            state_cell,
+            Cell::new(&pid_str),
+            Cell::new(&health_str),
+        ]);
     }
 
     println!("{table}");
@@ -58,14 +67,12 @@ pub fn print_status_table(servers: &[(String, ProcessState, Option<u32>)], color
 /// Collect current state snapshots from all server handles.
 ///
 /// This is a non-blocking operation — `watch::Receiver::borrow` returns immediately.
-pub fn collect_states_from_handles(
-    handles: &[ServerHandle],
-) -> Vec<(String, ProcessState, Option<u32>)> {
+pub fn collect_states_from_handles(handles: &[ServerHandle]) -> Vec<(String, ServerSnapshot)> {
     handles
         .iter()
         .map(|handle| {
-            let (state, pid) = handle.state_rx.borrow().clone();
-            (handle.name.clone(), state, pid)
+            let snapshot = handle.state_rx.borrow().clone();
+            (handle.name.clone(), snapshot)
         })
         .collect()
 }
