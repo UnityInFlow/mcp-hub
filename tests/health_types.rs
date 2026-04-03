@@ -28,7 +28,13 @@ fn healthy_to_degraded_at_2_misses() {
     };
     let next = compute_health_status(2, &current);
     assert!(
-        matches!(next, HealthStatus::Degraded { consecutive_misses: 2, .. }),
+        matches!(
+            next,
+            HealthStatus::Degraded {
+                consecutive_misses: 2,
+                ..
+            }
+        ),
         "Expected Degraded(2), got: {next}"
     );
 }
@@ -56,7 +62,12 @@ fn degraded_to_failed_at_7_misses() {
     };
     let next = compute_health_status(7, &current);
     assert!(
-        matches!(next, HealthStatus::Failed { consecutive_misses: 7 }),
+        matches!(
+            next,
+            HealthStatus::Failed {
+                consecutive_misses: 7
+            }
+        ),
         "Expected Failed(7), got: {next}"
     );
 }
