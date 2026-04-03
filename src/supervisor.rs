@@ -151,6 +151,8 @@ pub enum SupervisorCommand {
     /// Stop the managed server and exit the supervisor loop.
     Shutdown,
     /// Stop the managed server, reset backoff state, and restart from scratch.
+    // Phase 3 wires this from the CLI restart subcommand — unused in Phase 1 foreground mode.
+    #[allow(dead_code)]
     Restart,
 }
 
@@ -430,6 +432,8 @@ pub async fn stop_all_servers(handles: Vec<ServerHandle>) {
 /// Send a [`SupervisorCommand::Restart`] to the named server.
 ///
 /// Returns an error if no server with that name exists in `handles`.
+// Phase 3 daemon-mode CLI wires this from the restart subcommand — unused in Phase 1 foreground mode.
+#[allow(dead_code)]
 pub async fn restart_server(handles: &[ServerHandle], name: &str) -> anyhow::Result<()> {
     let handle = handles
         .iter()
