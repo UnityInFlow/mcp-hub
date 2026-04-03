@@ -159,7 +159,7 @@ pub enum SupervisorCommand {
 /// Long-running task that manages the lifecycle of a single MCP server.
 ///
 /// State transitions:
-/// ```
+/// ```text
 /// Stopped -> Starting -> Running -> (crash) -> Backoff -> Starting …
 ///                     -> (shutdown) -> Stopping -> Stopped
 ///                     -> (max failures) -> Fatal
