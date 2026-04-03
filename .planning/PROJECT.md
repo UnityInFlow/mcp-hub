@@ -16,11 +16,10 @@ Developers running 5+ MCP servers can manage them all from one place — one con
 - Process lifecycle: start, stop, restart for all servers — Validated in Phase 1
 - Auto-restart on crash with exponential backoff (1s -> 2s -> 4s -> max 60s) — Validated in Phase 1
 - Foreground mode (default): runs in terminal, Ctrl+C stops everything — Validated in Phase 1
+- Health monitoring: MCP ping checks with configurable interval, Healthy/Degraded/Failed states — Validated in Phase 2
+- Unified log view: stderr capture with ring buffer, docker-compose style colored output — Validated in Phase 2
 
 ### Active
-
-- [ ] Health monitoring: heartbeat checks with configurable interval
-- [ ] Unified log view: `mcp-hub logs --follow` streams all servers interleaved
 - [ ] Web UI: lists running servers, health status, available tools from introspection
 - [ ] Full MCP introspection: tools/list, resources/list, prompts/list per server
 - [ ] Claude Code config generator: outputs correct settings.json mcpServers block
@@ -88,4 +87,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-03 after Phase 1 completion*
+*Last updated: 2026-04-03 after Phase 2 completion*
