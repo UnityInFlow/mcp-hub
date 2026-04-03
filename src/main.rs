@@ -6,6 +6,7 @@ mod output;
 mod supervisor;
 mod types;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -34,10 +35,10 @@ async fn main() -> anyhow::Result<()> {
             let shutdown = CancellationToken::new();
 
             let server_names: Vec<String> = config.servers.keys().cloned().collect();
-            let log_agg = std::sync::Arc::new(logs::LogAggregator::new(&server_names, 10_000));
+            let log_agg = Arc::new(logs::LogAggregator::new(&server_names, 10_000));
 
             let mut handles =
-                supervisor::start_all_servers(&config, shutdown.clone(), std::sync::Arc::clone(&log_agg))
+                supervisor::start_all_servers(&config, shutdown.clone(), Arc::clone(&log_agg))
                     .await;
 
             // Wait for servers to reach initial state (Running, Backoff, or Fatal).
@@ -48,7 +49,7 @@ async fn main() -> anyhow::Result<()> {
             output::print_status_table(&states, color);
 
             // Run the interactive foreground loop (stdin commands + shutdown signal).
-            run_foreground_loop(&handles, color).await?;
+            run_foreground_loop(&handles, color, Arc::clone(&log_agg)).await?;
 
             tracing::info!("Shutting down all servers...");
             shutdown.cancel();
@@ -86,9 +87,12 @@ async fn main() -> anyhow::Result<()> {
 ///
 /// When stdin is closed (e.g. piped input exhausted), the function falls back
 /// to waiting for a shutdown signal so the hub does not exit unexpectedly.
+///
+/// The `log_agg` is stored for the `logs` stdin command (Plan 02-03).
 async fn run_foreground_loop(
     handles: &[supervisor::ServerHandle],
     color: bool,
+    _log_agg: Arc<logs::LogAggregator>,
 ) -> anyhow::Result<()> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
