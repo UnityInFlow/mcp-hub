@@ -1,5 +1,7 @@
 mod cli;
 mod config;
+mod logs;
+mod mcp;
 mod output;
 mod supervisor;
 mod types;
