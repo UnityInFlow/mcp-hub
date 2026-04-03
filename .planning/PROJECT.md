@@ -12,21 +12,20 @@ Developers running 5+ MCP servers can manage them all from one place — one con
 
 ### Validated
 
-(None yet — ship to validate)
+- TOML config file defining all MCP servers (name, command, args, env) — Validated in Phase 1
+- Process lifecycle: start, stop, restart for all servers — Validated in Phase 1
+- Auto-restart on crash with exponential backoff (1s -> 2s -> 4s -> max 60s) — Validated in Phase 1
+- Foreground mode (default): runs in terminal, Ctrl+C stops everything — Validated in Phase 1
 
 ### Active
 
-- [ ] TOML config file defining all MCP servers (name, command, args, env)
-- [ ] Process lifecycle: start, stop, restart, status for all servers
 - [ ] Health monitoring: heartbeat checks with configurable interval
-- [ ] Auto-restart on crash with exponential backoff (1s -> 2s -> 4s -> max 60s)
 - [ ] Unified log view: `mcp-hub logs --follow` streams all servers interleaved
 - [ ] Web UI: lists running servers, health status, available tools from introspection
 - [ ] Full MCP introspection: tools/list, resources/list, prompts/list per server
 - [ ] Claude Code config generator: outputs correct settings.json mcpServers block
 - [ ] Cursor config generator: outputs Cursor MCP config snippet
 - [ ] Config gen modes: from TOML (offline) and --live (from running introspection)
-- [ ] Foreground mode (default): runs in terminal, Ctrl+C stops everything
 - [ ] Daemon mode (--daemon flag): daemonizes, communicates via socket/file
 - [ ] `mcp-hub init`: interactive wizard to add a new server
 - [ ] Pre-built binaries for macOS (arm64/x86_64), Linux (x86_64/aarch64), Windows
@@ -89,4 +88,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-02 after initialization*
+*Last updated: 2026-04-03 after Phase 1 completion*
