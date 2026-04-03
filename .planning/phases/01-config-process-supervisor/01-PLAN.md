@@ -133,7 +133,7 @@ Verify the project compiles with `cargo build`.
 <action>
 Create `src/types.rs` with the following types:
 
-1. `ProcessState` enum with variants: `Stopped`, `Starting`, `Running`, `Backoff { attempt: u32, until: std::time::Instant }`, `Fatal`, `Stopping`. Derive `Debug, Clone, PartialEq, Eq`.
+1. `ProcessState` enum with variants: `Stopped`, `Starting`, `Running`, `Backoff { attempt: u32, until: std::time::Instant }`, `Fatal`, `Stopping`. Derive `Debug, Clone`. Do NOT derive `PartialEq`/`Eq` — `std::time::Instant` does not implement them.
 
 2. `BackoffConfig` struct with fields:
    - `base_delay_secs: f64` (default 1.0)
