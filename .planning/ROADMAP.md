@@ -12,6 +12,11 @@
 
 **Requirements:** CFG-01, CFG-02, PROC-01, PROC-02, PROC-03, PROC-05, PROC-06, PROC-07, PROC-08, PROC-09, DMN-01
 
+### Plans
+- [x] **Plan 01:** Project scaffolding + TOML config parsing (CFG-01, CFG-02) — COMPLETE 2026-04-02
+- [ ] **Plan 02:** Process supervisor (PROC-01 through PROC-09)
+- [ ] **Plan 03:** CLI dispatch + status table + Ctrl+C shutdown (DMN-01)
+
 ### Success Criteria
 1. `mcp-hub start` reads `mcp-hub.toml` and launches all configured servers; a typo in the config prints a clear error and exits non-zero.
 2. `mcp-hub stop` sends SIGTERM to all children and waits up to 5 s before SIGKILL — no zombie processes remain.
