@@ -133,7 +133,7 @@ Verify the project compiles with `cargo build`.
 <action>
 Create `src/types.rs` with the following types:
 
-1. `ProcessState` enum with variants: `Stopped`, `Starting`, `Running`, `Backoff { attempt: u32 }`, `Fatal`, `Stopping`. Derive `Debug, Clone, PartialEq, Eq`.
+1. `ProcessState` enum with variants: `Stopped`, `Starting`, `Running`, `Backoff { attempt: u32, until: std::time::Instant }`, `Fatal`, `Stopping`. Derive `Debug, Clone, PartialEq, Eq`.
 
 2. `BackoffConfig` struct with fields:
    - `base_delay_secs: f64` (default 1.0)
@@ -143,7 +143,7 @@ Create `src/types.rs` with the following types:
    - `stable_window_secs: u64` (default 60)
    Implement `Default` for `BackoffConfig` with these values.
 
-3. `ProcessState` display implementation: `Stopped` -> "stopped", `Starting` -> "starting", `Running` -> "running", `Backoff { attempt }` -> "backoff (N)", `Fatal` -> "fatal", `Stopping` -> "stopping".
+3. `ProcessState` display implementation: `Stopped` -> "stopped", `Starting` -> "starting", `Running` -> "running", `Backoff { attempt, .. }` -> "backoff (N)", `Fatal` -> "fatal", `Stopping` -> "stopping".
 
 All types use `pub` visibility.
 </action>
@@ -246,7 +246,7 @@ Create `src/config.rs` with the following components:
    - Return `Ok(config)`
    - All errors use `anyhow::Context` with the file path in the message
 
-5. `fn validate_config(config: &HubConfig) -> anyhow::Result<()>`:
+5. `pub fn validate_config(config: &HubConfig) -> anyhow::Result<()>`:
    - Collect all errors into a `Vec<String>` (show all problems, not just the first)
    - Check: `server.command` must not be empty for each server
    - Check: `server.transport` must be "stdio" or "http"

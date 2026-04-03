@@ -2,7 +2,7 @@
 plan_id: "01-03"
 title: "CLI integration + output formatting + integration tests"
 phase: 1
-wave: 2
+wave: 3
 depends_on:
   - "01-01"
   - "01-02"
@@ -326,6 +326,8 @@ All tests use `assert_cmd::Command::cargo_bin("mcp-hub")` and `tempfile::NamedTe
 - `tests/cli_integration_test.rs` contains `test_start_with_valid_config_shows_status_table`
 - `tests/cli_integration_test.rs` contains `test_no_color_flag`
 - `tests/cli_integration_test.rs` contains `test_stop_without_daemon_prints_message`
+- `tests/cli_integration_test.rs` contains `test_bad_command_in_config_starts_and_shows_fatal`
+- `tests/cli_integration_test.rs` contains `test_start_help`
 - Tests use `assert_cmd::Command::cargo_bin("mcp-hub")`
 - Tests with valid configs use `.timeout()` to prevent hanging
 - `cargo test --test cli_integration_test` exits 0

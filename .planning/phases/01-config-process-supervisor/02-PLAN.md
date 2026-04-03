@@ -2,7 +2,7 @@
 plan_id: "01-02"
 title: "Process supervisor + backoff + shutdown"
 phase: 1
-wave: 1
+wave: 2
 depends_on:
   - "01-01"
 files_modified:
@@ -49,6 +49,7 @@ Create `src/supervisor.rs` with the following:
 1. `pub struct SpawnedProcess` with fields:
    - `child: tokio::process::Child`
    - `pid: u32`
+   - `stdout: Option<tokio::process::ChildStdout>` — reserved for MCP client reuse in Phase 3
 
 2. `pub fn spawn_server(name: &str, config: &ServerConfig, env: &HashMap<String, String>) -> anyhow::Result<SpawnedProcess>`:
    - Create `tokio::process::Command::new(&config.command)`
@@ -62,8 +63,8 @@ Create `src/supervisor.rs` with the following:
    - If `config.cwd` is Some, set `.current_dir(cwd)`
    - Spawn and capture pid via `child.id().ok_or_else(|| anyhow::anyhow!("Failed to get PID for '{name}'"))?`
    - Take `child.stderr` and spawn a dedicated tokio task that drains stderr line-by-line using `tokio::io::BufReader::new(stderr).lines()`, forwarding each line to `tracing::debug!(server = %name, "{}", line)` — prevents pipe buffer filling (PITFALL #2)
-   - Take `child.stdout` and spawn a dedicated tokio task that drains stdout line-by-line (parked for Phase 3 MCP client; for now, drain to prevent blocking)
-   - Return `Ok(SpawnedProcess { child, pid })`
+   - Take `child.stdout` via `child.stdout.take()` and store it as `Option<ChildStdout>` in the returned struct — reserved for Phase 3 MCP client handoff. In Phase 1, callers that do not use the stdout handle should spawn a drain task to prevent pipe buffer blocking.
+   - Return `Ok(SpawnedProcess { child, pid, stdout })`
    - Error context: `format!("Failed to spawn '{}': {}", name, config.command)`
 
 3. `pub async fn shutdown_process(mut child: tokio::process::Child, pid: u32) -> anyhow::Result<()>`:
@@ -79,7 +80,7 @@ No `unwrap()` anywhere. All `nix` calls wrapped in `let _ =` or error-logged.
 <acceptance_criteria>
 - File `src/supervisor.rs` exists
 - `src/supervisor.rs` contains `pub struct SpawnedProcess`
-- `SpawnedProcess` has fields `child` and `pid`
+- `SpawnedProcess` has fields `child`, `pid`, and `stdout: Option<tokio::process::ChildStdout>`
 - `src/supervisor.rs` contains `pub fn spawn_server`
 - `spawn_server` sets `stdin(Stdio::piped())`, `stdout(Stdio::piped())`, `stderr(Stdio::piped())`
 - `spawn_server` contains `process_group(0)` inside a `#[cfg(unix)]` block
@@ -127,8 +128,8 @@ Add to `src/supervisor.rs`:
    - Enter a retry loop:
      - Set state to `Starting`, pid to None
      - Call `spawn_server(&name, &config, &env)`
-     - On spawn failure: increment `consecutive_failures`. If >= `backoff_config.max_attempts` (10): set state to `Fatal`, return. Otherwise: compute backoff delay, set state to `Backoff { attempt }`, sleep (interruptible by shutdown token or cmd_rx)
-     - On spawn success: set state to `Running`, pid to `Some(pid)`. Record `started_at = Instant::now()`
+     - On spawn failure: increment `consecutive_failures`. If >= `backoff_config.max_attempts` (10): set state to `Fatal`, return. Otherwise: compute backoff delay, set state to `Backoff { attempt, until: Instant::now() + delay }`, sleep (interruptible by shutdown token or cmd_rx)
+     - On spawn success: if `spawned.stdout` is Some, take it and spawn a tokio task that drains it line-by-line (prevents pipe blocking in Phase 1; Phase 3 will hand this handle to the MCP client instead of draining). Set state to `Running`, pid to `Some(pid)`. Record `started_at = Instant::now()`
      - Use `tokio::select!` to wait on three futures:
        a. `child.wait()` — child exited on its own. Check if ran >= `stable_window_secs` (60s, D-13) and reset consecutive_failures if so. Increment consecutive_failures. Check Fatal threshold. Compute backoff, set state, sleep (interruptible).
        b. `shutdown.cancelled()` — hub is shutting down. Set state to `Stopping`, call `shutdown_process`, set state to `Stopped`, return.
