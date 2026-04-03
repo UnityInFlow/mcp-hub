@@ -36,6 +36,12 @@ pub enum Commands {
 
     /// Restart a specific server by name.
     Restart(RestartArgs),
+
+    /// Show status of all servers (name, state, health, PID, uptime, restarts).
+    Status,
+
+    /// Show server logs.
+    Logs(LogsArgs),
 }
 
 /// Arguments for the `restart` subcommand.
@@ -43,4 +49,20 @@ pub enum Commands {
 pub struct RestartArgs {
     /// Name of the server to restart.
     pub name: String,
+}
+
+/// Arguments for the `logs` subcommand.
+#[derive(Debug, clap::Args)]
+pub struct LogsArgs {
+    /// Follow log output (streams new lines). Requires daemon mode (Phase 3).
+    #[arg(short = 'f', long)]
+    pub follow: bool,
+
+    /// Filter to a specific server by name.
+    #[arg(long, short = 's', value_name = "NAME")]
+    pub server: Option<String>,
+
+    /// Number of recent lines to show (default: 100).
+    #[arg(long, short = 'n', default_value = "100")]
+    pub lines: usize,
 }

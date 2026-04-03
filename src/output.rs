@@ -4,7 +4,7 @@ use comfy_table::{Cell, Color, Table};
 use tracing_subscriber::EnvFilter;
 
 use crate::supervisor::ServerHandle;
-use crate::types::{ProcessState, ServerSnapshot};
+use crate::types::{format_uptime, HealthStatus, ProcessState, ServerSnapshot};
 
 /// Return `true` if colored output should be used.
 ///
@@ -18,12 +18,20 @@ pub fn use_colors(no_color_flag: bool) -> bool {
     std::io::stdout().is_terminal()
 }
 
-/// Print a formatted status table for the given list of servers.
+/// Format the status table for the given list of servers and return it as a `String`.
 ///
-/// Each row shows the server name, lifecycle state (optionally colored), PID, and health.
-pub fn print_status_table(servers: &[(String, ServerSnapshot)], color: bool) {
+/// Columns: Name, State, Health, PID, Uptime, Restarts, Transport (D-09).
+pub fn format_status_table(servers: &[(String, ServerSnapshot)], color: bool) -> String {
     let mut table = Table::new();
-    table.set_header(vec!["Name", "State", "PID", "Health"]);
+    table.set_header(vec![
+        "Name",
+        "State",
+        "Health",
+        "PID",
+        "Uptime",
+        "Restarts",
+        "Transport",
+    ]);
 
     for (name, snapshot) in servers {
         let state = &snapshot.process_state;
@@ -46,22 +54,54 @@ pub fn print_status_table(servers: &[(String, ServerSnapshot)], color: bool) {
             Cell::new(&state_str)
         };
 
+        let health_str = snapshot.health.to_string();
+        let health_cell = if color {
+            let cell_color = match &snapshot.health {
+                HealthStatus::Healthy { .. } => Some(Color::Green),
+                HealthStatus::Degraded { .. } => Some(Color::Yellow),
+                HealthStatus::Failed { .. } => Some(Color::Red),
+                HealthStatus::Unknown => Some(Color::DarkGrey),
+            };
+            match cell_color {
+                Some(c) => Cell::new(&health_str).fg(c),
+                None => Cell::new(&health_str),
+            }
+        } else {
+            Cell::new(&health_str)
+        };
+
         let pid_str = snapshot
             .pid
             .map(|p| p.to_string())
             .unwrap_or_else(|| "-".to_string());
 
-        let health_str = snapshot.health.to_string();
+        let uptime_str = snapshot
+            .uptime_since
+            .map(|since| format_uptime(since.elapsed()))
+            .unwrap_or_else(|| "-".to_string());
+
+        let restarts_str = snapshot.restart_count.to_string();
 
         table.add_row(vec![
             Cell::new(name),
             state_cell,
+            health_cell,
             Cell::new(&pid_str),
-            Cell::new(&health_str),
+            Cell::new(&uptime_str),
+            Cell::new(&restarts_str),
+            Cell::new(&snapshot.transport),
         ]);
     }
 
-    println!("{table}");
+    table.to_string()
+}
+
+/// Print a formatted status table for the given list of servers.
+///
+/// Columns: Name, State, Health, PID, Uptime, Restarts, Transport (D-09).
+/// This is a thin wrapper around [`format_status_table`] for easy testing.
+pub fn print_status_table(servers: &[(String, ServerSnapshot)], color: bool) {
+    println!("{}", format_status_table(servers, color));
 }
 
 /// Collect current state snapshots from all server handles.

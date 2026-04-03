@@ -76,6 +76,36 @@ async fn main() -> anyhow::Result<()> {
             );
             std::process::exit(1);
         }
+
+        Commands::Status => {
+            // Phase 2: requires daemon IPC (Phase 3).
+            // In foreground mode, status is available via typing 'status' in the terminal.
+            eprintln!(
+                "mcp-hub status: no daemon running.\n\
+                 In foreground mode, type 'status' in the running hub's terminal.\n\
+                 Daemon-mode status will be available in a future version."
+            );
+            std::process::exit(1);
+        }
+
+        Commands::Logs(args) => {
+            // Phase 2: requires daemon IPC (Phase 3) for separate process access.
+            // In foreground mode, logs are visible in the terminal output directly.
+            if args.follow {
+                eprintln!(
+                    "mcp-hub logs --follow: requires daemon mode.\n\
+                     In foreground mode, server logs stream to the terminal automatically.\n\
+                     Daemon-mode log streaming will be available in a future version."
+                );
+            } else {
+                eprintln!(
+                    "mcp-hub logs: no daemon running.\n\
+                     In foreground mode, type 'logs' in the running hub's terminal to dump recent logs.\n\
+                     Daemon-mode log access will be available in a future version."
+                );
+            }
+            std::process::exit(1);
+        }
     }
 }
 
@@ -83,16 +113,15 @@ async fn main() -> anyhow::Result<()> {
 ///
 /// Concurrently reads commands from stdin and waits for a shutdown signal
 /// (Ctrl+C or SIGTERM). Typing `restart <name>` restarts the named server,
-/// `status` reprints the status table, and `help` lists all available commands.
+/// `status` reprints the status table, `logs` dumps recent logs, and `help`
+/// lists all available commands.
 ///
 /// When stdin is closed (e.g. piped input exhausted), the function falls back
 /// to waiting for a shutdown signal so the hub does not exit unexpectedly.
-///
-/// The `log_agg` is stored for the `logs` stdin command (Plan 02-03).
 async fn run_foreground_loop(
     handles: &[supervisor::ServerHandle],
     color: bool,
-    _log_agg: Arc<logs::LogAggregator>,
+    log_agg: Arc<logs::LogAggregator>,
 ) -> anyhow::Result<()> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -121,7 +150,7 @@ async fn run_foreground_loop(
                             if trimmed.is_empty() {
                                 continue;
                             }
-                            handle_stdin_command(trimmed, handles, color).await;
+                            handle_stdin_command(trimmed, handles, color, &*log_agg).await;
                         }
                         Ok(None) => {
                             // stdin closed — fall back to waiting for a signal.
@@ -160,7 +189,7 @@ async fn run_foreground_loop(
                             if trimmed.is_empty() {
                                 continue;
                             }
-                            handle_stdin_command(trimmed, handles, color).await;
+                            handle_stdin_command(trimmed, handles, color, &*log_agg).await;
                         }
                         Ok(None) => {
                             tracing::debug!("stdin closed; waiting for shutdown signal");
@@ -187,7 +216,12 @@ async fn run_foreground_loop(
 }
 
 /// Dispatch a single line of stdin input to the appropriate handler.
-async fn handle_stdin_command(input: &str, handles: &[supervisor::ServerHandle], color: bool) {
+async fn handle_stdin_command(
+    input: &str,
+    handles: &[supervisor::ServerHandle],
+    color: bool,
+    log_agg: &logs::LogAggregator,
+) {
     if let Some(name) = input.strip_prefix("restart ") {
         let name = name.trim();
         if name.is_empty() {
@@ -209,10 +243,47 @@ async fn handle_stdin_command(input: &str, handles: &[supervisor::ServerHandle],
     } else if input == "status" {
         let states = output::collect_states_from_handles(handles);
         output::print_status_table(&states, color);
+    } else if input == "logs" || input.starts_with("logs ") {
+        // "logs"         -> dump last 100 lines from all servers
+        // "logs <name>"  -> dump last 100 lines for specific server
+        let parts: Vec<&str> = input.splitn(2, ' ').collect();
+        if parts.len() == 1 {
+            // All servers — merge and show last 100.
+            let lines = log_agg.snapshot_all().await;
+            let tail = if lines.len() > 100 {
+                &lines[lines.len() - 100..]
+            } else {
+                &lines[..]
+            };
+            for line in tail {
+                println!("{}", logs::format_log_line(line, color));
+            }
+            if lines.is_empty() {
+                eprintln!("No logs captured yet.");
+            }
+        } else {
+            let server_name = parts[1].trim();
+            match log_agg.get_buffer(server_name) {
+                Some(buf) => {
+                    let lines = buf.snapshot_last(100).await;
+                    for line in &lines {
+                        println!("{}", logs::format_log_line(line, color));
+                    }
+                    if lines.is_empty() {
+                        eprintln!("No logs captured for '{server_name}' yet.");
+                    }
+                }
+                None => {
+                    eprintln!("Unknown server: '{server_name}'");
+                }
+            }
+        }
     } else if input == "help" {
         eprintln!("Available commands:");
         eprintln!("  restart <name>  — Restart the named server");
         eprintln!("  status          — Show current server status");
+        eprintln!("  logs            - Show recent logs from all servers");
+        eprintln!("  logs <name>     - Show recent logs for a specific server");
         eprintln!("  help            — Show this help message");
         eprintln!("  Ctrl+C          — Shut down all servers and exit");
     } else {
