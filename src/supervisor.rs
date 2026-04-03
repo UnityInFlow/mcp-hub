@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -8,6 +9,7 @@ use tokio::process::{ChildStdin, ChildStdout};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{resolve_env, HubConfig, ServerConfig};
+use crate::logs::LogAggregator;
 use crate::types::{BackoffConfig, ProcessState};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -32,13 +34,16 @@ pub struct SpawnedProcess {
 /// - Pipes stdin, stdout, and stderr (prevents pipe-buffer backpressure — PITFALL #2).
 /// - On Unix, puts the child in its own process group so Ctrl+C is not forwarded
 ///   directly to the child (PROC-08, PITFALL #5).
-/// - Spawns a dedicated tokio task to drain stderr line-by-line into `tracing::debug!`.
-/// - Takes stdout and stores it for Phase 3 MCP client handoff.
+/// - Spawns a dedicated tokio task to drain stderr line-by-line.
+///   - If `log_agg` is `Some`, lines are pushed to the [`LogAggregator`] and printed.
+///   - If `log_agg` is `None`, lines are drained via `tracing::debug!` (backward compat).
+/// - Takes stdout and stdin, storing them for the MCP health check task.
 /// - Does NOT call `kill_on_drop(true)` — cleanup is always explicit.
 pub fn spawn_server(
     name: &str,
     config: &ServerConfig,
     env: &HashMap<String, String>,
+    log_agg: Option<Arc<LogAggregator>>,
 ) -> anyhow::Result<SpawnedProcess> {
     let mut cmd = tokio::process::Command::new(&config.command);
     cmd.args(&config.args)
@@ -72,12 +77,30 @@ pub fn spawn_server(
     // Drain stderr continuously to prevent pipe-buffer backpressure (PITFALL #2).
     if let Some(stderr) = child.stderr.take() {
         let server_name = name.to_string();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                tracing::debug!(server = %server_name, "{}", line);
-            }
-        });
+        if let Some(agg) = log_agg {
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    // Push to the ring buffer and broadcast.
+                    agg.push(&server_name, line.clone()).await;
+                    // Also format and print to terminal stderr.
+                    let log_line = crate::logs::LogLine {
+                        server: server_name.clone(),
+                        timestamp: std::time::SystemTime::now(),
+                        message: line,
+                    };
+                    eprintln!("{}", crate::logs::format_log_line(&log_line, false));
+                }
+            });
+        } else {
+            // Backward-compatible drain for tests and cases without a LogAggregator.
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    tracing::debug!(server = %server_name, "{}", line);
+                }
+            });
+        }
     }
 
     Ok(SpawnedProcess {
@@ -185,6 +208,7 @@ pub async fn run_server_supervisor(
     shutdown: CancellationToken,
     mut cmd_rx: tokio::sync::mpsc::Receiver<SupervisorCommand>,
     state_tx: tokio::sync::watch::Sender<(ProcessState, Option<u32>)>,
+    log_agg: Arc<LogAggregator>,
 ) {
     let backoff_cfg = BackoffConfig::default();
     let mut consecutive_failures: u32 = 0;
@@ -203,7 +227,7 @@ pub async fn run_server_supervisor(
         // ── Starting ──────────────────────────────────────────────────────────
         let _ = state_tx.send((ProcessState::Starting, None));
 
-        let spawned = match spawn_server(&name, &config, &env) {
+        let spawned = match spawn_server(&name, &config, &env, Some(Arc::clone(&log_agg))) {
             Ok(s) => s,
             Err(err) => {
                 tracing::error!(server = %name, "Spawn failed: {err}");
@@ -369,6 +393,7 @@ pub struct ServerHandle {
 pub async fn start_all_servers(
     config: &HubConfig,
     shutdown: CancellationToken,
+    log_agg: Arc<LogAggregator>,
 ) -> Vec<ServerHandle> {
     let mut handles = Vec::with_capacity(config.servers.len());
 
@@ -378,9 +403,10 @@ pub async fn start_all_servers(
         let token = shutdown.child_token();
         let name_owned = name.clone();
         let cfg = server_config.clone();
+        let agg = Arc::clone(&log_agg);
 
         let task = tokio::spawn(async move {
-            run_server_supervisor(name_owned, cfg, token, cmd_rx, state_tx).await;
+            run_server_supervisor(name_owned, cfg, token, cmd_rx, state_tx, agg).await;
         });
 
         handles.push(ServerHandle {

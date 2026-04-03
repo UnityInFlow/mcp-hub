@@ -136,7 +136,7 @@ fn test_backoff_attempt_overflow_capped() {
 #[tokio::test]
 async fn test_spawn_server_with_echo() {
     let config = make_server_config("bash", &["-c", "echo hello >&2 && sleep 300"]);
-    let mut spawned = spawn_server("test-echo", &config, &HashMap::new())
+    let mut spawned = spawn_server("test-echo", &config, &HashMap::new(), None)
         .expect("spawn_server should succeed for a valid command");
 
     assert!(
@@ -156,7 +156,7 @@ async fn test_spawn_server_with_echo() {
 #[tokio::test]
 async fn test_spawn_nonexistent_command() {
     let config = make_server_config("/nonexistent/binary/path", &[]);
-    let result = spawn_server("test-missing", &config, &HashMap::new());
+    let result = spawn_server("test-missing", &config, &HashMap::new(), None);
 
     assert!(
         result.is_err(),
@@ -177,7 +177,7 @@ async fn test_spawn_nonexistent_command() {
 async fn test_shutdown_process_terminates_child() {
     // Spawn a long-running process.
     let config = make_server_config("sleep", &["300"]);
-    let spawned = spawn_server("test-shutdown", &config, &HashMap::new())
+    let spawned = spawn_server("test-shutdown", &config, &HashMap::new(), None)
         .expect("spawn_server should succeed for sleep");
 
     let pid = spawned.pid;

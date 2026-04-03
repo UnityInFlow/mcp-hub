@@ -32,7 +32,13 @@ async fn main() -> anyhow::Result<()> {
             }
 
             let shutdown = CancellationToken::new();
-            let mut handles = supervisor::start_all_servers(&config, shutdown.clone()).await;
+
+            let server_names: Vec<String> = config.servers.keys().cloned().collect();
+            let log_agg = std::sync::Arc::new(logs::LogAggregator::new(&server_names, 10_000));
+
+            let mut handles =
+                supervisor::start_all_servers(&config, shutdown.clone(), std::sync::Arc::clone(&log_agg))
+                    .await;
 
             // Wait for servers to reach initial state (Running, Backoff, or Fatal).
             supervisor::wait_for_initial_states(&mut handles, Duration::from_secs(10)).await;
