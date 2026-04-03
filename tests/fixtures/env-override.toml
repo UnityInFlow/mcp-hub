@@ -1,0 +1,4 @@
+[servers.env-test]
+command = "echo"
+env = { KEY1 = "inline-value", KEY2 = "keep-this" }
+env_file = "tests/fixtures/test.env"

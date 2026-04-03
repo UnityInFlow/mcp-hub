@@ -1,0 +1,3 @@
+[servers.bad-transport]
+command = "echo"
+transport = "grpc"

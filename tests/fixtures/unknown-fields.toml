@@ -1,0 +1,4 @@
+[servers.with-extras]
+command = "echo"
+future_feature = true
+some_new_option = "hello"

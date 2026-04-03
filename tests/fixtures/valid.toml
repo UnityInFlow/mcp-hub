@@ -1,0 +1,11 @@
+[servers.mcp-github]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+env = { GITHUB_TOKEN = "placeholder" }
+transport = "stdio"
+
+[servers.mcp-filesystem]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/home/user"]
+cwd = "/home/user"
+max_retries = 5
