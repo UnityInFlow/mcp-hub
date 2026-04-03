@@ -56,16 +56,8 @@ fn status_subcommand_prints_daemon_required() {
 
 #[test]
 fn logs_args_parsing() {
-    let cli = Cli::try_parse_from([
-        "mcp-hub",
-        "logs",
-        "-f",
-        "-s",
-        "my-server",
-        "-n",
-        "50",
-    ])
-    .expect("Failed to parse CLI args");
+    let cli = Cli::try_parse_from(["mcp-hub", "logs", "-f", "-s", "my-server", "-n", "50"])
+        .expect("Failed to parse CLI args");
 
     match cli.command {
         Commands::Logs(args) => {
@@ -98,13 +90,7 @@ fn logs_args_defaults() {
 #[test]
 fn logs_args_long_flags() {
     let cli = Cli::try_parse_from([
-        "mcp-hub",
-        "logs",
-        "--follow",
-        "--server",
-        "backend",
-        "--lines",
-        "200",
+        "mcp-hub", "logs", "--follow", "--server", "backend", "--lines", "200",
     ])
     .expect("Failed to parse CLI args with long flags");
 

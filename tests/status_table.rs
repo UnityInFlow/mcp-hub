@@ -162,7 +162,10 @@ fn status_table_fatal_failed_server() {
         "Table must contain 'failed' health: {output}"
     );
     // No PID — should show dash placeholder
-    assert!(output.contains('-'), "Table must show '-' for missing PID: {output}");
+    assert!(
+        output.contains('-'),
+        "Table must show '-' for missing PID: {output}"
+    );
     // Restart count of 5
     assert!(
         output.contains('5'),

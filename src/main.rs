@@ -150,7 +150,7 @@ async fn run_foreground_loop(
                             if trimmed.is_empty() {
                                 continue;
                             }
-                            handle_stdin_command(trimmed, handles, color, &*log_agg).await;
+                            handle_stdin_command(trimmed, handles, color, &log_agg).await;
                         }
                         Ok(None) => {
                             // stdin closed — fall back to waiting for a signal.
@@ -189,7 +189,7 @@ async fn run_foreground_loop(
                             if trimmed.is_empty() {
                                 continue;
                             }
-                            handle_stdin_command(trimmed, handles, color, &*log_agg).await;
+                            handle_stdin_command(trimmed, handles, color, &log_agg).await;
                         }
                         Ok(None) => {
                             tracing::debug!("stdin closed; waiting for shutdown signal");

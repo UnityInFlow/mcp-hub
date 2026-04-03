@@ -85,8 +85,7 @@ async fn test_log_aggregation_from_stderr() {
     let server_names: Vec<String> = config.servers.keys().cloned().collect();
     let log_agg = Arc::new(LogAggregator::new(&server_names, 10_000));
 
-    let handles =
-        start_all_servers(&config, shutdown.clone(), Arc::clone(&log_agg)).await;
+    let handles = start_all_servers(&config, shutdown.clone(), Arc::clone(&log_agg)).await;
 
     // Wait for stderr lines to be captured (bash writes them immediately on start).
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -99,12 +98,12 @@ async fn test_log_aggregation_from_stderr() {
 
     // Clean up before asserting so the process always gets stopped.
     shutdown.cancel();
-    let timeout_result = tokio::time::timeout(
-        Duration::from_secs(10),
-        stop_all_servers(handles),
-    )
-    .await;
-    assert!(timeout_result.is_ok(), "stop_all_servers should complete within 10s");
+    let timeout_result =
+        tokio::time::timeout(Duration::from_secs(10), stop_all_servers(handles)).await;
+    assert!(
+        timeout_result.is_ok(),
+        "stop_all_servers should complete within 10s"
+    );
 
     assert!(
         lines.len() >= 2,
@@ -151,8 +150,7 @@ async fn test_health_transitions_to_healthy() {
     let server_names: Vec<String> = config.servers.keys().cloned().collect();
     let log_agg = Arc::new(LogAggregator::new(&server_names, 10_000));
 
-    let handles =
-        start_all_servers(&config, shutdown.clone(), Arc::clone(&log_agg)).await;
+    let handles = start_all_servers(&config, shutdown.clone(), Arc::clone(&log_agg)).await;
 
     // Wait long enough for at least one health check to complete (1s interval + margin).
     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -161,12 +159,12 @@ async fn test_health_transitions_to_healthy() {
 
     // Clean up before asserting.
     shutdown.cancel();
-    let timeout_result = tokio::time::timeout(
-        Duration::from_secs(10),
-        stop_all_servers(handles),
-    )
-    .await;
-    assert!(timeout_result.is_ok(), "stop_all_servers should complete within 10s");
+    let timeout_result =
+        tokio::time::timeout(Duration::from_secs(10), stop_all_servers(handles)).await;
+    assert!(
+        timeout_result.is_ok(),
+        "stop_all_servers should complete within 10s"
+    );
 
     assert!(
         matches!(snapshot.health, HealthStatus::Healthy { .. }),
@@ -183,19 +181,14 @@ async fn test_health_transitions_to_healthy() {
 #[tokio::test]
 async fn test_health_degrades_on_unresponsive_server() {
     // A server that reads stdin but never writes to stdout — pings time out.
-    let config = single_server_config_with_health(
-        "silent-server",
-        "bash",
-        vec!["-c", "cat > /dev/null"],
-        1,
-    );
+    let config =
+        single_server_config_with_health("silent-server", "bash", vec!["-c", "cat > /dev/null"], 1);
 
     let shutdown = CancellationToken::new();
     let server_names: Vec<String> = config.servers.keys().cloned().collect();
     let log_agg = Arc::new(LogAggregator::new(&server_names, 10_000));
 
-    let handles =
-        start_all_servers(&config, shutdown.clone(), Arc::clone(&log_agg)).await;
+    let handles = start_all_servers(&config, shutdown.clone(), Arc::clone(&log_agg)).await;
 
     // Wait long enough for 2+ missed pings (1s interval, 5s ping timeout each).
     // We need at least 2 consecutive misses to transition away from Unknown.
@@ -206,12 +199,12 @@ async fn test_health_degrades_on_unresponsive_server() {
 
     // Clean up before asserting.
     shutdown.cancel();
-    let timeout_result = tokio::time::timeout(
-        Duration::from_secs(10),
-        stop_all_servers(handles),
-    )
-    .await;
-    assert!(timeout_result.is_ok(), "stop_all_servers should complete within 10s");
+    let timeout_result =
+        tokio::time::timeout(Duration::from_secs(10), stop_all_servers(handles)).await;
+    assert!(
+        timeout_result.is_ok(),
+        "stop_all_servers should complete within 10s"
+    );
 
     // The server should be Degraded (2–6 misses) or Failed (7+ misses) — not Healthy or Unknown.
     let is_degraded_or_worse = matches!(
@@ -250,7 +243,15 @@ fn test_status_table_output_has_seven_columns() {
     let output = format_status_table(&servers, false);
 
     // All 7 column headers must appear in the rendered table.
-    let required_headers = ["Name", "State", "Health", "PID", "Uptime", "Restarts", "Transport"];
+    let required_headers = [
+        "Name",
+        "State",
+        "Health",
+        "PID",
+        "Uptime",
+        "Restarts",
+        "Transport",
+    ];
     for header in required_headers {
         assert!(
             output.contains(header),
