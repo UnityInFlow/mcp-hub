@@ -1,4 +1,5 @@
-use std::io::Write as _;
+use std::io::{BufRead as _, BufReader, Write as _};
+use std::process::{Command as StdCommand, Stdio};
 use std::time::Duration;
 
 use assert_cmd::Command;
@@ -190,5 +191,235 @@ args = ["300"]
     assert!(
         stdout.contains("sleeper"),
         "Expected 'sleeper' in stdout, got:\n{stdout}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stdin interactive command tests
+//
+// These tests spawn mcp-hub as a child process with piped stdin/stdout/stderr
+// and interact with the interactive foreground loop. They are timing-sensitive
+// by nature — generous timeouts (up to 15 s total) are used.
+//
+// Implementation strategy: background drain threads accumulate stdout/stderr
+// into Arc<Mutex<String>> buffers. The test sleeps for a fixed duration (to
+// let the hub start and process commands), then kills the child (closing pipes
+// so drain threads exit), waits for the child, and finally checks the buffers.
+// ─────────────────────────────────────────────────────────────────────────────
+
+use std::sync::{Arc, Mutex};
+
+/// Helper: find the mcp-hub binary path via assert_cmd's cargo metadata.
+fn mcp_hub_bin_path() -> std::path::PathBuf {
+    assert_cmd::cargo::cargo_bin("mcp-hub")
+}
+
+/// Spawn mcp-hub with the given config. Returns:
+/// - The child process (for later kill + wait)
+/// - The child's stdin (for sending commands)
+/// - An Arc<Mutex<String>> accumulating stdout
+/// - An Arc<Mutex<String>> accumulating stderr
+///
+/// Two background drain threads continuously read from stdout and stderr into
+/// the shared buffers. They exit naturally when the child process closes the
+/// pipes (i.e. after the child is killed and waited on).
+fn spawn_hub_collecting(
+    config_path: &std::path::Path,
+) -> (
+    std::process::Child,
+    std::process::ChildStdin,
+    Arc<Mutex<String>>,
+    Arc<Mutex<String>>,
+) {
+    let mut child = StdCommand::new(mcp_hub_bin_path())
+        .args([
+            "start",
+            "--no-color",
+            "--config",
+            config_path.to_str().unwrap(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn mcp-hub");
+
+    let stdin = child.stdin.take().expect("stdin not available");
+
+    let stdout_buf: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    let stderr_buf: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+
+    // Drain stdout into the buffer.
+    {
+        let buf = Arc::clone(&stdout_buf);
+        let stdout = child.stdout.take().expect("stdout not available");
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        buf.lock().unwrap().push_str(&line);
+                        line.clear();
+                    }
+                }
+            }
+        });
+    }
+
+    // Drain stderr into the buffer.
+    {
+        let buf = Arc::clone(&stderr_buf);
+        let stderr = child.stderr.take().expect("stderr not available");
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stderr);
+            let mut line = String::new();
+            loop {
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        buf.lock().unwrap().push_str(&line);
+                        line.clear();
+                    }
+                }
+            }
+        });
+    }
+
+    (child, stdin, stdout_buf, stderr_buf)
+}
+
+/// Tests that typing `restart <name>` into the running hub's stdin restarts the
+/// named server, and that a new status table is printed afterwards.
+///
+/// This test is timing-sensitive. If it becomes flaky in CI, mark it `#[ignore]`
+/// and verify manually using the smoke test in the plan.
+#[test]
+fn test_stdin_restart_command() {
+    let f = write_toml(
+        r#"
+[servers.server-a]
+command = "sleep"
+args = ["300"]
+
+[servers.server-b]
+command = "sleep"
+args = ["300"]
+"#,
+    );
+
+    let (mut child, mut stdin_writer, stdout_buf, _stderr_buf) = spawn_hub_collecting(f.path());
+
+    // Wait for the hub to start and print the initial status table.
+    std::thread::sleep(Duration::from_secs(5));
+
+    // Send restart command for server-a.
+    writeln!(stdin_writer, "restart server-a").expect("Failed to write to stdin");
+
+    // Wait for the restart to complete and the new status table to be printed.
+    // restart_server sleeps 2s before reprinting, so 5s is ample.
+    std::thread::sleep(Duration::from_secs(5));
+
+    // Send status command to trigger a third table print.
+    writeln!(stdin_writer, "status").expect("Failed to write to stdin");
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Kill the child — this closes its stdout pipe, causing the drain thread to exit.
+    child.kill().ok();
+    child.wait().ok();
+
+    // Give the drain thread a moment to flush remaining data.
+    std::thread::sleep(Duration::from_millis(200));
+
+    let stdout = stdout_buf.lock().unwrap().clone();
+
+    assert!(
+        stdout.contains("server-a"),
+        "Expected 'server-a' in stdout, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("server-b"),
+        "Expected 'server-b' in stdout, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("running"),
+        "Expected 'running' in stdout, got:\n{stdout}"
+    );
+}
+
+/// Tests that restarting a server that does not exist prints a clear error to stderr.
+#[test]
+fn test_stdin_restart_unknown_server() {
+    let f = write_toml(
+        r#"
+[servers.only-server]
+command = "sleep"
+args = ["300"]
+"#,
+    );
+
+    let (mut child, mut stdin_writer, _stdout_buf, stderr_buf) = spawn_hub_collecting(f.path());
+
+    // Wait for the hub to start.
+    std::thread::sleep(Duration::from_secs(3));
+
+    // Request restart of a server that doesn't exist.
+    writeln!(stdin_writer, "restart nonexistent").expect("Failed to write to stdin");
+
+    // Wait for the error message to be written to stderr.
+    std::thread::sleep(Duration::from_secs(2));
+
+    child.kill().ok();
+    child.wait().ok();
+    std::thread::sleep(Duration::from_millis(200));
+
+    let stderr = stderr_buf.lock().unwrap().clone();
+
+    assert!(
+        stderr.contains("not found"),
+        "Expected 'not found' error in stderr, got:\n{stderr}"
+    );
+}
+
+/// Tests that typing `help` into the running hub's stdin prints available commands.
+#[test]
+fn test_stdin_help_command() {
+    let f = write_toml(
+        r#"
+[servers.helper-server]
+command = "sleep"
+args = ["300"]
+"#,
+    );
+
+    let (mut child, mut stdin_writer, _stdout_buf, stderr_buf) = spawn_hub_collecting(f.path());
+
+    // Wait for the hub to start.
+    std::thread::sleep(Duration::from_secs(3));
+
+    // Send help command.
+    writeln!(stdin_writer, "help").expect("Failed to write to stdin");
+
+    // Wait for the help text to be written to stderr.
+    std::thread::sleep(Duration::from_secs(2));
+
+    child.kill().ok();
+    child.wait().ok();
+    std::thread::sleep(Duration::from_millis(200));
+
+    let stderr = stderr_buf.lock().unwrap().clone();
+
+    assert!(
+        stderr.contains("Available commands"),
+        "Expected 'Available commands' in stderr, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("restart"),
+        "Expected 'restart' in help output, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("status"),
+        "Expected 'status' in help output, got:\n{stderr}"
     );
 }
