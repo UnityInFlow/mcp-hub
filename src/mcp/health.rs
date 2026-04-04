@@ -1,17 +1,17 @@
-//! MCP health check loop — sends JSON-RPC pings over stdin/stdout.
+//! MCP health check loop — sends JSON-RPC pings via the shared dispatcher.
 //!
-//! This module is implemented in Task 4 (02-02-04). The stub constants and
-//! function signatures are declared here so supervisor.rs can reference them
-//! during the Task 3 watch-channel upgrade (02-02-03).
+//! Phase 3 refactor: `ping_server` and `run_health_check_loop` now accept
+//! `SharedStdin` + `PendingMap` + `Arc<IdAllocator>` instead of owning
+//! `ChildStdin`/`ChildStdout` directly. The `reader_task` in `dispatcher.rs`
+//! owns stdout for the lifetime of the process.
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::anyhow;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{ChildStdin, ChildStdout};
 use tokio_util::sync::CancellationToken;
 
-use crate::mcp::protocol::{JsonRpcResponse, PingRequest};
+use crate::mcp::dispatcher::{IdAllocator, PendingMap, SharedStdin};
+use crate::mcp::protocol::PingRequest;
 use crate::types::{compute_health_status, HealthStatus, ServerSnapshot};
 
 /// Default health check interval in seconds (configurable per server via config).
@@ -19,95 +19,51 @@ pub const DEFAULT_HEALTH_CHECK_INTERVAL_SECS: u64 = 30;
 
 /// Send a single MCP JSON-RPC ping to the server and return latency in milliseconds.
 ///
-/// Writes `PingRequest::new(id)` as newline-delimited JSON to `stdin`, then reads
-/// from `stdout` until a matching response arrives. Non-matching lines (unsolicited
-/// server output) are drained via `tracing::debug!` to prevent pipe backpressure
-/// (PITFALL #2). The entire operation is wrapped in a 5-second timeout (HLTH-04).
+/// Writes `PingRequest::new(id)` via the shared dispatcher and awaits the matching
+/// response within a 5-second timeout. Returns the round-trip latency on success.
 pub async fn ping_server(
-    stdin: &mut ChildStdin,
-    stdout_reader: &mut tokio::io::Lines<BufReader<ChildStdout>>,
+    stdin: &SharedStdin,
+    pending: &PendingMap,
     id: u64,
 ) -> anyhow::Result<u64> {
     let request = PingRequest::new(id);
-    let mut json = serde_json::to_string(&request)?;
-    json.push('\n');
-
     let start = std::time::Instant::now();
 
-    stdin.write_all(json.as_bytes()).await?;
-    stdin.flush().await?;
+    let response =
+        crate::mcp::dispatcher::send_request(stdin, pending, id, &request, 5).await?;
 
-    // Read lines within the 5-second timeout, draining non-matching output.
-    let result = tokio::time::timeout(Duration::from_secs(5), async {
-        // Allow up to 100 non-matching lines before giving up (prevents infinite drain).
-        for _ in 0..100u32 {
-            let line = stdout_reader
-                .next_line()
-                .await
-                .map_err(|e| anyhow!("IO error reading stdout: {e}"))?
-                .ok_or_else(|| anyhow!("stdout closed unexpectedly"))?;
-
-            match serde_json::from_str::<JsonRpcResponse>(&line) {
-                Ok(resp) if resp.id == id => {
-                    if resp.error.is_some() {
-                        return Err(anyhow!(
-                            "Server returned error response to ping id={id}: {:?}",
-                            resp.error
-                        ));
-                    }
-                    return Ok(());
-                }
-                Ok(resp) => {
-                    // Unsolicited response — drain and continue.
-                    tracing::debug!(
-                        "Received out-of-order response id={}, expected id={id}",
-                        resp.id
-                    );
-                }
-                Err(_) => {
-                    // Non-JSON or notification line — drain and continue.
-                    tracing::debug!("Draining non-ping stdout line");
-                }
-            }
-        }
-        Err(anyhow!(
-            "Too many non-matching lines from server during ping id={id}"
-        ))
-    })
-    .await;
-
-    match result {
-        Ok(Ok(())) => Ok(start.elapsed().as_millis() as u64),
-        Ok(Err(e)) => Err(e),
-        Err(_elapsed) => Err(anyhow!("Ping id={id} timed out after 5s")),
+    if response.error.is_some() {
+        anyhow::bail!(
+            "Server returned error response to ping id={id}: {:?}",
+            response.error
+        );
     }
+
+    Ok(start.elapsed().as_millis() as u64)
 }
 
 /// Run the per-server health check loop.
 ///
-/// - Sends MCP JSON-RPC pings at `interval_secs` intervals.
+/// - Sends MCP JSON-RPC pings at `interval_secs` intervals via the shared dispatcher.
 /// - Updates `snapshot_tx` with `HealthStatus::Healthy` on success, or transitions
 ///   through Degraded/Failed on consecutive misses via `compute_health_status`.
 /// - Exits cleanly when `cancel` is triggered.
 ///
-/// The health task owns `stdin` and `stdout` for the lifetime of the spawned process.
+/// The `reader_task` in `dispatcher.rs` owns stdout for the process lifetime.
+/// This task only writes pings via `SharedStdin` and receives responses via `PendingMap`.
 /// The supervisor cancels the token before killing the process, and again on restart.
 pub async fn run_health_check_loop(
     server_name: String,
     interval_secs: u64,
-    stdin: ChildStdin,
-    stdout: ChildStdout,
+    stdin: SharedStdin,
+    pending: PendingMap,
+    id_alloc: Arc<IdAllocator>,
     snapshot_tx: tokio::sync::watch::Sender<ServerSnapshot>,
     cancel: CancellationToken,
 ) {
     use tokio::time::MissedTickBehavior;
 
-    let mut request_id: u64 = 1;
     let mut consecutive_misses: u32 = 0;
-
-    let mut stdin = stdin;
-    let stdout_reader = BufReader::new(stdout);
-    let mut lines = stdout_reader.lines();
 
     let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -121,7 +77,9 @@ pub async fn run_health_check_loop(
             }
         }
 
-        match ping_server(&mut stdin, &mut lines, request_id).await {
+        let request_id = id_alloc.next_id();
+
+        match ping_server(&stdin, &pending, request_id).await {
             Ok(latency_ms) => {
                 let prev_misses = consecutive_misses;
                 consecutive_misses = 0;
@@ -177,7 +135,5 @@ pub async fn run_health_check_loop(
                 });
             }
         }
-
-        request_id += 1;
     }
 }
