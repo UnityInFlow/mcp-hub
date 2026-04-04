@@ -239,6 +239,8 @@ pub async fn run_server_supervisor(
             s.uptime_since = None;
             s.health = HealthStatus::Unknown;
             s.restart_count = total_restarts;
+            // Reset stale capabilities from the previous process instance.
+            s.capabilities = crate::types::McpCapabilities::default();
         });
 
         let spawned = match spawn_server(&name, &config, &env, Some(Arc::clone(&log_agg))) {
@@ -341,6 +343,57 @@ pub async fn run_server_supervisor(
                     cancel,
                 )
                 .await;
+            });
+
+            // Spawn introspection trigger — watches for the first Healthy status,
+            // then runs run_introspection once per process spawn.
+            let introspect_name = name.clone();
+            let stdin_introspect = Arc::clone(&stdin_shared);
+            let pending_introspect = Arc::clone(&pending);
+            let id_introspect = Arc::clone(&id_alloc);
+            let snapshot_introspect = state_tx.clone();
+            let mut health_rx = state_tx.subscribe();
+            let introspect_cancel = health_cancel.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = introspect_cancel.cancelled() => return,
+                        result = health_rx.changed() => {
+                            if result.is_err() {
+                                // Watch channel closed — supervisor is shutting down.
+                                return;
+                            }
+                            let snapshot = health_rx.borrow().clone();
+                            if matches!(snapshot.health, crate::types::HealthStatus::Healthy { .. }) {
+                                // First Healthy — run introspection once for this process spawn.
+                                match crate::mcp::introspect::run_introspection(
+                                    &introspect_name,
+                                    &stdin_introspect,
+                                    &pending_introspect,
+                                    &id_introspect,
+                                    &snapshot_introspect,
+                                )
+                                .await
+                                {
+                                    Ok(_caps) => {
+                                        tracing::info!(
+                                            server = %introspect_name,
+                                            "MCP introspection succeeded"
+                                        );
+                                    }
+                                    Err(err) => {
+                                        tracing::warn!(
+                                            server = %introspect_name,
+                                            "MCP introspection failed: {err}"
+                                        );
+                                    }
+                                }
+                                // Only introspect once per process spawn — exit the loop.
+                                return;
+                            }
+                        }
+                    }
+                }
             });
         } else {
             // Fallback: drain stdout to prevent pipe-buffer backpressure (PITFALL #2).

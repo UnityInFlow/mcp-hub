@@ -20,7 +20,7 @@ pub fn use_colors(no_color_flag: bool) -> bool {
 
 /// Format the status table for the given list of servers and return it as a `String`.
 ///
-/// Columns: Name, State, Health, PID, Uptime, Restarts, Transport (D-09).
+/// Columns: Name, State, Health, PID, Uptime, Restarts, Transport, Tools (D-09).
 pub fn format_status_table(servers: &[(String, ServerSnapshot)], color: bool) -> String {
     let mut table = Table::new();
     table.set_header(vec![
@@ -31,6 +31,7 @@ pub fn format_status_table(servers: &[(String, ServerSnapshot)], color: bool) ->
         "Uptime",
         "Restarts",
         "Transport",
+        "Tools",
     ]);
 
     for (name, snapshot) in servers {
@@ -82,6 +83,18 @@ pub fn format_status_table(servers: &[(String, ServerSnapshot)], color: bool) ->
 
         let restarts_str = snapshot.restart_count.to_string();
 
+        let caps = &snapshot.capabilities;
+        let tools_str = if caps.introspected_at.is_some() {
+            format!(
+                "{}T/{}R/{}P",
+                caps.tools.len(),
+                caps.resources.len(),
+                caps.prompts.len(),
+            )
+        } else {
+            "-".to_string()
+        };
+
         table.add_row(vec![
             Cell::new(name),
             state_cell,
@@ -90,6 +103,7 @@ pub fn format_status_table(servers: &[(String, ServerSnapshot)], color: bool) ->
             Cell::new(&uptime_str),
             Cell::new(&restarts_str),
             Cell::new(&snapshot.transport),
+            Cell::new(&tools_str),
         ]);
     }
 
@@ -98,7 +112,7 @@ pub fn format_status_table(servers: &[(String, ServerSnapshot)], color: bool) ->
 
 /// Print a formatted status table for the given list of servers.
 ///
-/// Columns: Name, State, Health, PID, Uptime, Restarts, Transport (D-09).
+/// Columns: Name, State, Health, PID, Uptime, Restarts, Transport, Tools (D-09).
 /// This is a thin wrapper around [`format_status_table`] for easy testing.
 pub fn print_status_table(servers: &[(String, ServerSnapshot)], color: bool) {
     println!("{}", format_status_table(servers, color));
