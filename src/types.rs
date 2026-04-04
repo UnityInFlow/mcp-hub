@@ -1,7 +1,7 @@
-#![allow(dead_code)]
-
 use std::fmt;
 use std::time::{Duration, Instant};
+
+use crate::mcp::protocol::{McpPrompt, McpResource, McpTool};
 
 /// The lifecycle state of a managed MCP server process.
 ///
@@ -107,6 +107,27 @@ impl fmt::Display for HealthStatus {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// MCP capability snapshot (Phase 3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Capabilities discovered from an MCP server via `tools/list`, `resources/list`,
+/// and `prompts/list` after the `initialize` handshake.
+///
+/// Populated by the introspection task in Phase 3. Empty by default.
+#[derive(Debug, Clone, Default)]
+pub struct McpCapabilities {
+    pub tools: Vec<McpTool>,
+    pub resources: Vec<McpResource>,
+    pub prompts: Vec<McpPrompt>,
+    /// Monotonic timestamp of the most recent successful introspection sweep.
+    pub introspected_at: Option<std::time::Instant>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Server state snapshot
+// ─────────────────────────────────────────────────────────────────────────────
+
 /// A point-in-time snapshot of a managed server's state, health, and metadata.
 ///
 /// Replaces the `(ProcessState, Option<u32>)` watch channel payload in Phase 2.
@@ -119,6 +140,8 @@ pub struct ServerSnapshot {
     pub uptime_since: Option<Instant>,
     pub restart_count: u32,
     pub transport: String,
+    /// MCP capabilities discovered via introspection (populated in Phase 3).
+    pub capabilities: McpCapabilities,
 }
 
 impl Default for ServerSnapshot {
@@ -130,6 +153,7 @@ impl Default for ServerSnapshot {
             uptime_since: None,
             restart_count: 0,
             transport: "stdio".to_string(),
+            capabilities: McpCapabilities::default(),
         }
     }
 }
