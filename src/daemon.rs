@@ -12,8 +12,19 @@ use std::path::PathBuf;
 
 /// Resolve the daemon Unix socket path: `~/.config/mcp-hub/mcp-hub.sock`
 ///
+/// The path can be overridden with the `MCP_HUB_SOCKET` environment variable.
+/// This override is used by integration tests to isolate daemon instances.
+///
 /// Creates the parent directory if it does not already exist.
 pub fn socket_path() -> anyhow::Result<PathBuf> {
+    if let Ok(override_path) = std::env::var("MCP_HUB_SOCKET") {
+        let p = PathBuf::from(override_path);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| anyhow::anyhow!("Failed to create {}: {e}", parent.display()))?;
+        }
+        return Ok(p);
+    }
     let config_dir =
         dirs::config_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine config directory"))?;
     let dir = config_dir.join("mcp-hub");
@@ -23,7 +34,13 @@ pub fn socket_path() -> anyhow::Result<PathBuf> {
 }
 
 /// Resolve the daemon PID file path: `~/.config/mcp-hub/mcp-hub.pid`
+///
+/// The path can be overridden with the `MCP_HUB_PID` environment variable.
+/// This override is used by integration tests to isolate daemon instances.
 pub fn pid_path() -> anyhow::Result<PathBuf> {
+    if let Ok(override_path) = std::env::var("MCP_HUB_PID") {
+        return Ok(PathBuf::from(override_path));
+    }
     let config_dir =
         dirs::config_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine config directory"))?;
     Ok(config_dir.join("mcp-hub").join("mcp-hub.pid"))
