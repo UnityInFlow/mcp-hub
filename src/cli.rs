@@ -29,7 +29,11 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Commands {
     /// Start all configured MCP servers.
-    Start,
+    Start {
+        /// Run as a background daemon.
+        #[arg(long)]
+        daemon: bool,
+    },
 
     /// Stop all running servers.
     Stop,

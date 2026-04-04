@@ -22,7 +22,7 @@ async fn main() -> anyhow::Result<()> {
     let color = output::use_colors(cli.no_color);
 
     match cli.command {
-        Commands::Start => {
+        Commands::Start { daemon: _ } => {
             let config = config::find_and_load_config(cli.config.as_deref())
                 .context("Failed to load config")?;
 
