@@ -1,5 +1,6 @@
 mod cli;
 mod config;
+mod control;
 mod daemon;
 mod logs;
 mod mcp;
