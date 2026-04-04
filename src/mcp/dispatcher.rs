@@ -88,10 +88,7 @@ pub async fn reader_task(stdout: ChildStdout, pending: PendingMap) {
                     // Ignore send errors — the waiter may have timed out and moved on.
                     let _ = sender.send(response);
                 } else {
-                    tracing::debug!(
-                        id = response.id,
-                        "Received response with no pending waiter"
-                    );
+                    tracing::debug!(id = response.id, "Received response with no pending waiter");
                 }
             }
             Err(_) => {
@@ -183,6 +180,7 @@ pub async fn send_request<T: serde::Serialize>(
 /// # Errors
 /// - Serialization fails.
 /// - Writing to stdin fails (process died).
+#[allow(dead_code)] // used in Phase 3 Plan 02 for notifications/initialized
 pub async fn send_notification<T: serde::Serialize>(
     stdin: &SharedStdin,
     notification: &T,

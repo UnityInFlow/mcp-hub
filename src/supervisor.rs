@@ -6,10 +6,12 @@ use std::time::Duration;
 use anyhow::Context as _;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout};
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{resolve_env, HubConfig, ServerConfig};
 use crate::logs::LogAggregator;
+use crate::mcp::dispatcher::{IdAllocator, PendingMap, SharedStdin};
 use crate::types::{BackoffConfig, HealthStatus, ProcessState, ServerSnapshot};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -300,26 +302,41 @@ pub async fn run_server_supervisor(
             s.restart_count = total_restarts;
         });
 
-        // Spawn the MCP health check task if we have both stdin and stdout.
-        // The health task owns stdin (writes pings) and stdout (reads responses).
+        // Spawn the shared dispatcher (reader_task) and health check task.
+        // reader_task owns stdout; health task writes pings via SharedStdin + PendingMap.
         let health_cancel = shutdown.child_token();
         let spawned_stdin = spawned.stdin;
         let spawned_stdout = spawned.stdout;
         let mut child = spawned.child;
 
         if let (Some(stdin), Some(stdout)) = (spawned_stdin, spawned_stdout) {
+            let stdin_shared: SharedStdin = Arc::new(Mutex::new(stdin));
+            let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+            let id_alloc = Arc::new(IdAllocator::new());
+
+            // Spawn the reader task that owns stdout and routes responses by ID.
+            let pending_clone = Arc::clone(&pending);
+            tokio::spawn(async move {
+                crate::mcp::dispatcher::reader_task(stdout, pending_clone).await;
+            });
+
+            // Spawn the health check loop using shared stdin + pending map.
             let health_name = name.clone();
             let health_tx = state_tx.clone();
             let interval = config
                 .health_check_interval
                 .unwrap_or(crate::mcp::health::DEFAULT_HEALTH_CHECK_INTERVAL_SECS);
             let cancel = health_cancel.clone();
+            let stdin_health = Arc::clone(&stdin_shared);
+            let pending_health = Arc::clone(&pending);
+            let id_health = Arc::clone(&id_alloc);
             tokio::spawn(async move {
                 crate::mcp::health::run_health_check_loop(
                     health_name,
                     interval,
-                    stdin,
-                    stdout,
+                    stdin_health,
+                    pending_health,
+                    id_health,
                     health_tx,
                     cancel,
                 )

@@ -29,8 +29,7 @@ pub async fn ping_server(
     let request = PingRequest::new(id);
     let start = std::time::Instant::now();
 
-    let response =
-        crate::mcp::dispatcher::send_request(stdin, pending, id, &request, 5).await?;
+    let response = crate::mcp::dispatcher::send_request(stdin, pending, id, &request, 5).await?;
 
     if response.error.is_some() {
         anyhow::bail!(

@@ -1,3 +1,6 @@
+// Some fields are forward-looking (Phase 3) and not yet read; suppress until wired.
+#![allow(dead_code)]
+
 use std::fmt;
 use std::time::{Duration, Instant};
 
