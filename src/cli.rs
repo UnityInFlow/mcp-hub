@@ -46,6 +46,11 @@ pub enum Commands {
 
     /// Show server logs.
     Logs(LogsArgs),
+
+    /// Reload configuration from disk without restarting the daemon.
+    ///
+    /// Equivalent to sending SIGHUP to the daemon process.
+    Reload,
 }
 
 /// Arguments for the `restart` subcommand.

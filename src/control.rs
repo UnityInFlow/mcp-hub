@@ -253,8 +253,22 @@ async fn dispatch_request(request: DaemonRequest, state: &DaemonState) -> Daemon
         },
 
         DaemonRequest::Reload => {
-            // Placeholder — wired in Plan 03-04.
-            DaemonResponse::err("Reload not yet implemented".to_string())
+            // Send SIGHUP to self so the main event loop's sighup handler triggers
+            // the config reload without requiring a separate reload channel.
+            #[cfg(unix)]
+            {
+                use nix::sys::signal::{kill, Signal};
+                use nix::unistd::Pid;
+                let pid = Pid::from_raw(std::process::id() as i32);
+                match kill(pid, Signal::SIGHUP) {
+                    Ok(()) => DaemonResponse::ok_empty(),
+                    Err(e) => DaemonResponse::err(format!("Failed to send SIGHUP: {e}")),
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                DaemonResponse::err("Reload is not supported on this platform".to_string())
+            }
         }
     }
 }

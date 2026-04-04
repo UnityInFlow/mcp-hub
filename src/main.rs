@@ -105,14 +105,60 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     })
                 };
 
+                // Track the current config so reloads can diff against it.
+                let mut current_config = config;
+
                 // Block until a shutdown signal (SIGTERM, Ctrl+C) or a Stop
                 // command via the control socket cancels the token.
-                tokio::select! {
-                    result = wait_for_shutdown_signal() => {
-                        result?;
+                // SIGHUP triggers a config reload without stopping the daemon.
+                #[cfg(unix)]
+                {
+                    use tokio::signal::unix::{signal, SignalKind};
+
+                    let mut sighup = signal(SignalKind::hangup())
+                        .context("Failed to install SIGHUP handler")?;
+                    let mut sigterm = signal(SignalKind::terminate())
+                        .context("Failed to install SIGTERM handler")?;
+
+                    loop {
+                        tokio::select! {
+                            _ = sighup.recv() => {
+                                tracing::info!("SIGHUP received — reloading config");
+                                handle_reload(
+                                    &daemon_state,
+                                    cli.config.as_deref(),
+                                    &mut current_config,
+                                    &shutdown,
+                                    &log_agg,
+                                ).await;
+                            }
+                            _ = sigterm.recv() => {
+                                tracing::info!("SIGTERM received — shutting down daemon");
+                                break;
+                            }
+                            result = tokio::signal::ctrl_c() => {
+                                result.context("Failed to listen for Ctrl+C")?;
+                                tracing::info!("Ctrl+C received — shutting down daemon");
+                                break;
+                            }
+                            _ = shutdown.cancelled() => {
+                                // Stop command received via control socket.
+                                break;
+                            }
+                        }
                     }
-                    _ = shutdown.cancelled() => {
-                        // Stop command received via control socket.
+                }
+
+                #[cfg(not(unix))]
+                {
+                    tokio::select! {
+                        result = tokio::signal::ctrl_c() => {
+                            result.context("Failed to listen for Ctrl+C")?;
+                            tracing::info!("Ctrl+C received — shutting down daemon");
+                        }
+                        _ = shutdown.cancelled() => {
+                            // Stop command received via control socket.
+                        }
                     }
                 }
 
@@ -242,6 +288,64 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             }
             Ok(())
         }
+
+        Commands::Reload => {
+            // Send a Reload request to the running daemon via the control socket.
+            // The daemon receives this, sends SIGHUP to itself, and the main event
+            // loop picks it up and calls handle_reload.
+            let sock = daemon::socket_path()?;
+            let response =
+                control::send_daemon_command(&sock, &control::DaemonRequest::Reload, 5).await?;
+            if response.ok {
+                println!("Reload signal sent to daemon.");
+            } else {
+                eprintln!(
+                    "Reload failed: {}",
+                    response
+                        .error
+                        .unwrap_or_else(|| "unknown error".to_string())
+                );
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Reload configuration from disk and apply changes to the running daemon.
+///
+/// Diffs the new config against `current_config` and starts/stops/restarts
+/// servers as needed. Updates `current_config` on success so subsequent reloads
+/// diff against the latest state.
+async fn handle_reload(
+    state: &Arc<control::DaemonState>,
+    config_path: Option<&std::path::Path>,
+    current_config: &mut config::HubConfig,
+    shutdown: &CancellationToken,
+    log_agg: &Arc<logs::LogAggregator>,
+) {
+    match config::find_and_load_config(config_path) {
+        Ok(new_config) => {
+            let mut handles = state.handles.lock().await;
+            let (added, removed, changed) = supervisor::apply_config_diff(
+                &mut handles,
+                current_config,
+                &new_config,
+                shutdown,
+                log_agg,
+            )
+            .await;
+            tracing::info!(
+                added,
+                removed,
+                changed,
+                "Config reload complete"
+            );
+            *current_config = new_config;
+        }
+        Err(e) => {
+            tracing::error!("Config reload failed: {e}");
+        }
     }
 }
 
@@ -273,9 +377,11 @@ async fn run_foreground_loop(
     {
         use tokio::signal::unix::{signal, SignalKind};
 
-        // Install the SIGTERM handler once outside the loop.
+        // Install the SIGTERM and SIGHUP handlers once outside the loop.
         let mut sigterm =
             signal(SignalKind::terminate()).context("Failed to install SIGTERM handler")?;
+        let mut sighup =
+            signal(SignalKind::hangup()).context("Failed to install SIGHUP handler")?;
 
         loop {
             tokio::select! {
@@ -309,6 +415,12 @@ async fn run_foreground_loop(
                 _ = sigterm.recv() => {
                     tracing::info!("SIGTERM received");
                     break;
+                }
+                _ = sighup.recv() => {
+                    // Config reload in foreground mode — log a notice. Full reload
+                    // requires access to handles and config path which are not
+                    // available here; use `mcp-hub reload` against a daemon instead.
+                    tracing::info!("SIGHUP received in foreground mode (use daemon mode for config reload)");
                 }
             }
         }
