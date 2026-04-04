@@ -16,15 +16,49 @@ use clap::Parser;
 use cli::{Cli, Commands};
 use tokio_util::sync::CancellationToken;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// Synchronous entry point.
+///
+/// Daemonization via `fork(2)` **must** happen before the Tokio runtime is
+/// created — forking after threads are spawned leads to undefined behaviour.
+/// This function handles the pre-fork work (duplicate-daemon check, fork,
+/// PID file), then builds the Tokio runtime and hands off to `async_main`.
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    // Detect whether `--daemon` was requested so we can fork before Tokio starts.
+    let is_daemon = matches!(cli.command, Commands::Start { daemon: true });
+
+    #[cfg(unix)]
+    if is_daemon {
+        let sock = daemon::socket_path()?;
+        let pid = daemon::pid_path()?;
+        // If a live daemon is already running, bail out here (before fork).
+        daemon::check_existing_daemon(&sock, &pid)?;
+        // Fork into background — the parent process exits here.
+        daemon::daemonize_process()?;
+        // We are now the daemon child. Write our PID.
+        daemon::write_pid_file(&pid)?;
+    }
+
+    #[cfg(not(unix))]
+    if is_daemon {
+        anyhow::bail!("Daemon mode is not supported on Windows. Use foreground mode instead.");
+    }
+
+    // Build the Tokio runtime *after* the fork so threads are not duplicated.
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main(cli))
+}
+
+/// Async main — all Tokio-dependent code lives here.
+async fn async_main(cli: Cli) -> anyhow::Result<()> {
     output::configure_tracing(cli.verbose);
     let color = output::use_colors(cli.no_color);
 
     match cli.command {
-        Commands::Start { daemon: _ } => {
+        Commands::Start { daemon } => {
             let config = config::find_and_load_config(cli.config.as_deref())
                 .context("Failed to load config")?;
 
@@ -46,67 +80,167 @@ async fn main() -> anyhow::Result<()> {
             // Wait for servers to reach initial state (Running, Backoff, or Fatal).
             supervisor::wait_for_initial_states(&mut handles, Duration::from_secs(10)).await;
 
-            // Print status table (D-15).
-            let states = output::collect_states_from_handles(&handles);
-            output::print_status_table(&states, color);
+            if daemon {
+                // ── Daemon mode ─────────────────────────────────────────────
+                // No TTY in daemon mode — run the control socket instead of the
+                // foreground stdin loop.
+                let sock = daemon::socket_path()?;
+                let pid = daemon::pid_path()?;
 
-            // Run the interactive foreground loop (stdin commands + shutdown signal).
-            run_foreground_loop(&handles, color, Arc::clone(&log_agg)).await?;
+                let daemon_state = Arc::new(control::DaemonState {
+                    handles: Arc::new(tokio::sync::Mutex::new(handles)),
+                    log_agg: Arc::clone(&log_agg),
+                    shutdown: shutdown.clone(),
+                    color: false,
+                });
 
-            tracing::info!("Shutting down all servers...");
-            shutdown.cancel();
-            supervisor::stop_all_servers(handles).await;
+                // Spawn the control socket listener as a background task.
+                let socket_task = {
+                    let state = Arc::clone(&daemon_state);
+                    let sock_clone = sock.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = control::run_control_socket(&sock_clone, state).await {
+                            tracing::error!("Control socket error: {e}");
+                        }
+                    })
+                };
 
-            tracing::info!("All servers stopped.");
+                // Block until a shutdown signal (SIGTERM, Ctrl+C) or a Stop
+                // command via the control socket cancels the token.
+                tokio::select! {
+                    result = wait_for_shutdown_signal() => {
+                        result?;
+                    }
+                    _ = shutdown.cancelled() => {
+                        // Stop command received via control socket.
+                    }
+                }
+
+                tracing::info!("Shutting down daemon...");
+                shutdown.cancel();
+
+                // Wait for the control socket to finish serving in-flight requests.
+                socket_task.await.ok();
+
+                // Stop all managed servers.
+                // Clone the handles Arc so we can try_unwrap it once daemon_state is dropped.
+                let handles_arc = Arc::clone(&daemon_state.handles);
+                drop(daemon_state);
+                let final_handles = Arc::try_unwrap(handles_arc)
+                    .map_err(|_| {
+                        anyhow::anyhow!("Cannot unwrap daemon handles — Arc still shared")
+                    })?
+                    .into_inner();
+                supervisor::stop_all_servers(final_handles).await;
+
+                // Remove the PID file now that the daemon is fully stopped.
+                daemon::remove_pid_file(&pid);
+
+                tracing::info!("Daemon stopped.");
+            } else {
+                // ── Foreground mode ─────────────────────────────────────────
+                // Print status table then run the interactive stdin loop.
+                let states = output::collect_states_from_handles(&handles);
+                output::print_status_table(&states, color);
+
+                run_foreground_loop(&handles, color, Arc::clone(&log_agg)).await?;
+
+                tracing::info!("Shutting down all servers...");
+                shutdown.cancel();
+                supervisor::stop_all_servers(handles).await;
+                tracing::info!("All servers stopped.");
+            }
+
             Ok(())
         }
 
         Commands::Stop => {
-            // Phase 1: foreground mode only — stop is Ctrl+C.
-            // Daemon mode (Phase 3) will implement socket-based stop.
-            eprintln!("mcp-hub stop: no daemon running (foreground mode uses Ctrl+C to stop)");
-            std::process::exit(1);
+            // Daemon mode stop — connect to the daemon and send Stop.
+            let sock = daemon::socket_path()?;
+            let request = control::DaemonRequest::Stop;
+            let response = control::send_daemon_command(&sock, &request, 5).await?;
+            if response.ok {
+                eprintln!("Daemon stop signal sent.");
+            } else {
+                eprintln!(
+                    "Stop failed: {}",
+                    response
+                        .error
+                        .unwrap_or_else(|| "unknown error".to_string())
+                );
+                std::process::exit(1);
+            }
+            Ok(())
         }
 
         Commands::Restart(args) => {
-            // Phase 1: restart requires the hub to be running in foreground.
-            // The restart_server function IS implemented in supervisor.rs for Phase 3 wiring.
-            eprintln!(
-                "mcp-hub restart {}: restart is available during foreground operation via the supervisor. \
-                 Daemon-mode restart will be available in a future version.",
-                args.name
-            );
-            std::process::exit(1);
+            // Daemon mode restart — connect to the daemon and send Restart.
+            let sock = daemon::socket_path()?;
+            let request = control::DaemonRequest::Restart { name: args.name };
+            let response = control::send_daemon_command(&sock, &request, 5).await?;
+            if response.ok {
+                eprintln!("Restart signal sent.");
+            } else {
+                eprintln!(
+                    "Restart failed: {}",
+                    response
+                        .error
+                        .unwrap_or_else(|| "unknown error".to_string())
+                );
+                std::process::exit(1);
+            }
+            Ok(())
         }
 
         Commands::Status => {
-            // Phase 2: requires daemon IPC (Phase 3).
-            // In foreground mode, status is available via typing 'status' in the terminal.
-            eprintln!(
-                "mcp-hub status: no daemon running.\n\
-                 In foreground mode, type 'status' in the running hub's terminal.\n\
-                 Daemon-mode status will be available in a future version."
-            );
-            std::process::exit(1);
+            // Daemon mode status — connect to the daemon and request status.
+            let sock = daemon::socket_path()?;
+            let request = control::DaemonRequest::Status;
+            let response = control::send_daemon_command(&sock, &request, 5).await?;
+            if response.ok {
+                if let Some(data) = response.data {
+                    println!("{}", serde_json::to_string_pretty(&data)?);
+                }
+            } else {
+                eprintln!(
+                    "Status failed: {}",
+                    response
+                        .error
+                        .unwrap_or_else(|| "unknown error".to_string())
+                );
+                std::process::exit(1);
+            }
+            Ok(())
         }
 
         Commands::Logs(args) => {
-            // Phase 2: requires daemon IPC (Phase 3) for separate process access.
-            // In foreground mode, logs are visible in the terminal output directly.
-            if args.follow {
-                eprintln!(
-                    "mcp-hub logs --follow: requires daemon mode.\n\
-                     In foreground mode, server logs stream to the terminal automatically.\n\
-                     Daemon-mode log streaming will be available in a future version."
-                );
+            // Daemon mode logs — connect to the daemon and request logs.
+            let sock = daemon::socket_path()?;
+            let request = control::DaemonRequest::Logs {
+                server: args.server,
+                lines: args.lines,
+            };
+            let response = control::send_daemon_command(&sock, &request, 5).await?;
+            if response.ok {
+                if let Some(data) = response.data {
+                    if let Some(lines) = data.as_array() {
+                        for line in lines {
+                            if let Some(s) = line.as_str() {
+                                println!("{s}");
+                            }
+                        }
+                    }
+                }
             } else {
                 eprintln!(
-                    "mcp-hub logs: no daemon running.\n\
-                     In foreground mode, type 'logs' in the running hub's terminal to dump recent logs.\n\
-                     Daemon-mode log access will be available in a future version."
+                    "Logs failed: {}",
+                    response
+                        .error
+                        .unwrap_or_else(|| "unknown error".to_string())
                 );
+                std::process::exit(1);
             }
-            std::process::exit(1);
+            Ok(())
         }
     }
 }

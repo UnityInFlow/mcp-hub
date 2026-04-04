@@ -1,5 +1,3 @@
-// Functions are wired in main.rs (Task 4 of plan 03-03); suppress dead_code until then.
-#![allow(dead_code)]
 /// Daemon mode helpers: PID file management, socket path resolution,
 /// duplicate daemon detection, stale file cleanup, and process forking.
 ///

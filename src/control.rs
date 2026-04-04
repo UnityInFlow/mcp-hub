@@ -1,5 +1,3 @@
-// Functions are wired in main.rs (Task 4 of plan 03-03); suppress dead_code until then.
-#![allow(dead_code)]
 /// Unix domain socket IPC for daemon mode.
 ///
 /// Defines the `DaemonRequest`/`DaemonResponse` wire protocol (newline-delimited
@@ -102,6 +100,8 @@ pub struct DaemonState {
     /// Cancelled when the daemon receives a `Stop` command or SIGTERM.
     pub shutdown: CancellationToken,
     /// Whether to use ANSI colors in log output.
+    /// Reserved for future use when log output is colorized in the daemon.
+    #[allow(dead_code)]
     pub color: bool,
 }
 
