@@ -1,9 +1,16 @@
 //! Health monitor tests — covers PingRequest serialization, JsonRpcResponse deserialization,
 //! and the ping_server / run_health_check_loop integration with a mock MCP echo server.
+//!
+//! Phase 3 refactor: tests now use SharedStdin + PendingMap + reader_task instead of
+//! passing ChildStdin/ChildStdout directly.
 
+use std::sync::Arc;
+
+use mcp_hub::mcp::dispatcher::{reader_task, IdAllocator, PendingMap, SharedStdin};
 use mcp_hub::mcp::health::{run_health_check_loop, DEFAULT_HEALTH_CHECK_INTERVAL_SECS};
 use mcp_hub::mcp::protocol::{JsonRpcResponse, PingRequest};
 use mcp_hub::types::{HealthStatus, ServerSnapshot};
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -105,26 +112,41 @@ while IFS= read -r line; do
 done
 "#;
 
+/// Spawn the ping responder and return (SharedStdin, PendingMap) with reader_task running.
 #[cfg(unix)]
-#[tokio::test]
-async fn ping_server_returns_latency_for_valid_responder() {
-    use mcp_hub::mcp::health::ping_server;
-    use tokio::io::{AsyncBufReadExt, BufReader};
-
+async fn spawn_responder_with_dispatcher() -> (tokio::process::Child, SharedStdin, PendingMap) {
     let mut child = tokio::process::Command::new("bash")
         .arg("-c")
         .arg(PING_RESPONDER_SCRIPT)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
         .spawn()
         .expect("bash should be available");
 
-    let mut stdin = child.stdin.take().expect("stdin should be piped");
+    let stdin = child.stdin.take().expect("stdin should be piped");
     let stdout = child.stdout.take().expect("stdout should be piped");
-    let mut lines = BufReader::new(stdout).lines();
 
-    let result = ping_server(&mut stdin, &mut lines, 1).await;
+    let stdin_shared: SharedStdin = Arc::new(Mutex::new(stdin));
+    let pending: PendingMap = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
+    // Spawn the reader task that owns stdout.
+    let pending_clone = Arc::clone(&pending);
+    tokio::spawn(async move {
+        reader_task(stdout, pending_clone).await;
+    });
+
+    (child, stdin_shared, pending)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn ping_server_returns_latency_for_valid_responder() {
+    use mcp_hub::mcp::health::ping_server;
+
+    let (mut child, stdin_shared, pending) = spawn_responder_with_dispatcher().await;
+
+    let result = ping_server(&stdin_shared, &pending, 1).await;
 
     child.kill().await.ok();
 
@@ -146,7 +168,6 @@ async fn ping_server_returns_latency_for_valid_responder() {
 #[tokio::test]
 async fn ping_timeout() {
     use mcp_hub::mcp::health::ping_server;
-    use tokio::io::{AsyncBufReadExt, BufReader};
 
     // A process that reads stdin but never writes to stdout.
     let mut child = tokio::process::Command::new("bash")
@@ -158,12 +179,20 @@ async fn ping_timeout() {
         .spawn()
         .expect("bash should be available");
 
-    let mut stdin = child.stdin.take().expect("stdin should be piped");
+    let stdin = child.stdin.take().expect("stdin should be piped");
     let stdout = child.stdout.take().expect("stdout should be piped");
-    let mut lines = BufReader::new(stdout).lines();
+
+    let stdin_shared: SharedStdin = Arc::new(Mutex::new(stdin));
+    let pending: PendingMap = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
+    // Spawn reader_task (will block until stdout closes, which never happens here).
+    let pending_clone = Arc::clone(&pending);
+    tokio::spawn(async move {
+        reader_task(stdout, pending_clone).await;
+    });
 
     let start = std::time::Instant::now();
-    let result = ping_server(&mut stdin, &mut lines, 99).await;
+    let result = ping_server(&stdin_shared, &pending, 99).await;
     let elapsed = start.elapsed();
 
     child.kill().await.ok();
@@ -188,23 +217,14 @@ async fn ping_timeout() {
 #[cfg(unix)]
 #[tokio::test]
 async fn run_health_check_loop_sets_healthy_on_first_ping() {
-    let mut child = tokio::process::Command::new("bash")
-        .arg("-c")
-        .arg(PING_RESPONDER_SCRIPT)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("bash should be available");
-
-    let stdin = child.stdin.take().expect("stdin should be piped");
-    let stdout = child.stdout.take().expect("stdout should be piped");
+    let (mut child, stdin_shared, pending) = spawn_responder_with_dispatcher().await;
 
     let initial_snapshot = ServerSnapshot::default();
     let (tx, rx) = tokio::sync::watch::channel(initial_snapshot);
 
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
+    let id_alloc = Arc::new(IdAllocator::new());
 
     // Use a very short interval (100ms) so the test completes quickly.
     let handle = tokio::spawn(async move {
@@ -213,8 +233,9 @@ async fn run_health_check_loop_sets_healthy_on_first_ping() {
             // interval_secs must be u64, use 0 would panic — minimum is 1 for interval.
             // We use a very short delay by passing 1 second and just waiting.
             1,
-            stdin,
-            stdout,
+            stdin_shared,
+            pending,
+            id_alloc,
             tx,
             cancel_clone,
         )
@@ -250,30 +271,22 @@ async fn run_health_check_loop_sets_healthy_on_first_ping() {
 #[cfg(unix)]
 #[tokio::test]
 async fn run_health_check_loop_exits_on_cancel() {
-    let mut child = tokio::process::Command::new("bash")
-        .arg("-c")
-        .arg(PING_RESPONDER_SCRIPT)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("bash should be available");
-
-    let stdin = child.stdin.take().expect("stdin should be piped");
-    let stdout = child.stdout.take().expect("stdout should be piped");
+    let (mut child, stdin_shared, pending) = spawn_responder_with_dispatcher().await;
 
     let initial_snapshot = ServerSnapshot::default();
     let (tx, _rx) = tokio::sync::watch::channel(initial_snapshot);
 
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
+    let id_alloc = Arc::new(IdAllocator::new());
 
     let handle = tokio::spawn(async move {
         run_health_check_loop(
             "test-cancel".to_string(),
             60, // long interval — we test cancellation before first tick
-            stdin,
-            stdout,
+            stdin_shared,
+            pending,
+            id_alloc,
             tx,
             cancel_clone,
         )

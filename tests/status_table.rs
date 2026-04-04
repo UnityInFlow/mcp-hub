@@ -23,6 +23,7 @@ fn running_healthy_snapshot() -> ServerSnapshot {
         uptime_since: Some(Instant::now() - std::time::Duration::from_secs(3661)),
         restart_count: 0,
         transport: "stdio".to_string(),
+        ..ServerSnapshot::default()
     }
 }
 
@@ -40,6 +41,7 @@ fn backoff_degraded_snapshot() -> ServerSnapshot {
         uptime_since: None,
         restart_count: 2,
         transport: "stdio".to_string(),
+        ..ServerSnapshot::default()
     }
 }
 
@@ -53,6 +55,7 @@ fn fatal_failed_snapshot() -> ServerSnapshot {
         uptime_since: None,
         restart_count: 5,
         transport: "stdio".to_string(),
+        ..ServerSnapshot::default()
     }
 }
 

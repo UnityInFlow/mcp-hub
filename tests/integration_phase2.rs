@@ -237,6 +237,7 @@ fn test_status_table_output_has_seven_columns() {
         uptime_since: Some(std::time::Instant::now()),
         restart_count: 0,
         transport: "stdio".to_string(),
+        ..ServerSnapshot::default()
     };
 
     let servers = vec![("test-server".to_string(), snapshot)];
