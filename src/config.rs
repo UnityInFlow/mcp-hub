@@ -22,7 +22,7 @@ fn default_transport() -> String {
 }
 
 /// Per-server configuration block.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ServerConfig {
     /// The executable to run (required, must not be empty).
     pub command: String,
@@ -56,7 +56,7 @@ pub struct ServerConfig {
 }
 
 /// Top-level config structure loaded from `mcp-hub.toml`.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct HubConfig {
     /// Map of server name → server configuration.
     #[serde(default)]
