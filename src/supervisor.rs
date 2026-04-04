@@ -536,6 +536,39 @@ pub struct ServerHandle {
     pub task: tokio::task::JoinHandle<()>,
 }
 
+/// Spawn a supervisor task for a single MCP server.
+///
+/// Extracted from `start_all_servers` so that `apply_config_diff` can start
+/// individual servers when the config changes.
+pub async fn start_single_server(
+    name: &str,
+    config: &ServerConfig,
+    shutdown: &CancellationToken,
+    log_agg: &Arc<LogAggregator>,
+) -> ServerHandle {
+    let initial_snapshot = ServerSnapshot {
+        transport: config.transport.clone(),
+        ..ServerSnapshot::default()
+    };
+    let (state_tx, state_rx) = tokio::sync::watch::channel(initial_snapshot);
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(8);
+    let token = shutdown.child_token();
+    let name_owned = name.to_string();
+    let cfg = config.clone();
+    let agg = Arc::clone(log_agg);
+
+    let task = tokio::spawn(async move {
+        run_server_supervisor(name_owned, cfg, token, cmd_rx, state_tx, agg).await;
+    });
+
+    ServerHandle {
+        name: name.to_string(),
+        state_rx,
+        cmd_tx,
+        task,
+    }
+}
+
 /// Spawn a supervisor task for every server in the config.
 ///
 /// Returns one [`ServerHandle`] per server so the caller can observe state and
@@ -548,30 +581,93 @@ pub async fn start_all_servers(
     let mut handles = Vec::with_capacity(config.servers.len());
 
     for (name, server_config) in &config.servers {
-        let initial_snapshot = ServerSnapshot {
-            transport: server_config.transport.clone(),
-            ..ServerSnapshot::default()
-        };
-        let (state_tx, state_rx) = tokio::sync::watch::channel(initial_snapshot);
-        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(8);
-        let token = shutdown.child_token();
-        let name_owned = name.clone();
-        let cfg = server_config.clone();
-        let agg = Arc::clone(&log_agg);
-
-        let task = tokio::spawn(async move {
-            run_server_supervisor(name_owned, cfg, token, cmd_rx, state_tx, agg).await;
-        });
-
-        handles.push(ServerHandle {
-            name: name.clone(),
-            state_rx,
-            cmd_tx,
-            task,
-        });
+        handles.push(start_single_server(name, server_config, &shutdown, &log_agg).await);
     }
 
     handles
+}
+
+/// Stop a named server, remove it from `handles`, and await its task.
+///
+/// Used by `apply_config_diff` to stop servers that were removed from or changed
+/// in the config file.
+pub async fn stop_named_server(handles: &mut Vec<ServerHandle>, name: &str) {
+    if let Some(pos) = handles.iter().position(|h| h.name == name) {
+        let handle = handles.remove(pos);
+        let _ = handle.cmd_tx.send(SupervisorCommand::Shutdown).await;
+        if let Err(e) = handle.task.await {
+            tracing::warn!(server = %name, "Supervisor task panicked during stop: {e:?}");
+        }
+        tracing::info!(server = %name, "Server stopped (config removed/changed)");
+    }
+}
+
+/// Diff `old_config` against `new_config` and apply the minimum set of changes
+/// to `handles`:
+///
+/// - **Removed servers** (in old but not new): stopped and removed from handles.
+/// - **New servers** (in new but not old): started and added to handles.
+/// - **Changed servers** (in both, config differs): stopped then re-started.
+/// - **Unchanged servers** (in both, config identical): left running.
+///
+/// Returns `(added, removed, changed)` counts for logging.
+pub async fn apply_config_diff(
+    handles: &mut Vec<ServerHandle>,
+    old_config: &HubConfig,
+    new_config: &HubConfig,
+    shutdown: &CancellationToken,
+    log_agg: &Arc<LogAggregator>,
+) -> (usize, usize, usize) {
+    use std::collections::HashSet;
+
+    let old_names: HashSet<&String> = old_config.servers.keys().collect();
+    let new_names: HashSet<&String> = new_config.servers.keys().collect();
+
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    let mut changed = 0usize;
+
+    // Removed servers: in old but not in new.
+    let to_remove: Vec<String> = old_names
+        .difference(&new_names)
+        .map(|s| (*s).clone())
+        .collect();
+    for name in &to_remove {
+        stop_named_server(handles, name).await;
+        removed += 1;
+    }
+
+    // New servers: in new but not in old.
+    let to_add: Vec<String> = new_names
+        .difference(&old_names)
+        .map(|s| (*s).clone())
+        .collect();
+    for name in &to_add {
+        let cfg = &new_config.servers[name];
+        let handle = start_single_server(name, cfg, shutdown, log_agg).await;
+        handles.push(handle);
+        added += 1;
+    }
+
+    // Existing servers: check if config changed.
+    let to_check: Vec<String> = old_names
+        .intersection(&new_names)
+        .map(|s| (*s).clone())
+        .collect();
+    for name in &to_check {
+        let old_cfg = &old_config.servers[name];
+        let new_cfg = &new_config.servers[name];
+        if old_cfg != new_cfg {
+            // Changed — stop old instance, start new one.
+            stop_named_server(handles, name).await;
+            let handle = start_single_server(name, new_cfg, shutdown, log_agg).await;
+            handles.push(handle);
+            changed += 1;
+        }
+        // If equal: skip entirely — no restart needed.
+    }
+
+    (added, removed, changed)
 }
 
 /// Wait until every server has left the `Stopped`/`Starting` transient states,
