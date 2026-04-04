@@ -203,13 +203,13 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         Commands::Stop => {
             // Daemon mode stop — connect to the daemon and send Stop.
             let sock = daemon::socket_path()?;
-            let request = control::DaemonRequest::Stop;
-            let response = control::send_daemon_command(&sock, &request, 5).await?;
+            let response =
+                control::send_daemon_command(&sock, &control::DaemonRequest::Stop, 5).await?;
             if response.ok {
-                eprintln!("Daemon stop signal sent.");
+                println!("Daemon stop command sent. Shutting down...");
             } else {
                 eprintln!(
-                    "Stop failed: {}",
+                    "Error: {}",
                     response
                         .error
                         .unwrap_or_else(|| "unknown error".to_string())
@@ -222,13 +222,20 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         Commands::Restart(args) => {
             // Daemon mode restart — connect to the daemon and send Restart.
             let sock = daemon::socket_path()?;
-            let request = control::DaemonRequest::Restart { name: args.name };
-            let response = control::send_daemon_command(&sock, &request, 5).await?;
+            let server_name = args.name;
+            let response = control::send_daemon_command(
+                &sock,
+                &control::DaemonRequest::Restart {
+                    name: server_name.clone(),
+                },
+                10,
+            )
+            .await?;
             if response.ok {
-                eprintln!("Restart signal sent.");
+                println!("Restart signal sent to '{server_name}'.");
             } else {
                 eprintln!(
-                    "Restart failed: {}",
+                    "Error: {}",
                     response
                         .error
                         .unwrap_or_else(|| "unknown error".to_string())
