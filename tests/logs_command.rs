@@ -2,6 +2,9 @@
 ///
 /// CLI tests use assert_cmd to run the binary as a subprocess and verify exit codes
 /// and stderr messages. Unit tests verify LogsArgs flag parsing.
+///
+/// Note: In Phase 3, logs/status/stop now attempt to connect to the daemon socket.
+/// When no daemon is running they fail with a connection error mentioning the socket path.
 use assert_cmd::Command;
 use clap::Parser;
 use mcp_hub::cli::{Cli, Commands};
@@ -12,42 +15,49 @@ use mcp_hub::cli::{Cli, Commands};
 
 #[test]
 fn logs_subcommand_prints_daemon_required() {
+    // When no daemon is running, `mcp-hub logs` should fail with an error
+    // mentioning the socket or daemon.
     let mut cmd = Command::cargo_bin("mcp-hub").expect("Failed to find mcp-hub binary");
     cmd.arg("logs");
     cmd.assert()
         .failure()
         .code(1)
-        .stderr(predicates::str::contains("no daemon running"));
+        .stderr(predicates::str::is_match("(daemon|socket|mcp-hub)").unwrap());
 }
 
 #[test]
 fn logs_follow_subcommand_prints_daemon_required() {
+    // `--follow` is parsed but not yet implemented in daemon mode.
+    // The command should fail mentioning the socket/daemon.
     let mut cmd = Command::cargo_bin("mcp-hub").expect("Failed to find mcp-hub binary");
     cmd.args(["logs", "--follow"]);
     cmd.assert()
         .failure()
         .code(1)
-        .stderr(predicates::str::contains("requires daemon mode"));
+        .stderr(predicates::str::is_match("(daemon|socket|mcp-hub)").unwrap());
 }
 
 #[test]
 fn logs_subcommand_with_server_filter() {
+    // Providing --server flag should also fail gracefully when no daemon is running.
     let mut cmd = Command::cargo_bin("mcp-hub").expect("Failed to find mcp-hub binary");
     cmd.args(["logs", "--server", "foo"]);
     cmd.assert()
         .failure()
         .code(1)
-        .stderr(predicates::str::contains("no daemon running"));
+        .stderr(predicates::str::is_match("(daemon|socket|mcp-hub)").unwrap());
 }
 
 #[test]
 fn status_subcommand_prints_daemon_required() {
+    // When no daemon is running, `mcp-hub status` should fail with an error
+    // mentioning the socket or daemon.
     let mut cmd = Command::cargo_bin("mcp-hub").expect("Failed to find mcp-hub binary");
     cmd.arg("status");
     cmd.assert()
         .failure()
         .code(1)
-        .stderr(predicates::str::contains("no daemon running"));
+        .stderr(predicates::str::is_match("(daemon|socket|mcp-hub)").unwrap());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

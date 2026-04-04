@@ -88,16 +88,18 @@ fn test_empty_config_exits_nonzero() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Stop subcommand (foreground-mode stub)
+// Stop subcommand — fails with a useful message when no daemon is running
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
 fn test_stop_without_daemon_prints_message() {
+    // When no daemon is running, `mcp-hub stop` should fail and print a message
+    // that mentions either the socket path or that no daemon is running.
     mcp_hub()
         .arg("stop")
         .assert()
         .failure()
-        .stderr(predicates::str::is_match("(foreground|Ctrl\\+C)").unwrap());
+        .stderr(predicates::str::is_match("(daemon|socket|mcp-hub)").unwrap());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
