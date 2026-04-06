@@ -56,7 +56,7 @@
 
 ### Web UI
 
-- [ ] **WEB-01**: Hub serves a web UI on a configurable port (default 3456)
+- [x] **WEB-01**: Hub serves a web UI on a configurable port (default 3456)
 - [ ] **WEB-02**: Status page shows all servers with name, state, PID, uptime, restart count, health, tool count
 - [ ] **WEB-03**: Tools browser page shows tools/resources/prompts per server
 - [ ] **WEB-04**: Log viewer streams logs via SSE (all servers or filtered by server)
@@ -149,7 +149,7 @@
 | GEN-03 | Phase 5 | Pending |
 | GEN-04 | Phase 5 | Pending |
 | GEN-05 | Phase 5 | Pending |
-| WEB-01 | Phase 4 | Pending |
+| WEB-01 | Phase 4 | Complete |
 | WEB-02 | Phase 4 | Pending |
 | WEB-03 | Phase 4 | Pending |
 | WEB-04 | Phase 4 | Pending |
