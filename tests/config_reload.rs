@@ -8,8 +8,8 @@
 use std::collections::HashMap;
 
 use mcp_hub::config::{HubConfig, ServerConfig};
-use mcp_hub::supervisor::{apply_config_diff, start_all_servers};
 use mcp_hub::logs::LogAggregator;
+use mcp_hub::supervisor::{apply_config_diff, start_all_servers};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -103,7 +103,11 @@ async fn unchanged_config_no_restarts() {
     assert_eq!(added, 0, "Unchanged config: no servers should be added");
     assert_eq!(removed, 0, "Unchanged config: no servers should be removed");
     assert_eq!(changed, 0, "Unchanged config: no servers should be changed");
-    assert_eq!(handles.len(), 1, "Handle count must remain 1 after no-op diff");
+    assert_eq!(
+        handles.len(),
+        1,
+        "Handle count must remain 1 after no-op diff"
+    );
 
     // Clean up.
     shutdown.cancel();
@@ -115,13 +119,9 @@ async fn add_new_server() {
     let shutdown = CancellationToken::new();
     let old_cfg = make_hub_config(&[("a", sleep_server())]);
     let new_cfg = make_hub_config(&[("a", sleep_server()), ("b", sleep_server())]);
-    let log_agg = Arc::new(LogAggregator::new(
-        &["a".to_string(), "b".to_string()],
-        100,
-    ));
+    let log_agg = Arc::new(LogAggregator::new(&["a".to_string(), "b".to_string()], 100));
 
-    let mut handles =
-        start_all_servers(&old_cfg, shutdown.clone(), Arc::clone(&log_agg)).await;
+    let mut handles = start_all_servers(&old_cfg, shutdown.clone(), Arc::clone(&log_agg)).await;
     assert_eq!(handles.len(), 1);
 
     let (added, removed, changed) =
@@ -134,7 +134,10 @@ async fn add_new_server() {
 
     let names: Vec<&str> = handles.iter().map(|h| h.name.as_str()).collect();
     assert!(names.contains(&"a"), "Handle for 'a' must still exist");
-    assert!(names.contains(&"b"), "Handle for newly added 'b' must exist");
+    assert!(
+        names.contains(&"b"),
+        "Handle for newly added 'b' must exist"
+    );
 
     shutdown.cancel();
     mcp_hub::supervisor::stop_all_servers(handles).await;
@@ -145,13 +148,9 @@ async fn remove_server() {
     let shutdown = CancellationToken::new();
     let old_cfg = make_hub_config(&[("a", sleep_server()), ("b", sleep_server())]);
     let new_cfg = make_hub_config(&[("a", sleep_server())]);
-    let log_agg = Arc::new(LogAggregator::new(
-        &["a".to_string(), "b".to_string()],
-        100,
-    ));
+    let log_agg = Arc::new(LogAggregator::new(&["a".to_string(), "b".to_string()], 100));
 
-    let mut handles =
-        start_all_servers(&old_cfg, shutdown.clone(), Arc::clone(&log_agg)).await;
+    let mut handles = start_all_servers(&old_cfg, shutdown.clone(), Arc::clone(&log_agg)).await;
     assert_eq!(handles.len(), 2);
 
     let (added, removed, changed) =
@@ -176,8 +175,7 @@ async fn change_server_command() {
     let new_cfg = make_hub_config(&[("a", sleep_server_alt())]);
     let log_agg = Arc::new(LogAggregator::new(&["a".to_string()], 100));
 
-    let mut handles =
-        start_all_servers(&old_cfg, shutdown.clone(), Arc::clone(&log_agg)).await;
+    let mut handles = start_all_servers(&old_cfg, shutdown.clone(), Arc::clone(&log_agg)).await;
     assert_eq!(handles.len(), 1);
 
     // Record the original task ID to confirm it was replaced.
@@ -216,9 +214,9 @@ async fn mixed_config_diff() {
         ("c", sleep_server()),
     ]);
     let new_cfg = make_hub_config(&[
-        ("a", sleep_server()),      // unchanged
+        ("a", sleep_server()),     // unchanged
         ("c", sleep_server_alt()), // changed
-        ("d", sleep_server()),      // new
+        ("d", sleep_server()),     // new
     ]);
     let log_agg = Arc::new(LogAggregator::new(
         &[
@@ -230,8 +228,7 @@ async fn mixed_config_diff() {
         100,
     ));
 
-    let mut handles =
-        start_all_servers(&old_cfg, shutdown.clone(), Arc::clone(&log_agg)).await;
+    let mut handles = start_all_servers(&old_cfg, shutdown.clone(), Arc::clone(&log_agg)).await;
     assert_eq!(handles.len(), 3);
 
     let (added, removed, changed) =
