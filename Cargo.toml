@@ -24,9 +24,16 @@ dirs = "5"
 comfy-table = "7"
 owo-colors = { version = "4", features = ["supports-colors"] }
 rand = "0.9"
+axum = "0.8"
+askama = "0.15"
+askama_web = { version = "0.15", features = ["axum-0.8"] }
+tower-http = { version = "0.6", features = ["timeout", "cors"] }
+tokio-stream = "0.1"
+futures-util = "0.3"
 
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
 tokio-test = "0.4"
+portpicker = "0.1"

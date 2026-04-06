@@ -21,6 +21,26 @@ fn default_transport() -> String {
     "stdio".to_string()
 }
 
+fn default_web_port() -> u16 {
+    3456
+}
+
+/// Global hub configuration from the optional `[hub]` section.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HubGlobalConfig {
+    /// Port for the web UI (default 3456). Per D-05, WEB-01.
+    #[serde(default = "default_web_port")]
+    pub web_port: u16,
+}
+
+impl Default for HubGlobalConfig {
+    fn default() -> Self {
+        Self {
+            web_port: default_web_port(),
+        }
+    }
+}
+
 /// Per-server configuration block.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ServerConfig {
@@ -58,6 +78,9 @@ pub struct ServerConfig {
 /// Top-level config structure loaded from `mcp-hub.toml`.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct HubConfig {
+    /// Global hub settings from the optional `[hub]` section.
+    #[serde(default)]
+    pub hub: HubGlobalConfig,
     /// Map of server name → server configuration.
     #[serde(default)]
     pub servers: HashMap<String, ServerConfig>,
@@ -195,5 +218,33 @@ pub fn find_and_load_config(explicit_path: Option<&std::path::Path>) -> anyhow::
             g.servers.extend(l.servers);
             Ok(g)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hub_config_web_port() {
+        let toml_str = r#"
+[hub]
+web_port = 8080
+
+[servers.test]
+command = "echo"
+"#;
+        let config: HubConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.hub.web_port, 8080);
+    }
+
+    #[test]
+    fn hub_config_default_port() {
+        let toml_str = r#"
+[servers.test]
+command = "echo"
+"#;
+        let config: HubConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.hub.web_port, 3456);
     }
 }
