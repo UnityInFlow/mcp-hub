@@ -62,6 +62,13 @@
 
 **Requirements:** WEB-01, WEB-02, WEB-03, WEB-04, WEB-05
 
+**Plans:** 3 plans
+
+### Plans
+- [ ] 04-01-PLAN.md — Web UI foundation: dependencies, config, module skeleton, static assets, templates
+- [ ] 04-02-PLAN.md — Route handlers, SSE log streaming, askama templates, /health endpoint
+- [ ] 04-03-PLAN.md — Integration into main.rs, tests, browser verification
+
 ### Success Criteria
 1. Opening `http://localhost:3456` in a browser shows all servers with name, state, PID, uptime, restart count, health state, and tool count.
 2. The tools browser page lists each server's tools, resources, and prompts from the latest introspection.
@@ -131,4 +138,4 @@
 
 ---
 
-*Last updated: 2026-04-02*
+*Last updated: 2026-04-06*
