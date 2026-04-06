@@ -37,7 +37,10 @@ fn single_server_config(name: &str, command: &str, args: Vec<&str>) -> HubConfig
 
     let mut servers = HashMap::new();
     servers.insert(name.to_string(), server);
-    HubConfig { servers }
+    HubConfig {
+        hub: Default::default(),
+        servers,
+    }
 }
 
 /// Build a config with a custom health_check_interval (in seconds).
@@ -61,7 +64,10 @@ fn single_server_config_with_health(
 
     let mut servers = HashMap::new();
     servers.insert(name.to_string(), server);
-    HubConfig { servers }
+    HubConfig {
+        hub: Default::default(),
+        servers,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

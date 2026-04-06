@@ -36,7 +36,10 @@ fn make_hub_config(entries: &[(&str, ServerConfig)]) -> HubConfig {
     for (name, cfg) in entries {
         servers.insert((*name).to_string(), cfg.clone());
     }
-    HubConfig { servers }
+    HubConfig {
+        hub: Default::default(),
+        servers,
+    }
 }
 
 /// Build a long-running process config that does nothing and can be stopped.

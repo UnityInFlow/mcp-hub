@@ -751,6 +751,7 @@ dependencies = [
  "comfy-table",
  "dirs",
  "futures-util",
+ "http-body-util",
  "nix",
  "owo-colors",
  "portpicker",
@@ -765,6 +766,7 @@ dependencies = [
  "tokio-test",
  "tokio-util",
  "toml",
+ "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",
@@ -1388,6 +1390,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

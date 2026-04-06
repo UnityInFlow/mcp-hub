@@ -1,0 +1,31 @@
+{% if tools.is_empty() && resources.is_empty() && prompts.is_empty() %}
+<p style="color: var(--text-muted); padding: 0.5rem 0;">No capabilities discovered.</p>
+{% else %}
+{% if !tools.is_empty() %}
+<h4 style="font-size: 0.85rem; color: var(--text-muted); margin: 0.5rem 0 0.25rem;">Tools</h4>
+{% for tool in tools %}
+<div class="tool-item">
+  <div class="tool-name">{{ tool.name }}</div>
+  <div class="tool-desc">{{ tool.description }}</div>
+</div>
+{% endfor %}
+{% endif %}
+{% if !resources.is_empty() %}
+<h4 style="font-size: 0.85rem; color: var(--text-muted); margin: 0.5rem 0 0.25rem;">Resources</h4>
+{% for res in resources %}
+<div class="tool-item">
+  <div class="tool-name">{{ res.name }} <span style="color: var(--text-muted); font-size: 0.8rem;">({{ res.uri }})</span></div>
+  <div class="tool-desc">{{ res.description }}</div>
+</div>
+{% endfor %}
+{% endif %}
+{% if !prompts.is_empty() %}
+<h4 style="font-size: 0.85rem; color: var(--text-muted); margin: 0.5rem 0 0.25rem;">Prompts</h4>
+{% for prompt in prompts %}
+<div class="tool-item">
+  <div class="tool-name">{{ prompt.name }}</div>
+  <div class="tool-desc">{{ prompt.description }}</div>
+</div>
+{% endfor %}
+{% endif %}
+{% endif %}

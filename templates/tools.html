@@ -7,6 +7,22 @@
     <h2>No servers configured</h2>
     <p>Add servers to mcp-hub.toml to get started.</p>
   </div>
+  {% else %}
+  {% for server in servers %}
+  <div class="accordion-item">
+    <div class="accordion-header"
+         hx-get="/partials/tools/{{ server.name }}"
+         hx-target="#tools-{{ loop.index }}"
+         hx-swap="innerHTML"
+         hx-trigger="click once">
+      <span>{{ server.name }}</span>
+      <span>{% if server.has_been_introspected %}{{ server.tool_count }}T / {{ server.resource_count }}R / {{ server.prompt_count }}P{% else %}not introspected{% endif %}</span>
+    </div>
+    <div class="accordion-body" id="tools-{{ loop.index }}">
+      <!-- Lazy-loaded via HTMX on click -->
+    </div>
+  </div>
+  {% endfor %}
   {% endif %}
 </div>
 {% endblock %}

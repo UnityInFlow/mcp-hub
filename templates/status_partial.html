@@ -1,0 +1,24 @@
+{% if servers.is_empty() %}
+<div class="empty-state">
+  <h2>No servers configured</h2>
+  <p>Add servers to mcp-hub.toml to get started.</p>
+</div>
+{% else %}
+<div class="card-grid">
+{% for server in servers %}
+<div class="server-card">
+  <div class="card-header">
+    <span class="status-dot {{ server.state_class }}"></span>
+    <span class="server-name">{{ server.name }}</span>
+    <span class="health-badge {{ server.health_class }}">{{ server.health }}</span>
+  </div>
+  <div class="card-body">
+    <span class="label">PID</span><span>{{ server.pid }}</span>
+    <span class="label">Uptime</span><span>{{ server.uptime }}</span>
+    <span class="label">Restarts</span><span>{{ server.restart_count }}</span>
+    <span class="label">Tools</span><span>{{ server.tool_count }}</span>
+  </div>
+</div>
+{% endfor %}
+</div>
+{% endif %}

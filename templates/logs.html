@@ -1,10 +1,18 @@
 {% extends "base.html" %}
 {% block content %}
 <div class="filter-pills" id="filter-pills">
+  <a href="/logs"
+     hx-get="/logs" hx-target="#main" hx-push-url="true"
+     class="filter-pill {% if active_filter.is_none() %}active{% endif %}">All</a>
+  {% for server in servers %}
+  <a href="/logs?server={{ server.name }}"
+     hx-get="/logs?server={{ server.name }}" hx-target="#main" hx-push-url="true"
+     class="filter-pill {% if server.active %}active{% endif %}">{{ server.name }}</a>
+  {% endfor %}
 </div>
 <div class="log-container" id="log-stream"
      hx-ext="sse"
-     sse-connect="/logs/stream"
+     sse-connect="{{ sse_url }}"
      sse-swap="log"
      hx-swap="beforeend">
 </div>

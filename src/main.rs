@@ -95,6 +95,20 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     color: false,
                 });
 
+                // Spawn web UI server (Phase 4 -- WEB-01).
+                let web_port = config.hub.web_port;
+                let web_state = Arc::new(web::WebState {
+                    handles: Arc::clone(&daemon_state.handles),
+                    log_agg: Arc::clone(&log_agg),
+                });
+                let web_shutdown = shutdown.clone();
+                let web_task = tokio::spawn(async move {
+                    if let Err(e) = web::start_web_server(web_port, web_state, web_shutdown).await {
+                        tracing::error!("Web UI error: {e}");
+                    }
+                });
+                tracing::info!("Web UI available at http://127.0.0.1:{web_port}");
+
                 // Spawn the control socket listener as a background task.
                 let socket_task = {
                     let state = Arc::clone(&daemon_state);
@@ -168,6 +182,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
                 // Wait for the control socket to finish serving in-flight requests.
                 socket_task.await.ok();
+                web_task.abort(); // Stop web server
 
                 // Stop all managed servers.
                 // Clone the handles Arc so we can try_unwrap it once daemon_state is dropped.
@@ -186,15 +201,43 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 tracing::info!("Daemon stopped.");
             } else {
                 // ── Foreground mode ─────────────────────────────────────────
-                // Print status table then run the interactive stdin loop.
+                // Print initial status, then wrap handles in Arc<Mutex> for web server sharing.
                 let states = output::collect_states_from_handles(&handles);
                 output::print_status_table(&states, color);
 
-                run_foreground_loop(&handles, color, Arc::clone(&log_agg)).await?;
+                // Wrap handles for web server sharing.
+                let handles_arc = Arc::new(tokio::sync::Mutex::new(handles));
+
+                // Spawn web UI server (Phase 4 -- WEB-01).
+                let web_state = Arc::new(web::WebState {
+                    handles: Arc::clone(&handles_arc),
+                    log_agg: Arc::clone(&log_agg),
+                });
+                let web_shutdown = shutdown.clone();
+                let _web_task = tokio::spawn(async move {
+                    if let Err(e) =
+                        web::start_web_server(config.hub.web_port, web_state, web_shutdown).await
+                    {
+                        tracing::error!("Web UI error: {e}");
+                    }
+                });
+                tracing::info!(
+                    "Web UI available at http://127.0.0.1:{}",
+                    config.hub.web_port
+                );
+
+                run_foreground_loop_shared(&handles_arc, color, Arc::clone(&log_agg)).await?;
 
                 tracing::info!("Shutting down all servers...");
                 shutdown.cancel();
-                supervisor::stop_all_servers(handles).await;
+
+                // Recover handles for stop.
+                let final_handles = Arc::try_unwrap(handles_arc)
+                    .map_err(|_| {
+                        anyhow::anyhow!("Cannot unwrap foreground handles — Arc still shared")
+                    })?
+                    .into_inner();
+                supervisor::stop_all_servers(final_handles).await;
                 tracing::info!("All servers stopped.");
             }
 
@@ -352,17 +395,20 @@ async fn handle_reload(
     }
 }
 
-/// Run the interactive foreground loop.
+/// Run the interactive foreground loop with Arc-wrapped handles for web server sharing.
 ///
 /// Concurrently reads commands from stdin and waits for a shutdown signal
 /// (Ctrl+C or SIGTERM). Typing `restart <name>` restarts the named server,
 /// `status` reprints the status table, `logs` dumps recent logs, and `help`
 /// lists all available commands.
 ///
+/// Handles are wrapped in `Arc<Mutex<Vec<ServerHandle>>>` so they can be shared
+/// concurrently with the web server spawned in foreground mode.
+///
 /// When stdin is closed (e.g. piped input exhausted), the function falls back
 /// to waiting for a shutdown signal so the hub does not exit unexpectedly.
-async fn run_foreground_loop(
-    handles: &[supervisor::ServerHandle],
+async fn run_foreground_loop_shared(
+    handles: &Arc<tokio::sync::Mutex<Vec<supervisor::ServerHandle>>>,
     color: bool,
     log_agg: Arc<logs::LogAggregator>,
 ) -> anyhow::Result<()> {
@@ -395,7 +441,8 @@ async fn run_foreground_loop(
                             if trimmed.is_empty() {
                                 continue;
                             }
-                            handle_stdin_command(trimmed, handles, color, &log_agg).await;
+                            let h = handles.lock().await;
+                            handle_stdin_command(trimmed, &h, color, &log_agg).await;
                         }
                         Ok(None) => {
                             // stdin closed — fall back to waiting for a signal.
@@ -440,7 +487,8 @@ async fn run_foreground_loop(
                             if trimmed.is_empty() {
                                 continue;
                             }
-                            handle_stdin_command(trimmed, handles, color, &log_agg).await;
+                            let h = handles.lock().await;
+                            handle_stdin_command(trimmed, &h, color, &log_agg).await;
                         }
                         Ok(None) => {
                             tracing::debug!("stdin closed; waiting for shutdown signal");
