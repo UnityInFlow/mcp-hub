@@ -1,0 +1,10 @@
+[hub]
+web_port = 3456
+
+[servers.echo-server]
+command = "bash"
+args = ["-c", "while true; do echo 'hello from echo-server' >&2; sleep 2; done"]
+
+[servers.date-server]
+command = "bash"
+args = ["-c", "while true; do date >&2; sleep 3; done"]
