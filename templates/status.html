@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block header_stats %}{{ total_count }} servers | {{ healthy_count }} healthy{% endblock %}
+{% block content %}
+<div id="server-cards"
+     hx-get="/partials/status"
+     hx-trigger="every 3s"
+     hx-swap="innerHTML">
+  {% if servers.is_empty() %}
+  <div class="empty-state">
+    <h2>No servers configured</h2>
+    <p>Add servers to mcp-hub.toml to get started.</p>
+  </div>
+  {% else %}
+  <div class="card-grid">
+  {% for server in servers %}
+  {% endfor %}
+  </div>
+  {% endif %}
+</div>
+{% endblock %}

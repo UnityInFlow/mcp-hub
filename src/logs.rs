@@ -195,7 +195,7 @@ fn server_color(name: &str) -> AnsiColors {
 /// Format a `SystemTime` as `YYYY-MM-DDTHH:MM:SSZ` (RFC 3339, second precision).
 ///
 /// Uses manual arithmetic on `duration_since(UNIX_EPOCH)` — no chrono dependency.
-fn format_system_time(t: SystemTime) -> String {
+pub(crate) fn format_system_time(t: SystemTime) -> String {
     let secs = t
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()

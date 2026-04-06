@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="filter-pills" id="filter-pills">
+</div>
+<div class="log-container" id="log-stream"
+     hx-ext="sse"
+     sse-connect="/logs/stream"
+     sse-swap="log"
+     hx-swap="beforeend">
+</div>
+{% endblock %}

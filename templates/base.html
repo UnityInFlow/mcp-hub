@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>mcp-hub</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/htmx.min.js"></script>
+  <script src="/static/htmx-sse.js"></script>
+</head>
+<body>
+  <div class="header">
+    <h1>mcp-hub</h1>
+    <span class="stats">{% block header_stats %}{% endblock %}</span>
+  </div>
+  <nav class="nav-tabs">
+    <a href="/" hx-get="/" hx-target="#main" hx-push-url="true"
+       class="{% if active_tab == "status" %}active{% endif %}">Status</a>
+    <a href="/tools" hx-get="/tools" hx-target="#main" hx-push-url="true"
+       class="{% if active_tab == "tools" %}active{% endif %}">Tools</a>
+    <a href="/logs" hx-get="/logs" hx-target="#main" hx-push-url="true"
+       class="{% if active_tab == "logs" %}active{% endif %}">Logs</a>
+  </nav>
+  <div class="content" id="main">
+    {% block content %}{% endblock %}
+  </div>
+</body>
+</html>

@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block header_stats %}{{ total_count }} servers{% endblock %}
+{% block content %}
+<div id="tools-list">
+  {% if servers.is_empty() %}
+  <div class="empty-state">
+    <h2>No servers configured</h2>
+    <p>Add servers to mcp-hub.toml to get started.</p>
+  </div>
+  {% endif %}
+</div>
+{% endblock %}

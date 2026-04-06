@@ -7,6 +7,7 @@ mod mcp;
 mod output;
 mod supervisor;
 mod types;
+mod web;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -115,8 +116,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 {
                     use tokio::signal::unix::{signal, SignalKind};
 
-                    let mut sighup = signal(SignalKind::hangup())
-                        .context("Failed to install SIGHUP handler")?;
+                    let mut sighup =
+                        signal(SignalKind::hangup()).context("Failed to install SIGHUP handler")?;
                     let mut sigterm = signal(SignalKind::terminate())
                         .context("Failed to install SIGTERM handler")?;
 
@@ -342,12 +343,7 @@ async fn handle_reload(
                 log_agg,
             )
             .await;
-            tracing::info!(
-                added,
-                removed,
-                changed,
-                "Config reload complete"
-            );
+            tracing::info!(added, removed, changed, "Config reload complete");
             *current_config = new_config;
         }
         Err(e) => {
