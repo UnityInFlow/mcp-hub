@@ -21,9 +21,9 @@ Developers running 5+ MCP servers can manage them all from one place — one con
 - Full MCP introspection: initialize + tools/list + resources/list + prompts/list with concurrent JSON-RPC ID correlation — Validated in Phase 3
 - Daemon mode (--daemon flag): daemonizes with Unix socket IPC, PID file, duplicate prevention — Validated in Phase 3
 - Config reload via SIGHUP: diff-based (unchanged=skip, changed=restart, new=start, removed=stop) — Validated in Phase 3
+- Web UI: Axum + HTMX, status card grid, tools accordion, SSE log streaming, /health JSON endpoint — Validated in Phase 4
 
 ### Active
-- [ ] Web UI: lists running servers, health status, available tools from introspection
 - [ ] Claude Code config generator: outputs correct settings.json mcpServers block
 - [ ] Cursor config generator: outputs Cursor MCP config snippet
 - [ ] Config gen modes: from TOML (offline) and --live (from running introspection)
@@ -89,4 +89,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-04 after Phase 3 completion*
+*Last updated: 2026-04-06 after Phase 4 completion*
