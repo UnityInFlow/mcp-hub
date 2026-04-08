@@ -65,39 +65,44 @@ pub fn render_cursor_config(
 
 /// Parse a daemon `Status` response into a `Vec<ServerLiveInfo>`.
 ///
-/// For Phase 5 Plan 01, tool names are not yet included in the daemon
-/// response payload; they are left empty and will be wired in Plan 02.
+/// Returns `Err` if the response indicates failure (`ok == false`) or has an
+/// unexpected structure. All JSON field access uses safe accessor methods —
+/// no panics on malformed input (T-05-07 mitigation).
 pub fn parse_live_info(response: &DaemonResponse) -> anyhow::Result<Vec<ServerLiveInfo>> {
+    anyhow::ensure!(
+        response.ok,
+        "Daemon status query failed: {:?}",
+        response.error
+    );
+
     let data = response
         .data
         .as_ref()
-        .context("Daemon status response contained no data")?;
+        .context("Empty status response from daemon")?;
 
     let servers = data
         .as_array()
-        .context("Daemon status data is not a JSON array")?;
+        .context("Expected array from status response")?;
 
-    let mut result = Vec::with_capacity(servers.len());
-    for entry in servers {
-        let name = entry
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let state = entry
-            .get("state")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_string();
-        result.push(ServerLiveInfo {
-            name,
-            state,
-            tool_names: Vec::new(), // extended in Plan 02
-            resource_count: 0,
-            prompt_count: 0,
-        });
-    }
-    Ok(result)
+    servers
+        .iter()
+        .map(|s| {
+            Ok(ServerLiveInfo {
+                name: s["name"].as_str().unwrap_or_default().to_string(),
+                state: s["state"].as_str().unwrap_or("unknown").to_string(),
+                tool_names: s["tool_names"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                resource_count: s["resources"].as_u64().unwrap_or(0) as usize,
+                prompt_count: s["prompts"].as_u64().unwrap_or(0) as usize,
+            })
+        })
+        .collect()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -396,6 +401,102 @@ mod tests {
         assert!(
             output.contains("\"API_KEY\": \"secret123\""),
             "env vars must appear in output"
+        );
+    }
+
+    // ── Plan 02 tests ─────────────────────────────────────────────────────────
+
+    use crate::control::DaemonResponse;
+    use serde_json::json;
+
+    #[test]
+    fn test_parse_live_info_success() {
+        let response = DaemonResponse::success(json!([{
+            "name": "fs",
+            "state": "running",
+            "tool_names": ["read", "write"],
+            "tools": 2,
+            "resources": 0,
+            "prompts": 0,
+            "resource_names": [],
+            "prompt_names": []
+        }]));
+        let result = parse_live_info(&response).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "fs");
+        assert_eq!(result[0].state, "running");
+        assert_eq!(result[0].tool_names, vec!["read", "write"]);
+    }
+
+    #[test]
+    fn test_parse_live_info_failure() {
+        let response = DaemonResponse::err("test error".to_string());
+        let result = parse_live_info(&response);
+        assert!(
+            result.is_err(),
+            "parse_live_info must return Err for failed response"
+        );
+    }
+
+    #[test]
+    fn test_parse_live_info_empty_array() {
+        let response = DaemonResponse::success(json!([]));
+        let result = parse_live_info(&response).unwrap();
+        assert!(result.is_empty(), "empty array must produce empty Vec");
+    }
+
+    #[test]
+    fn test_live_comments_running_with_tools() {
+        let config = make_config(vec![("filesystem", make_server("npx", vec![]))]);
+        let live_info = vec![ServerLiveInfo {
+            name: "filesystem".to_string(),
+            state: "running".to_string(),
+            tool_names: vec!["read".to_string(), "write".to_string()],
+            resource_count: 0,
+            prompt_count: 0,
+        }];
+        let output = render_claude_config(&config, Some(&live_info)).unwrap();
+        assert!(
+            output.contains("// filesystem: tools=[read, write]"),
+            "running server with tools must produce tools comment, got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn test_live_comments_stopped_server() {
+        let config = make_config(vec![("filesystem", make_server("npx", vec![]))]);
+        let live_info = vec![ServerLiveInfo {
+            name: "filesystem".to_string(),
+            state: "stopped".to_string(),
+            tool_names: vec![],
+            resource_count: 0,
+            prompt_count: 0,
+        }];
+        let output = render_claude_config(&config, Some(&live_info)).unwrap();
+        assert!(
+            output.contains("// WARNING: filesystem is not running (state: stopped)"),
+            "stopped server must produce WARNING comment, got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn test_live_comments_stopped_with_cached_tools() {
+        let config = make_config(vec![("filesystem", make_server("npx", vec![]))]);
+        let live_info = vec![ServerLiveInfo {
+            name: "filesystem".to_string(),
+            state: "stopped".to_string(),
+            tool_names: vec!["read".to_string()],
+            resource_count: 0,
+            prompt_count: 0,
+        }];
+        let output = render_claude_config(&config, Some(&live_info)).unwrap();
+        assert!(
+            output.contains("// WARNING: filesystem is not running (state: stopped)"),
+            "stopped server with cached tools must produce WARNING, got:\n{output}"
+        );
+        assert!(
+            output.contains("// filesystem: tools=[read]"),
+            "stopped server with cached tools must ALSO produce tools comment, got:\n{output}"
         );
     }
 }

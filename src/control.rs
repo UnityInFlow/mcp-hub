@@ -203,8 +203,11 @@ async fn dispatch_request(request: DaemonRequest, state: &DaemonState) -> Daemon
                         "restart_count": snapshot.restart_count,
                         "transport": snapshot.transport,
                         "tools": snapshot.capabilities.tools.len(),
+                        "tool_names": snapshot.capabilities.tools.iter().map(|t| &t.name).collect::<Vec<_>>(),
                         "resources": snapshot.capabilities.resources.len(),
+                        "resource_names": snapshot.capabilities.resources.iter().map(|r| &r.name).collect::<Vec<_>>(),
                         "prompts": snapshot.capabilities.prompts.len(),
+                        "prompt_names": snapshot.capabilities.prompts.iter().map(|p| &p.name).collect::<Vec<_>>(),
                     })
                 })
                 .collect();
