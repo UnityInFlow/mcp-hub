@@ -184,6 +184,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 // Wait for the control socket to finish serving in-flight requests.
                 socket_task.await.ok();
                 web_task.abort(); // Stop web server
+                let _ = web_task.await; // Wait for task to release its Arc clone before try_unwrap.
 
                 // Stop all managed servers.
                 // Clone the handles Arc so we can try_unwrap it once daemon_state is dropped.
@@ -215,7 +216,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     log_agg: Arc::clone(&log_agg),
                 });
                 let web_shutdown = shutdown.clone();
-                let _web_task = tokio::spawn(async move {
+                let web_task = tokio::spawn(async move {
                     if let Err(e) =
                         web::start_web_server(config.hub.web_port, web_state, web_shutdown).await
                     {
@@ -231,6 +232,10 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
                 tracing::info!("Shutting down all servers...");
                 shutdown.cancel();
+
+                // Abort the web task and await it so it releases its Arc clone before try_unwrap.
+                web_task.abort();
+                let _ = web_task.await;
 
                 // Recover handles for stop.
                 let final_handles = Arc::try_unwrap(handles_arc)
