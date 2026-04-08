@@ -3,6 +3,7 @@ mod config;
 mod control;
 mod daemon;
 mod gen_config;
+mod init;
 mod logs;
 mod mcp;
 mod output;
@@ -366,6 +367,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             }
             Ok(())
         }
+
+        Commands::Init => init::run_init_wizard(),
 
         Commands::GenConfig(args) => {
             let config = config::find_and_load_config(cli.config.as_deref())

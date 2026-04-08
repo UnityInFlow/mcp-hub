@@ -54,6 +54,9 @@ pub enum Commands {
 
     /// Generate a Claude Code or Cursor config snippet from the hub's server list.
     GenConfig(GenConfigArgs),
+
+    /// Interactively add a new MCP server to ./mcp-hub.toml.
+    Init,
 }
 
 /// Arguments for the `gen-config` subcommand.
