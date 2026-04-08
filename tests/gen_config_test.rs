@@ -77,7 +77,9 @@ fn claude_format_outputs_valid_json() {
         .stdout(predicate::str::contains("\"filesystem\""))
         .stdout(predicate::str::contains("\"github\""))
         .stdout(predicate::str::contains("\"command\": \"npx\""))
-        .stdout(predicate::str::contains("\"GITHUB_TOKEN\": \"ghp_test123\""));
+        .stdout(predicate::str::contains(
+            "\"GITHUB_TOKEN\": \"ghp_test123\"",
+        ));
 }
 
 /// `--format cursor` produces JSON on stdout with the Cursor-specific header.
@@ -170,8 +172,8 @@ fn http_transport_excluded() {
 
     // Verify "remote-api" does NOT appear as a JSON key inside mcpServers.
     // It may appear in the WARNING comment line, but not as `"remote-api":`.
-    let output = String::from_utf8(assert.get_output().stdout.clone())
-        .expect("stdout is valid UTF-8");
+    let output =
+        String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is valid UTF-8");
 
     // Find the JSON block start (first `{`) and check inside it.
     let json_start = output.find('{').expect("output must contain JSON block");
