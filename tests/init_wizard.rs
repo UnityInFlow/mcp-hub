@@ -167,3 +167,64 @@ fn test_new_file_no_leading_blank_line() {
         "new file must not start with a blank line"
     );
 }
+
+// -- TOML escaping roundtrip tests (CR-01 regression) ----------------------
+
+#[test]
+fn test_format_block_escapes_backslash_and_quote() {
+    // Command with backslash (Windows path)
+    let command = r#"C:\tools\mcp.exe"#;
+    let block = format_toml_block("win", command, &[], "stdio");
+    let content = block.trim_start_matches('\n');
+    let parsed: toml::Value =
+        toml::from_str(content).expect("TOML with escaped backslash must parse");
+    let parsed_cmd = parsed["servers"]["win"]["command"].as_str().unwrap();
+    assert_eq!(parsed_cmd, command, "backslash must roundtrip");
+}
+
+#[test]
+fn test_format_block_escapes_double_quote_in_command() {
+    let command = r#"node "my server.js""#;
+    let block = format_toml_block("quoted", command, &[], "stdio");
+    let content = block.trim_start_matches('\n');
+    let parsed: toml::Value = toml::from_str(content).expect("TOML with escaped quote must parse");
+    let parsed_cmd = parsed["servers"]["quoted"]["command"].as_str().unwrap();
+    assert_eq!(parsed_cmd, command, "double-quote must roundtrip");
+}
+
+#[test]
+fn test_format_block_escapes_args_with_special_chars() {
+    let args = vec![
+        r#"--config="my config.json""#.to_string(),
+        r#"C:\Users\me\file.txt"#.to_string(),
+    ];
+    let block = format_toml_block("special", "cmd", &args, "stdio");
+    let content = block.trim_start_matches('\n');
+    let parsed: toml::Value = toml::from_str(content).expect("TOML with escaped args must parse");
+    let parsed_args: Vec<String> = parsed["servers"]["special"]["args"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(parsed_args, args, "args with special chars must roundtrip");
+}
+
+#[test]
+fn test_format_block_windows_path_full_roundtrip() {
+    let command = r#"C:\Program Files\mcp\server.exe"#;
+    let args = vec![r#"--dir=C:\Users\me\data"#.to_string()];
+    let block = format_toml_block("winpath", command, &args, "stdio");
+
+    // Write to temp file and read back — full file roundtrip
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("mcp-hub.toml");
+    write_server_entry_to(&path, &block).expect("write");
+
+    let content = std::fs::read_to_string(&path).expect("read");
+    let parsed: toml::Value =
+        toml::from_str(&content).expect("file with Windows paths must parse as valid TOML");
+    let srv = &parsed["servers"]["winpath"];
+    assert_eq!(srv["command"].as_str().unwrap(), command);
+    assert_eq!(srv["args"][0].as_str().unwrap(), args[0]);
+}
