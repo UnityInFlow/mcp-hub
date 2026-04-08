@@ -26,9 +26,10 @@ Developers running 5+ MCP servers can manage them all from one place — one con
 - Cursor config generator: `gen-config --format cursor` outputs Cursor MCP config snippet — Validated in Phase 5
 - Config gen modes: offline from TOML + `--live` from running introspected state with tool name comments — Validated in Phase 5
 
+- `mcp-hub init`: interactive setup wizard with dialoguer prompts, TOML-safe name validation, duplicate detection, file create/append — Validated in Phase 6
+
 ### Active
 - [ ] Daemon mode (--daemon flag): daemonizes, communicates via socket/file
-- [ ] `mcp-hub init`: interactive wizard to add a new server
 - [ ] Pre-built binaries for macOS (arm64/x86_64), Linux (x86_64/aarch64), Windows
 - [ ] Homebrew formula: `brew install unityinflow/tap/mcp-hub`
 
@@ -89,4 +90,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-08 after Phase 5 completion*
+*Last updated: 2026-04-08 after Phase 6 completion*
