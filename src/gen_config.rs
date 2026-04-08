@@ -88,7 +88,11 @@ pub fn parse_live_info(response: &DaemonResponse) -> anyhow::Result<Vec<ServerLi
         .iter()
         .map(|s| {
             Ok(ServerLiveInfo {
-                name: s["name"].as_str().unwrap_or_default().to_string(),
+                name: s["name"]
+                    .as_str()
+                    .filter(|n| !n.is_empty())
+                    .context("Server entry missing 'name' field in status response")?
+                    .to_string(),
                 state: s["state"].as_str().unwrap_or("unknown").to_string(),
                 tool_names: s["tool_names"]
                     .as_array()
