@@ -22,11 +22,11 @@ Developers running 5+ MCP servers can manage them all from one place — one con
 - Daemon mode (--daemon flag): daemonizes with Unix socket IPC, PID file, duplicate prevention — Validated in Phase 3
 - Config reload via SIGHUP: diff-based (unchanged=skip, changed=restart, new=start, removed=stop) — Validated in Phase 3
 - Web UI: Axum + HTMX, status card grid, tools accordion, SSE log streaming, /health JSON endpoint — Validated in Phase 4
+- Claude Code config generator: `gen-config --format claude` outputs mcpServers JSON block — Validated in Phase 5
+- Cursor config generator: `gen-config --format cursor` outputs Cursor MCP config snippet — Validated in Phase 5
+- Config gen modes: offline from TOML + `--live` from running introspected state with tool name comments — Validated in Phase 5
 
 ### Active
-- [ ] Claude Code config generator: outputs correct settings.json mcpServers block
-- [ ] Cursor config generator: outputs Cursor MCP config snippet
-- [ ] Config gen modes: from TOML (offline) and --live (from running introspection)
 - [ ] Daemon mode (--daemon flag): daemonizes, communicates via socket/file
 - [ ] `mcp-hub init`: interactive wizard to add a new server
 - [ ] Pre-built binaries for macOS (arm64/x86_64), Linux (x86_64/aarch64), Windows
@@ -89,4 +89,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-06 after Phase 4 completion*
+*Last updated: 2026-04-08 after Phase 5 completion*
