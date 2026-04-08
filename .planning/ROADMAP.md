@@ -87,8 +87,8 @@
 **Plans:** 2 plans
 
 ### Plans
-- [ ] 05-01-PLAN.md — CLI + gen_config module (offline mode): chrono dep, GenConfigArgs, render functions, unit + integration tests (GEN-01, GEN-02, GEN-03, GEN-05)
-- [ ] 05-02-PLAN.md — Live mode: extend IPC with tool names, parse_live_info, live comment injection, --live error tests (GEN-04)
+- [x] 05-01-PLAN.md — CLI + gen_config module (offline mode): chrono dep, GenConfigArgs, render functions, unit + integration tests (GEN-01, GEN-02, GEN-03, GEN-05)
+- [x] 05-02-PLAN.md — Live mode: extend IPC with tool names, parse_live_info, live comment injection, --live error tests (GEN-04)
 
 ### Success Criteria
 1. `mcp-hub gen-config --format claude` outputs a valid `mcpServers` JSON block compatible with Claude Code `settings.json`, without any servers needing to be running.
