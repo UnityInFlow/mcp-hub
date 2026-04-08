@@ -105,10 +105,11 @@
 
 **Requirements:** WIZ-01, WIZ-02, WIZ-03
 
-**Plans:** 1 plan
+**Plans:** 2 plans
 
 ### Plans
-- [ ] 06-01-PLAN.md — Interactive init wizard: dialoguer prompts, TOML block formatter, file create/append, CLI wiring, integration tests (WIZ-01, WIZ-02, WIZ-03)
+- [x] 06-01-PLAN.md — Interactive init wizard: dialoguer prompts, TOML block formatter, file create/append, CLI wiring, integration tests (WIZ-01, WIZ-02, WIZ-03)
+- [ ] 06-02-PLAN.md — Gap closure: TOML escaping fix (CR-01), ASCII-only server names (CR-02), TOCTOU fix (WR-02), roundtrip regression tests
 
 ### Success Criteria
 1. `mcp-hub init` launches an interactive prompt sequence asking for name, command, args, env vars, and transport type; pressing Enter skips optional fields with sensible defaults.
