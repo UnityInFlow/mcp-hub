@@ -116,7 +116,7 @@ pub struct DaemonState {
 /// cancelled and removes the socket file on exit.
 pub async fn run_control_socket(sock_path: &Path, state: Arc<DaemonState>) -> anyhow::Result<()> {
     // Remove any leftover socket from a previous run.
-    let _ = std::fs::remove_file(sock_path);
+    let _ = tokio::fs::remove_file(sock_path).await;
 
     let listener = UnixListener::bind(sock_path)
         .map_err(|e| anyhow::anyhow!("Failed to bind socket {}: {e}", sock_path.display()))?;
@@ -148,7 +148,7 @@ pub async fn run_control_socket(sock_path: &Path, state: Arc<DaemonState>) -> an
     }
 
     // Remove the socket file on clean shutdown.
-    let _ = std::fs::remove_file(sock_path);
+    let _ = tokio::fs::remove_file(sock_path).await;
     Ok(())
 }
 
