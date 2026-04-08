@@ -23,10 +23,10 @@ pub struct ServerLiveInfo {
     pub name: String,
     pub state: String,
     pub tool_names: Vec<String>,
-    /// Number of MCP resources exposed by this server (extended in Plan 02).
+    /// Number of MCP resources exposed by this server.
     #[allow(dead_code)]
     pub resource_count: usize,
-    /// Number of MCP prompts exposed by this server (extended in Plan 02).
+    /// Number of MCP prompts exposed by this server.
     #[allow(dead_code)]
     pub prompt_count: usize,
 }
