@@ -2,6 +2,7 @@ pub mod cli;
 pub mod config;
 pub mod control;
 pub mod daemon;
+pub mod gen_config;
 pub mod logs;
 pub mod mcp;
 pub mod output;

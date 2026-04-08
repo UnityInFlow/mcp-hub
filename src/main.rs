@@ -2,6 +2,7 @@ mod cli;
 mod config;
 mod control;
 mod daemon;
+mod gen_config;
 mod logs;
 mod mcp;
 mod output;
@@ -358,6 +359,35 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 );
                 std::process::exit(1);
             }
+            Ok(())
+        }
+
+        Commands::GenConfig(args) => {
+            let config = config::find_and_load_config(cli.config.as_deref())
+                .context("Failed to load config")?;
+
+            if config.servers.is_empty() {
+                eprintln!("\u{26a0} No servers configured in mcp-hub.toml");
+            }
+
+            let live_info: Option<Vec<gen_config::ServerLiveInfo>> = if args.live {
+                let sock = daemon::socket_path()?;
+                let response =
+                    control::send_daemon_command(&sock, &control::DaemonRequest::Status, 5).await?;
+                Some(gen_config::parse_live_info(&response)?)
+            } else {
+                None
+            };
+
+            let output = match args.format.as_str() {
+                "claude" => gen_config::render_claude_config(&config, live_info.as_deref())?,
+                "cursor" => gen_config::render_cursor_config(&config, live_info.as_deref())?,
+                other => anyhow::bail!(
+                    "Unknown format '{other}'. Use --format claude or --format cursor."
+                ),
+            };
+
+            print!("{output}");
             Ok(())
         }
     }

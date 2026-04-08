@@ -51,6 +51,22 @@ pub enum Commands {
     ///
     /// Equivalent to sending SIGHUP to the daemon process.
     Reload,
+
+    /// Generate a Claude Code or Cursor config snippet from the hub's server list.
+    GenConfig(GenConfigArgs),
+}
+
+/// Arguments for the `gen-config` subcommand.
+#[derive(Debug, clap::Args)]
+#[command(name = "gen-config")]
+pub struct GenConfigArgs {
+    /// Output format: 'claude' or 'cursor'.
+    #[arg(long, short = 'f', value_name = "FORMAT")]
+    pub format: String,
+
+    /// Connect to the running daemon and include introspected tool/resource/prompt info as comments.
+    #[arg(long)]
+    pub live: bool,
 }
 
 /// Arguments for the `restart` subcommand.
