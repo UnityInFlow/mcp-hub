@@ -3,13 +3,19 @@ use dialoguer::{Input, Select};
 use std::io::Write as _;
 use std::path::Path;
 
+/// Escape a string for placement inside a TOML double-quoted basic string.
+/// Replaces `\` with `\\` and `"` with `\"`.
+fn toml_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 /// Characters that are invalid in TOML bare keys and would break the generated config.
-/// TOML bare keys only allow A-Za-z0-9, `-`, and `_`.
+/// TOML bare keys only allow ASCII A-Za-z0-9, `-`, and `_`.
 fn is_valid_server_name(name: &str) -> bool {
     !name.is_empty()
         && name
             .chars()
-            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+            .all(|c| matches!(c, 'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_'))
 }
 
 /// Return all server names found in `./mcp-hub.toml` in the current directory.
@@ -62,15 +68,21 @@ pub fn existing_server_names_from(path: &Path) -> Vec<String> {
 /// - Omits `transport` when it is `"stdio"` (the default, per D-10).
 /// - Starts with a leading newline so appends are separated from existing content.
 pub fn format_toml_block(name: &str, command: &str, args: &[String], transport: &str) -> String {
-    let mut block = format!("\n[servers.{name}]\ncommand = \"{command}\"\n");
+    let mut block = format!(
+        "\n[servers.{name}]\ncommand = \"{}\"\n",
+        toml_escape(command)
+    );
 
     if !args.is_empty() {
-        let quoted: Vec<String> = args.iter().map(|a| format!("\"{a}\"")).collect();
+        let quoted: Vec<String> = args
+            .iter()
+            .map(|a| format!("\"{}\"", toml_escape(a)))
+            .collect();
         block.push_str(&format!("args = [{}]\n", quoted.join(", ")));
     }
 
     if transport != "stdio" {
-        block.push_str(&format!("transport = \"{transport}\"\n"));
+        block.push_str(&format!("transport = \"{}\"\n", toml_escape(transport)));
     }
 
     block
@@ -90,15 +102,16 @@ pub fn write_server_entry(toml_block: &str) -> anyhow::Result<()> {
 /// appended directly (the leading `\n` provides the blank-line separator).
 pub fn write_server_entry_to(path: &Path, toml_block: &str) -> anyhow::Result<()> {
     if path.exists() {
-        // Append mode — the leading newline in toml_block acts as a separator.
+        // Read first to check trailing newline, then open for append.
+        let existing = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+
         let mut file = std::fs::OpenOptions::new()
             .append(true)
             .open(path)
             .with_context(|| format!("Failed to open {} for appending", path.display()))?;
 
         // Ensure the existing file ends with a newline before appending.
-        let existing = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read {}", path.display()))?;
         if !existing.ends_with('\n') {
             file.write_all(b"\n")
                 .with_context(|| format!("Failed to write newline to {}", path.display()))?;
@@ -327,5 +340,36 @@ mod tests {
         assert!(!is_valid_server_name("[brackets]"));
         assert!(!is_valid_server_name("has\nnewline"));
         assert!(!is_valid_server_name("has\"quote"));
+    }
+
+    // -- toml_escape tests ---------------------------------------------------
+
+    #[test]
+    fn toml_escape_plain_string_unchanged() {
+        assert_eq!(toml_escape("hello"), "hello");
+    }
+
+    #[test]
+    fn toml_escape_backslash() {
+        assert_eq!(toml_escape("C:\\tools\\mcp.exe"), "C:\\\\tools\\\\mcp.exe");
+    }
+
+    #[test]
+    fn toml_escape_double_quote() {
+        assert_eq!(toml_escape("node \"server.js\""), "node \\\"server.js\\\"");
+    }
+
+    #[test]
+    fn toml_escape_both() {
+        assert_eq!(toml_escape("back\\and\"quote"), "back\\\\and\\\"quote");
+    }
+
+    // -- is_valid_server_name: Unicode rejection ------------------------------
+
+    #[test]
+    fn rejects_unicode_server_names() {
+        assert!(!is_valid_server_name("cafe\u{0301}")); // e + combining accent
+        assert!(!is_valid_server_name("\u{6570}\u{636e}")); // CJK: 数据
+        assert!(!is_valid_server_name("serveur-francais-e\u{0301}"));
     }
 }
