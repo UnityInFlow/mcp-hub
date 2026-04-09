@@ -8,8 +8,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixListener;
 use tokio_util::sync::CancellationToken;
 
 use crate::logs::LogAggregator;
@@ -106,15 +104,18 @@ pub struct DaemonState {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Server-side socket listener
+// Server-side socket listener (Unix only)
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[cfg(unix)]
 /// Bind a Unix domain socket at `sock_path` and accept control connections.
 ///
 /// Each connection receives exactly one request and sends exactly one response
 /// (newline-delimited JSON). The listener shuts down when `state.shutdown` is
 /// cancelled and removes the socket file on exit.
 pub async fn run_control_socket(sock_path: &Path, state: Arc<DaemonState>) -> anyhow::Result<()> {
+    use tokio::net::UnixListener;
+
     // Remove any leftover socket from a previous run.
     let _ = tokio::fs::remove_file(sock_path).await;
 
@@ -152,15 +153,24 @@ pub async fn run_control_socket(sock_path: &Path, state: Arc<DaemonState>) -> an
     Ok(())
 }
 
+#[cfg(not(unix))]
+/// Stub: Unix domain socket IPC is not supported on non-Unix platforms.
+pub async fn run_control_socket(_sock_path: &Path, _state: Arc<DaemonState>) -> anyhow::Result<()> {
+    anyhow::bail!("Unix domain socket IPC is not supported on this platform. Use foreground mode.")
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-// Per-connection handler
+// Per-connection handler (Unix only)
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[cfg(unix)]
 /// Read one request line, dispatch it, and write one response line.
 async fn handle_connection(
     stream: tokio::net::UnixStream,
     state: Arc<DaemonState>,
 ) -> anyhow::Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 
@@ -183,9 +193,10 @@ async fn handle_connection(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Request dispatch
+// Request dispatch (Unix only)
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[cfg(unix)]
 /// Route a `DaemonRequest` to the appropriate handler and return a response.
 async fn dispatch_request(request: DaemonRequest, state: &DaemonState) -> DaemonResponse {
     match request {
@@ -258,7 +269,6 @@ async fn dispatch_request(request: DaemonRequest, state: &DaemonState) -> Daemon
         DaemonRequest::Reload => {
             // Send SIGHUP to self so the main event loop's sighup handler triggers
             // the config reload without requiring a separate reload channel.
-            #[cfg(unix)]
             {
                 use nix::sys::signal::{kill, Signal};
                 use nix::unistd::Pid;
@@ -268,10 +278,6 @@ async fn dispatch_request(request: DaemonRequest, state: &DaemonState) -> Daemon
                     Err(e) => DaemonResponse::err(format!("Failed to send SIGHUP: {e}")),
                 }
             }
-            #[cfg(not(unix))]
-            {
-                DaemonResponse::err("Reload is not supported on this platform".to_string())
-            }
         }
     }
 }
@@ -280,6 +286,7 @@ async fn dispatch_request(request: DaemonRequest, state: &DaemonState) -> Daemon
 // Client-side helper
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[cfg(unix)]
 /// Connect to a running daemon and send a single request, returning the response.
 ///
 /// Both the connection and the response read are bounded by `timeout_secs`.
@@ -288,6 +295,7 @@ pub async fn send_daemon_command(
     request: &DaemonRequest,
     timeout_secs: u64,
 ) -> anyhow::Result<DaemonResponse> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
 
     let stream = tokio::time::timeout(
@@ -321,4 +329,14 @@ pub async fn send_daemon_command(
         .map_err(|e| anyhow::anyhow!("Invalid daemon response JSON: {e}"))?;
 
     Ok(response)
+}
+
+#[cfg(not(unix))]
+/// Stub: Unix domain socket IPC is not supported on non-Unix platforms.
+pub async fn send_daemon_command(
+    _sock_path: &Path,
+    _request: &DaemonRequest,
+    _timeout_secs: u64,
+) -> anyhow::Result<DaemonResponse> {
+    anyhow::bail!("Unix domain socket IPC is not supported on this platform. Use foreground mode.")
 }
