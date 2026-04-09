@@ -125,6 +125,12 @@
 
 **Requirements:** DIST-01, DIST-02, DIST-03
 
+**Plans:** 2 plans
+
+### Plans
+- [ ] 07-01-PLAN.md — Prepare codebase: fix nix to cfg(unix), add README.md + LICENSE, verify crates.io readiness (DIST-01, DIST-03)
+- [ ] 07-02-PLAN.md — Release workflow: GitHub Actions pipeline with cross-compilation, Homebrew tap auto-update, crates.io publish (DIST-01, DIST-02, DIST-03)
+
 ### Success Criteria
 1. GitHub CI produces release artifacts for macOS arm64, macOS x86_64, Linux x86_64, Linux aarch64, and Windows x86_64 — all downloadable from the GitHub Releases page.
 2. `brew install unityinflow/tap/mcp-hub` installs the binary on macOS with no Rust toolchain required.
@@ -150,4 +156,4 @@
 
 ---
 
-*Last updated: 2026-04-08*
+*Last updated: 2026-04-09*
