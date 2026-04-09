@@ -353,6 +353,6 @@ jobs:
         # Runs LAST -- after binaries uploaded and Homebrew tap updated.
         # --dry-run was validated in preflight; plain publish used here since
         # test job already verified the crate builds and tests pass.
-        run: cargo publish --locked
+        run: cargo publish --locked --allow-dirty
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
