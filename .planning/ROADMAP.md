@@ -128,8 +128,8 @@
 **Plans:** 2 plans
 
 ### Plans
-- [ ] 07-01-PLAN.md — Codebase readiness: gate nix to cfg(unix), wrap control.rs for Windows compilation, add include whitelist + README + LICENSE, verify cargo publish --dry-run (DIST-01, DIST-03)
-- [ ] 07-02-PLAN.md — Release workflow: preflight version check, test gate, 3 parallel build jobs with smoke tests, macOS timeout, GitHub Release + Homebrew tap + crates.io publish (DIST-01, DIST-02, DIST-03)
+- [x] 07-01-PLAN.md — Codebase readiness: gate nix to cfg(unix), wrap control.rs for Windows compilation, add include whitelist + README + LICENSE, verify cargo publish --dry-run (DIST-01, DIST-03)
+- [x] 07-02-PLAN.md — Release workflow: preflight version check, test gate, 3 parallel build jobs with smoke tests, macOS timeout, GitHub Release + Homebrew tap + crates.io publish (DIST-01, DIST-02, DIST-03)
 
 ### Success Criteria
 1. GitHub CI produces release artifacts for macOS arm64, macOS x86_64, Linux x86_64, Linux aarch64, and Windows x86_64 — all downloadable from the GitHub Releases page.
