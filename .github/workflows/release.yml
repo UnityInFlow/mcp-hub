@@ -368,34 +368,38 @@ jobs:
 
           echo "Updating Homebrew tap for ${TAG} (SHA256: ${SHA256})"
 
-          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/unityinflow/homebrew-tap.git" tap-repo
-          mkdir -p tap-repo/Formula
+          git clone https://github.com/unityinflow/homebrew-tap.git tap-repo
+          cd tap-repo || { echo "ERROR: tap-repo directory not found after clone"; exit 1; }
 
-          cat > tap-repo/Formula/mcp-hub.rb << FORMULA
-          class McpHub < Formula
-            desc "PM2 for MCP servers - manage, monitor, and configure your MCP servers"
-            homepage "https://github.com/UnityInFlow/mcp-hub"
-            version "${VERSION}"
-            license "MIT"
-
-            on_macos do
-              url "https://github.com/UnityInFlow/mcp-hub/releases/download/${TAG}/mcp-hub-macos-universal.tar.gz"
-              sha256 "${SHA256}"
-            end
-
-            def install
-              bin.install "mcp-hub"
-            end
-
-            test do
-              system "#{bin}/mcp-hub", "--version"
-            end
-          end
-          FORMULA
-
-          cd tap-repo
+          # Use credential helper -- token never appears in remote URL
+          git config credential.helper '!f() { echo "username=x-access-token"; echo "password=${HOMEBREW_TAP_TOKEN}"; }; f'
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          mkdir -p Formula
+
+cat > Formula/mcp-hub.rb << FORMULA
+class McpHub < Formula
+  desc "PM2 for MCP servers - manage, monitor, and configure your MCP servers"
+  homepage "https://github.com/UnityInFlow/mcp-hub"
+  version "${VERSION}"
+  license "MIT"
+
+  on_macos do
+    url "https://github.com/UnityInFlow/mcp-hub/releases/download/${TAG}/mcp-hub-macos-universal.tar.gz"
+    sha256 "${SHA256}"
+  end
+
+  def install
+    bin.install "mcp-hub"
+  end
+
+  test do
+    system "#{bin}/mcp-hub", "--version"
+  end
+end
+FORMULA
+
           git add Formula/mcp-hub.rb
           git commit -m "chore: bump mcp-hub to ${VERSION}"
           git push
