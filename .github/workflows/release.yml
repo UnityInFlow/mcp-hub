@@ -99,71 +99,40 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install cross (pinned version)
-        run: cargo install cross@0.2.5 --locked
-
-      - name: Build Linux x86_64
-        run: cross build --release --target x86_64-unknown-linux-gnu
+      - name: Build Linux x86_64 (native)
+        run: cargo build --release
 
       - name: Smoke test Linux x86_64 binary
         run: |
-          # Write inline fixture config
           cat > /tmp/smoke-test.toml << 'FIXTURE'
           [servers.echo-test]
           command = "echo"
           args = ["hello"]
           FIXTURE
-
-          # Smoke test 1: version output
-          ./target/x86_64-unknown-linux-gnu/release/mcp-hub --version
-
-          # Smoke test 2: config load + start (SC-4)
-          # echo exits immediately; mcp-hub loads config, spawns process, detects exit.
-          # Non-panic exit (even non-zero from server dying) satisfies SC-4.
-          timeout 10 ./target/x86_64-unknown-linux-gnu/release/mcp-hub start -c /tmp/smoke-test.toml 2>&1 || true
+          ./target/release/mcp-hub --version
+          timeout 10 ./target/release/mcp-hub start -c /tmp/smoke-test.toml 2>&1 || true
           echo "Linux x86_64 smoke test passed"
 
-      - name: Build Windows x86_64
-        run: cross build --release --target x86_64-pc-windows-gnu
-
-      - name: Smoke test Windows x86_64 binary (best-effort via Wine)
-        run: |
-          # NOTE: Wine may not be installed on the runner. If absent, Windows binary is
-          # validated only by successful cross-compilation. This is an accepted limitation.
-          # SC-4 for Windows: cross-compilation success + Wine check if available.
-          if command -v wine &>/dev/null; then
-            cat > /tmp/smoke-test.toml << 'FIXTURE'
-            [servers.echo-test]
-            command = "echo"
-            args = ["hello"]
-            FIXTURE
-            wine ./target/x86_64-pc-windows-gnu/release/mcp-hub.exe --version
-            timeout 10 wine ./target/x86_64-pc-windows-gnu/release/mcp-hub.exe start -c /tmp/smoke-test.toml 2>&1 || true
-            echo "Windows smoke test passed (via Wine)"
-          else
-            echo "NOTE: Wine not available -- Windows smoke test skipped."
-            echo "Binary built successfully via cross-compilation; that validates the Windows target."
-          fi
+      # NOTE: Windows cross-compilation via cross disabled — Docker/GHCR auth
+      # issue on ARC runners. Re-enable when Docker is available on runners.
+      # - name: Install cross
+      #   run: cargo install cross@0.2.5 --locked
+      # - name: Build Windows x86_64
+      #   run: cross build --release --target x86_64-pc-windows-gnu
 
       - name: Package Linux x86_64
-        run: tar czf mcp-hub-linux-x86_64.tar.gz -C target/x86_64-unknown-linux-gnu/release mcp-hub
-
-      - name: Package Windows x86_64
-        run: |
-          cd target/x86_64-pc-windows-gnu/release
-          zip ../../../mcp-hub-windows-x86_64.zip mcp-hub.exe
+        run: tar czf mcp-hub-linux-x86_64.tar.gz -C target/release mcp-hub
 
       - name: Generate SHA256 checksums
-        run: sha256sum mcp-hub-linux-x86_64.tar.gz mcp-hub-windows-x86_64.zip > checksums-linux-x64-windows.txt
+        run: sha256sum mcp-hub-linux-x86_64.tar.gz > checksums-linux-x64.txt
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: linux-x64-windows
+          name: linux-x64
           path: |
             mcp-hub-linux-x86_64.tar.gz
-            mcp-hub-windows-x86_64.zip
-            checksums-linux-x64-windows.txt
+            checksums-linux-x64.txt
 
   # ──────────────────────────────────────────────────────────────────────────
   # JOB 4: build-linux-arm64
@@ -284,11 +253,10 @@ jobs:
       - name: Validate all 4 expected archives exist
         run: |
           echo "Validating release artifacts..."
-          # NOTE: macOS archive removed until self-hosted Mac runner is available.
+          # NOTE: macOS + Windows disabled for v0.1.0. Linux only.
           for f in \
             mcp-hub-linux-x86_64.tar.gz \
-            mcp-hub-linux-aarch64.tar.gz \
-            mcp-hub-windows-x86_64.zip; do
+            mcp-hub-linux-aarch64.tar.gz; do
             if test -f "artifacts/$f"; then
               echo "OK: $f"
             else
@@ -301,11 +269,10 @@ jobs:
       - name: Generate SHA256SUMS.txt
         run: |
           cd artifacts
-          # NOTE: macOS archive removed until self-hosted Mac runner is available.
+          # NOTE: macOS + Windows disabled for v0.1.0. Linux only.
           sha256sum \
             mcp-hub-linux-x86_64.tar.gz \
             mcp-hub-linux-aarch64.tar.gz \
-            mcp-hub-windows-x86_64.zip \
             > SHA256SUMS.txt
           echo "Generated SHA256SUMS.txt:"
           cat SHA256SUMS.txt
@@ -316,7 +283,6 @@ jobs:
           files: |
             artifacts/mcp-hub-linux-x86_64.tar.gz
             artifacts/mcp-hub-linux-aarch64.tar.gz
-            artifacts/mcp-hub-windows-x86_64.zip
             artifacts/SHA256SUMS.txt
           generate_release_notes: true
           body: |
