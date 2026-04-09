@@ -28,10 +28,12 @@ Developers running 5+ MCP servers can manage them all from one place — one con
 
 - `mcp-hub init`: interactive setup wizard with dialoguer prompts, TOML-safe name validation, duplicate detection, file create/append — Validated in Phase 6
 
+- Pre-built binaries: release.yml CI pipeline for Linux x86_64/aarch64, Windows x86_64, macOS universal — Validated in Phase 7
+- Homebrew formula: auto-generated and pushed to unityinflow/homebrew-tap on release — Validated in Phase 7
+- crates.io: published as `mcp-server-hub`, installs `mcp-hub` binary — Validated in Phase 7
+
 ### Active
 - [ ] Daemon mode (--daemon flag): daemonizes, communicates via socket/file
-- [ ] Pre-built binaries for macOS (arm64/x86_64), Linux (x86_64/aarch64), Windows
-- [ ] Homebrew formula: `brew install unityinflow/tap/mcp-hub`
 
 ### Out of Scope
 
@@ -90,4 +92,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-08 after Phase 6 completion*
+*Last updated: 2026-04-09 after Phase 7 completion — v1.0 milestone complete*
