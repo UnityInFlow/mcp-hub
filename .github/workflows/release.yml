@@ -205,69 +205,39 @@ jobs:
             checksums-linux-arm64.txt
 
   # ──────────────────────────────────────────────────────────────────────────
-  # JOB 5: build-macos
-  # Builds macOS universal binary (arm64 + x86_64) via lipo on developer Mac.
-  # timeout-minutes: 30 prevents infinite queue when runner is offline.
-  # If Mac runner is offline -> job times out -> release job's needs unsatisfied
-  # -> no partial release (all platforms required).
-  # Smoke tests: --version AND mcp-hub start with fixture config (SC-4).
+  # JOB 5: build-macos (DISABLED — no self-hosted Mac runner yet)
+  # Uncomment when macos-arm64 runner is registered.
+  # Also re-add build-macos to the release job's `needs` list.
   # ──────────────────────────────────────────────────────────────────────────
-  build-macos:
-    name: Build macOS universal binary
-    needs: test
-    runs-on: [macos-arm64]
-    timeout-minutes: 30
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Add x86_64 Apple Darwin target
-        run: rustup target add x86_64-apple-darwin
-
-      - name: Build macOS arm64
-        run: cargo build --release --target aarch64-apple-darwin
-
-      - name: Build macOS x86_64
-        run: cargo build --release --target x86_64-apple-darwin
-
-      - name: Create macOS universal binary via lipo
-        run: |
-          # lipo output named 'mcp-hub' (not 'mcp-hub-universal') so Homebrew
-          # formula can use `bin.install "mcp-hub"` directly without renaming.
-          lipo -create \
-            target/aarch64-apple-darwin/release/mcp-hub \
-            target/x86_64-apple-darwin/release/mcp-hub \
-            -output mcp-hub
-
-      - name: Smoke test macOS universal binary
-        run: |
-          # Write inline fixture config
-          cat > /tmp/smoke-test.toml << 'FIXTURE'
-          [servers.echo-test]
-          command = "echo"
-          args = ["hello"]
-          FIXTURE
-
-          # Smoke test 1: version output
-          ./mcp-hub --version
-
-          # Smoke test 2: config load + start (SC-4)
-          timeout 10 ./mcp-hub start -c /tmp/smoke-test.toml 2>&1 || true
-          echo "macOS universal smoke test passed"
-
-      - name: Package macOS universal binary
-        run: tar czf mcp-hub-macos-universal.tar.gz mcp-hub
-
-      - name: Generate SHA256 checksum
-        run: sha256sum mcp-hub-macos-universal.tar.gz > checksums-macos.txt
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-universal
-          path: |
-            mcp-hub-macos-universal.tar.gz
-            checksums-macos.txt
+  # build-macos:
+  #   name: Build macOS universal binary
+  #   needs: test
+  #   runs-on: [macos-arm64]
+  #   timeout-minutes: 30
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - run: rustup target add x86_64-apple-darwin
+  #     - run: cargo build --release --target aarch64-apple-darwin
+  #     - run: cargo build --release --target x86_64-apple-darwin
+  #     - name: Create universal binary via lipo
+  #       run: lipo -create target/aarch64-apple-darwin/release/mcp-hub target/x86_64-apple-darwin/release/mcp-hub -output mcp-hub
+  #     - name: Smoke test
+  #       run: |
+  #         cat > /tmp/smoke-test.toml << 'FIXTURE'
+  #         [servers.echo-test]
+  #         command = "echo"
+  #         args = ["hello"]
+  #         FIXTURE
+  #         ./mcp-hub --version
+  #         timeout 10 ./mcp-hub start -c /tmp/smoke-test.toml 2>&1 || true
+  #     - run: tar czf mcp-hub-macos-universal.tar.gz mcp-hub
+  #     - run: sha256sum mcp-hub-macos-universal.tar.gz > checksums-macos.txt
+  #     - uses: actions/upload-artifact@v4
+  #       with:
+  #         name: macos-universal
+  #         path: |
+  #           mcp-hub-macos-universal.tar.gz
+  #           checksums-macos.txt
 
   # ──────────────────────────────────────────────────────────────────────────
   # JOB 6: release
@@ -278,7 +248,9 @@ jobs:
   # ──────────────────────────────────────────────────────────────────────────
   release:
     name: Create GitHub Release + Homebrew + crates.io
-    needs: [build-linux-x64, build-linux-arm64, build-macos]
+    needs: [build-linux-x64, build-linux-arm64]
+    # NOTE: build-macos removed from needs until self-hosted Mac runner is available.
+    # Re-add build-macos to this list when macos-arm64 runner is registered.
     runs-on: [arc-runner-unityinflow]
     permissions:
       contents: write
@@ -295,11 +267,11 @@ jobs:
       - name: Validate all 4 expected archives exist
         run: |
           echo "Validating release artifacts..."
+          # NOTE: macOS archive removed until self-hosted Mac runner is available.
           for f in \
             mcp-hub-linux-x86_64.tar.gz \
             mcp-hub-linux-aarch64.tar.gz \
-            mcp-hub-windows-x86_64.zip \
-            mcp-hub-macos-universal.tar.gz; do
+            mcp-hub-windows-x86_64.zip; do
             if test -f "artifacts/$f"; then
               echo "OK: $f"
             else
@@ -312,11 +284,11 @@ jobs:
       - name: Generate SHA256SUMS.txt
         run: |
           cd artifacts
+          # NOTE: macOS archive removed until self-hosted Mac runner is available.
           sha256sum \
             mcp-hub-linux-x86_64.tar.gz \
             mcp-hub-linux-aarch64.tar.gz \
             mcp-hub-windows-x86_64.zip \
-            mcp-hub-macos-universal.tar.gz \
             > SHA256SUMS.txt
           echo "Generated SHA256SUMS.txt:"
           cat SHA256SUMS.txt
@@ -328,7 +300,6 @@ jobs:
             artifacts/mcp-hub-linux-x86_64.tar.gz
             artifacts/mcp-hub-linux-aarch64.tar.gz
             artifacts/mcp-hub-windows-x86_64.zip
-            artifacts/mcp-hub-macos-universal.tar.gz
             artifacts/SHA256SUMS.txt
           generate_release_notes: true
           body: |
@@ -358,51 +329,42 @@ jobs:
             ## Checksums
             See `SHA256SUMS.txt` for verification.
 
-      - name: Update Homebrew tap
-        env:
-          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-        run: |
-          TAG="${GITHUB_REF##refs/tags/}"
-          VERSION="${TAG#v}"
-          SHA256=$(sha256sum artifacts/mcp-hub-macos-universal.tar.gz | awk '{print $1}')
-
-          echo "Updating Homebrew tap for ${TAG} (SHA256: ${SHA256})"
-
-          git clone https://github.com/unityinflow/homebrew-tap.git tap-repo
-          cd tap-repo || { echo "ERROR: tap-repo directory not found after clone"; exit 1; }
-
-          # Use credential helper -- token never appears in remote URL
-          git config credential.helper '!f() { echo "username=x-access-token"; echo "password=${HOMEBREW_TAP_TOKEN}"; }; f'
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          mkdir -p Formula
-
-cat > Formula/mcp-hub.rb << FORMULA
-class McpHub < Formula
-  desc "PM2 for MCP servers - manage, monitor, and configure your MCP servers"
-  homepage "https://github.com/UnityInFlow/mcp-hub"
-  version "${VERSION}"
-  license "MIT"
-
-  on_macos do
-    url "https://github.com/UnityInFlow/mcp-hub/releases/download/${TAG}/mcp-hub-macos-universal.tar.gz"
-    sha256 "${SHA256}"
-  end
-
-  def install
-    bin.install "mcp-hub"
-  end
-
-  test do
-    system "#{bin}/mcp-hub", "--version"
-  end
-end
-FORMULA
-
-          git add Formula/mcp-hub.rb
-          git commit -m "chore: bump mcp-hub to ${VERSION}"
-          git push
+      # NOTE: Homebrew tap update DISABLED until macOS builds are enabled.
+      # Uncomment when build-macos job is re-enabled.
+      # - name: Update Homebrew tap
+      #   env:
+      #     HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      #   run: |
+      #     TAG="${GITHUB_REF##refs/tags/}"
+      #     VERSION="${TAG#v}"
+      #     SHA256=$(sha256sum artifacts/mcp-hub-macos-universal.tar.gz | awk '{print $1}')
+      #     git clone https://github.com/unityinflow/homebrew-tap.git tap-repo
+      #     cd tap-repo || { echo "ERROR: tap-repo directory not found"; exit 1; }
+      #     git config credential.helper '!f() { echo "username=x-access-token"; echo "password=${HOMEBREW_TAP_TOKEN}"; }; f'
+      #     git config user.name "github-actions[bot]"
+      #     git config user.email "github-actions[bot]@users.noreply.github.com"
+      #     mkdir -p Formula
+      #     cat > Formula/mcp-hub.rb << FORMULA
+      #     class McpHub < Formula
+      #       desc "PM2 for MCP servers"
+      #       homepage "https://github.com/UnityInFlow/mcp-hub"
+      #       version "${VERSION}"
+      #       license "MIT"
+      #       on_macos do
+      #         url "https://github.com/UnityInFlow/mcp-hub/releases/download/${TAG}/mcp-hub-macos-universal.tar.gz"
+      #         sha256 "${SHA256}"
+      #       end
+      #       def install
+      #         bin.install "mcp-hub"
+      #       end
+      #       test do
+      #         system "#{bin}/mcp-hub", "--version"
+      #       end
+      #     end
+      #     FORMULA
+      #     git add Formula/mcp-hub.rb
+      #     git commit -m "chore: bump mcp-hub to ${VERSION}"
+      #     git push
 
       - name: Publish to crates.io
         # Runs LAST -- after binaries uploaded and Homebrew tap updated.
