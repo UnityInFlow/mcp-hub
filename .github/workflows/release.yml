@@ -27,6 +27,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Validate tag matches Cargo.toml version
         id: extract-version
         run: |
@@ -64,6 +67,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
       - name: cargo test
         run: cargo test --locked
 
@@ -87,6 +95,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Install cross (pinned version)
         run: cargo install cross@0.2.5 --locked
@@ -167,6 +178,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Add aarch64 target
         run: rustup target add aarch64-unknown-linux-gnu
@@ -257,6 +271,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
