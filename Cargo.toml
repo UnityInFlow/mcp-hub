@@ -1,6 +1,6 @@
 [package]
 name = "mcp-server-hub"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 description = "PM2 for MCP servers — manage, monitor, and configure your MCP servers"
 license = "MIT"
