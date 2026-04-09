@@ -1,5 +1,5 @@
 [package]
-name = "mcp-hub"
+name = "mcp-server-hub"
 version = "0.0.1"
 edition = "2021"
 description = "PM2 for MCP servers — manage, monitor, and configure your MCP servers"
@@ -8,6 +8,15 @@ repository = "https://github.com/UnityInFlow/mcp-hub"
 keywords = ["mcp", "process-manager", "ai", "developer-tools"]
 categories = ["command-line-utilities", "development-tools"]
 readme = "README.md"
+
+[[bin]]
+name = "mcp-hub"
+path = "src/main.rs"
+
+[lib]
+name = "mcp_hub"
+path = "src/lib.rs"
+
 include = [
     "src/**/*",
     "tests/**/*",

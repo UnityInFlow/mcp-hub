@@ -342,7 +342,7 @@ jobs:
 
             **From source:**
             ```bash
-            cargo install mcp-hub
+            cargo install mcp-server-hub
             ```
 
             **Pre-built binaries:**

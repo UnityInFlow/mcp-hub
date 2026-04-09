@@ -29,7 +29,7 @@ Download from [GitHub Releases](https://github.com/UnityInFlow/mcp-hub/releases)
 **From source:**
 
 ```sh
-cargo install mcp-hub
+cargo install mcp-server-hub
 ```
 
 ## Quick Start
