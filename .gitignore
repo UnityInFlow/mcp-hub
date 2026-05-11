@@ -1,1 +1,8 @@
 /target
+
+# Local Claude Code config
+.claude/
+
+# Workspace-level reference docs (live in parent workspace, not here)
+07-mcp-hub.md
+claude-code-harness-engineering-guide-v2.md
