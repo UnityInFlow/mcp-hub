@@ -14,8 +14,8 @@
 
 ### Plans
 - [x] **Plan 01:** Project scaffolding + TOML config parsing (CFG-01, CFG-02) — COMPLETE 2026-04-02
-- [ ] **Plan 02:** Process supervisor (PROC-01 through PROC-09)
-- [ ] **Plan 03:** CLI dispatch + status table + Ctrl+C shutdown (DMN-01)
+- [x] **Plan 02:** Process supervisor (PROC-01 through PROC-09) — COMPLETE
+- [x] **Plan 03:** CLI dispatch + status table + Ctrl+C shutdown (DMN-01) — COMPLETE
 
 ### Success Criteria
 1. `mcp-hub start` reads `mcp-hub.toml` and launches all configured servers; a typo in the config prints a clear error and exits non-zero.

@@ -2,9 +2,9 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: executing
-stopped_at: Phase 7 context gathered
-last_updated: "2026-04-09T12:32:21.462Z"
+status: milestone-complete
+stopped_at: v0.1.0 released
+last_updated: "2026-06-12T00:00:00.000Z"
 progress:
   total_phases: 7
   completed_phases: 7
@@ -17,14 +17,15 @@ progress:
 
 ## Current Phase
 
-Phase 4: Web UI
-Status: Executing Phase 04 — Plan 02 complete, Plan 03 next
+Milestone v1.0 complete — all 7 phases (20/20 plans) done.
+v0.1.0 released 2026-04-09: GitHub Release with Linux x86_64/aarch64 binaries shipped.
+Known gap: crates.io publish failed (CARGO_REGISTRY_TOKEN lacks publish scope) — token rotation pending, owner action.
 
 ## Project Reference
 
 See: .planning/PROJECT.md (updated 2026-04-04)
 **Core value:** Developers running 5+ MCP servers can manage them all from one place — one config file, one command, one log stream.
-**Current focus:** Phase 04 — web-ui
+**Current focus:** Milestone complete — maintenance and hygiene only
 
 ## Phase History
 
@@ -70,5 +71,5 @@ See: .planning/PROJECT.md (updated 2026-04-04)
 
 ## Last Session
 
-**Stopped at:** Phase 7 context gathered
-**Timestamp:** 2026-04-06T19:55:46Z
+**Stopped at:** v0.1.0 released (2026-04-09) — milestone v1.0 complete
+**Timestamp:** 2026-06-12T00:00:00Z
