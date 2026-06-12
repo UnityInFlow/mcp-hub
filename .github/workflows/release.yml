@@ -25,7 +25,7 @@ jobs:
       version: ${{ steps.extract-version.outputs.version }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -65,7 +65,7 @@ jobs:
     runs-on: [arc-runner-unityinflow]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -94,7 +94,7 @@ jobs:
     runs-on: [arc-runner-unityinflow]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -127,7 +127,7 @@ jobs:
         run: sha256sum mcp-hub-linux-x86_64.tar.gz > checksums-linux-x64.txt
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: linux-x64
           path: |
@@ -146,7 +146,7 @@ jobs:
     runs-on: [orangepi]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -180,7 +180,7 @@ jobs:
         run: sha256sum mcp-hub-linux-aarch64.tar.gz > checksums-linux-arm64.txt
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: linux-arm64
           path: |
@@ -198,7 +198,7 @@ jobs:
   #   runs-on: [macos-arm64]
   #   timeout-minutes: 30
   #   steps:
-  #     - uses: actions/checkout@v4
+  #     - uses: actions/checkout@v5
   #     - run: rustup target add x86_64-apple-darwin
   #     - run: cargo build --release --target aarch64-apple-darwin
   #     - run: cargo build --release --target x86_64-apple-darwin
@@ -215,7 +215,7 @@ jobs:
   #         timeout 10 ./mcp-hub start -c /tmp/smoke-test.toml 2>&1 || true
   #     - run: tar czf mcp-hub-macos-universal.tar.gz mcp-hub
   #     - run: sha256sum mcp-hub-macos-universal.tar.gz > checksums-macos.txt
-  #     - uses: actions/upload-artifact@v4
+  #     - uses: actions/upload-artifact@v5
   #       with:
   #         name: macos-universal
   #         path: |
@@ -224,13 +224,14 @@ jobs:
 
   # ──────────────────────────────────────────────────────────────────────────
   # JOB 6: release
-  # Requires ALL three build jobs to succeed -- no partial release risk.
-  # Validates all 4 archives exist before creating release.
-  # Generates SHA256SUMS.txt, creates GitHub Release, updates Homebrew tap,
-  # and publishes to crates.io (last step, after everything else succeeds).
+  # Requires ALL build jobs to succeed -- no partial release risk.
+  # Validates all expected archives exist before creating release.
+  # Generates SHA256SUMS.txt, creates GitHub Release, updates Homebrew tap.
+  # crates.io publishing runs in a separate job (JOB 7) that cannot block
+  # the GitHub Release or binary uploads.
   # ──────────────────────────────────────────────────────────────────────────
   release:
-    name: Create GitHub Release + Homebrew + crates.io
+    name: Create GitHub Release + Homebrew
     needs: [build-linux-x64, build-linux-arm64]
     # NOTE: build-macos removed from needs until self-hosted Mac runner is available.
     # Re-add build-macos to this list when macos-arm64 runner is registered.
@@ -239,13 +240,13 @@ jobs:
       contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           merge-multiple: true
           path: artifacts/
@@ -278,7 +279,7 @@ jobs:
           cat SHA256SUMS.txt
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             artifacts/mcp-hub-linux-x86_64.tar.gz
@@ -349,10 +350,27 @@ jobs:
       #     git commit -m "chore: bump mcp-hub to ${VERSION}"
       #     git push
 
-      - name: Publish to crates.io
-        # Runs LAST -- after binaries uploaded and Homebrew tap updated.
-        # --dry-run was validated in preflight; plain publish used here since
-        # test job already verified the crate builds and tests pass.
-        run: cargo publish --locked --allow-dirty
+  # ──────────────────────────────────────────────────────────────────────────
+  # JOB 7: publish-crates
+  # Publishes the crate to crates.io AFTER the GitHub Release succeeds.
+  # Non-blocking by design (continue-on-error): a registry or token failure
+  # (e.g. CARGO_REGISTRY_TOKEN missing publish scope) must never block the
+  # GitHub Release or binary uploads. If this job fails, rotate the token
+  # and run `cargo publish --locked` manually for the tagged version.
+  # ──────────────────────────────────────────────────────────────────────────
+  publish-crates:
+    name: Publish to crates.io (non-blocking)
+    needs: release
+    runs-on: [arc-runner-unityinflow]
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo publish (requires CARGO_REGISTRY_TOKEN with publish scope)
+        run: cargo publish --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
