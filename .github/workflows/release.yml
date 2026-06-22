@@ -1,6 +1,8 @@
 name: Release
 
-# Trigger: push a v* tag (e.g., git tag v0.1.0 && git push origin v0.1.0)
+# Trigger: push a v* tag (e.g., git tag v0.1.1 && git push origin v0.1.1)
+# NOTE: 0.1.0 is already published on crates.io (immutable); this pipeline ships
+# the binstall-metadata + prebuilt-binaries release as 0.1.1 (03-TOOLING-PINS.md).
 # This produces downloadable, cargo-binstall-resolvable binaries for 5 targets
 # (Linux x86_64/aarch64 gnu + musl, Windows x86_64) and publishes the crate to
 # crates.io -- all without manual intervention. The deliberate v* tag + the
