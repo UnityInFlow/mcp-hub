@@ -144,9 +144,21 @@ jobs:
       - name: Install pinned zig + cargo-zigbuild
         run: |
           # Pinned versions (03-TOOLING-PINS.md): zig 0.14.1, cargo-zigbuild 0.23.0.
-          # pip installs the ziglang wheel -> `python -m ziglang`, which zigbuild
-          # auto-discovers as the zig backend. Pin BOTH -- never `latest`.
-          pip3 install --user "ziglang==${ZIG_VERSION}"
+          # Install zig from the official tarball matched to the HOST arch (the
+          # self-hosted runners have no pip3 — orangepi is ARM64; a Hetzner X64
+          # runner would be x86_64). zig itself cross-compiles to all targets,
+          # so only the host arch matters here. Pin BOTH versions -- never `latest`.
+          set -euo pipefail
+          case "$(uname -m)" in
+            aarch64|arm64) ZIG_ARCH=aarch64 ;;
+            x86_64|amd64)  ZIG_ARCH=x86_64 ;;
+            *) echo "unsupported host arch: $(uname -m)" >&2; exit 1 ;;
+          esac
+          ZIG_DIR="zig-linux-${ZIG_ARCH}-${ZIG_VERSION}"
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/${ZIG_DIR}.tar.xz" -o /tmp/zig.tar.xz
+          mkdir -p "$HOME/.zig" && tar -xJf /tmp/zig.tar.xz -C "$HOME/.zig"
+          echo "$HOME/.zig/${ZIG_DIR}" >> "$GITHUB_PATH"
+          "$HOME/.zig/${ZIG_DIR}/zig" version
           cargo install --locked --version "${CARGO_ZIGBUILD_VERSION}" cargo-zigbuild
 
       - name: Build (cargo zigbuild, cross-compiled from this Linux host)
