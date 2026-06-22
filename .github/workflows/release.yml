@@ -154,7 +154,8 @@ jobs:
             x86_64|amd64)  ZIG_ARCH=x86_64 ;;
             *) echo "unsupported host arch: $(uname -m)" >&2; exit 1 ;;
           esac
-          ZIG_DIR="zig-linux-${ZIG_ARCH}-${ZIG_VERSION}"
+          # zig 0.14.0+ uses arch-first artifact naming: zig-<arch>-linux-<ver> (was zig-linux-<arch>-<ver>).
+          ZIG_DIR="zig-${ZIG_ARCH}-linux-${ZIG_VERSION}"
           curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/${ZIG_DIR}.tar.xz" -o /tmp/zig.tar.xz
           mkdir -p "$HOME/.zig" && tar -xJf /tmp/zig.tar.xz -C "$HOME/.zig"
           echo "$HOME/.zig/${ZIG_DIR}" >> "$GITHUB_PATH"
