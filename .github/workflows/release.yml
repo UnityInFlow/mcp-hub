@@ -29,7 +29,7 @@ jobs:
   # ──────────────────────────────────────────────────────────────────────────
   preflight:
     name: Preflight (tag/version check + publish dry-run)
-    runs-on: [arc-runner-unityinflow]
+    runs-on: [orangepi]
     outputs:
       version: ${{ steps.extract-version.outputs.version }}
     steps:
@@ -71,7 +71,7 @@ jobs:
   test:
     name: Test gate (test + clippy + fmt)
     needs: preflight
-    runs-on: [arc-runner-unityinflow]
+    runs-on: [orangepi]
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -116,7 +116,7 @@ jobs:
   build-binaries:
     name: Build ${{ matrix.target }}
     needs: test
-    runs-on: [arc-runner-unityinflow]   # flip to [orangepi] if Hetzner X64 fleet is offline (zigbuild is host-arch-independent)
+    runs-on: [orangepi]   # flip to [orangepi] if Hetzner X64 fleet is offline (zigbuild is host-arch-independent)
     strategy:
       fail-fast: true                   # a partial binary set is a broken release -- fail the whole matrix
       matrix:
@@ -210,7 +210,7 @@ jobs:
   release:
     name: Create GitHub Release
     needs: [build-binaries]
-    runs-on: [arc-runner-unityinflow]
+    runs-on: [orangepi]
     permissions:
       contents: write
     steps:
@@ -309,7 +309,7 @@ jobs:
   publish-crates:
     name: Publish to crates.io
     needs: release
-    runs-on: [arc-runner-unityinflow]
+    runs-on: [orangepi]
     steps:
       - name: Checkout
         uses: actions/checkout@v5
