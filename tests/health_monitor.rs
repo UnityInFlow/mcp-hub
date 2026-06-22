@@ -91,9 +91,11 @@ fn ping_response_missing_result_field() {
 
 #[test]
 fn default_health_check_interval_is_reasonable() {
-    // Must be positive and not absurdly large (sanity check).
-    assert!(DEFAULT_HEALTH_CHECK_INTERVAL_SECS > 0);
-    assert!(DEFAULT_HEALTH_CHECK_INTERVAL_SECS <= 300);
+    // Must be positive and not absurdly large (sanity check). These are
+    // compile-time constants, so assert them in a const block (clippy
+    // assertions_on_constants) — this also validates them at compile time.
+    const { assert!(DEFAULT_HEALTH_CHECK_INTERVAL_SECS > 0) };
+    const { assert!(DEFAULT_HEALTH_CHECK_INTERVAL_SECS <= 300) };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
