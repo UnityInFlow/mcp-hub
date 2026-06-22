@@ -1,8 +1,11 @@
 name: Release
 
 # Trigger: push a v* tag (e.g., git tag v0.1.0 && git push origin v0.1.0)
-# This produces downloadable binaries for 4 platform variants, updates the
-# Homebrew formula, and publishes the crate -- all without manual intervention.
+# This produces downloadable, cargo-binstall-resolvable binaries for 5 targets
+# (Linux x86_64/aarch64 gnu + musl, Windows x86_64) and publishes the crate to
+# crates.io -- all without manual intervention. The deliberate v* tag + the
+# preflight dry-run ARE the gate (crates.io publish is immediate and yank-only;
+# there is no reviewable staging bundle, so there is intentionally NO human gate).
 on:
   push:
     tags:
@@ -10,6 +13,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Pinned toolchain for cargo-zigbuild cross-compilation (see 03-TOOLING-PINS.md).
+  # NEVER use "latest" -- zig <-> cargo-zigbuild compatibility is version-coupled.
+  ZIG_VERSION: '0.14.1'
+  CARGO_ZIGBUILD_VERSION: '0.23.0'
 
 jobs:
   # ──────────────────────────────────────────────────────────────────────────
@@ -82,159 +89,125 @@ jobs:
         run: cargo fmt --check
 
   # ──────────────────────────────────────────────────────────────────────────
-  # JOB 3: build-linux-x64
-  # Builds Linux x86_64 (native via cross) and Windows x86_64 (cross-compiled).
-  # Uses pinned cross@0.2.5 to ensure reproducible builds.
-  # Smoke tests: --version AND mcp-hub start with fixture config (SC-4).
-  # Windows smoke test is best-effort via Wine (accepted limitation).
+  # JOB 3: build-binaries
+  # ONE self-hosted Linux runner cross-compiles ALL 5 targets via cargo-zigbuild
+  # (zig is host-arch-independent, so this whole matrix runs on a single Linux
+  # host -- no per-arch runner, no Docker/cross, no macОS runner). Replaces the
+  # old native build-linux-x64 (cross disabled) + build-linux-arm64 jobs.
+  #
+  # Runner: default [arc-runner-unityinflow]. The Hetzner X64 fleet has been
+  # intermittently offline across Phases 1-2; because zigbuild is host-arch-
+  # independent the entire matrix (incl. x86_64 + Windows) can also run on the
+  # ARM64 orangepi runner -- to flip, change `runs-on` below to [orangepi].
+  #
+  # Assets are named after the CRATE (`mcp-server-hub-<target>-v<version>.<ext>`),
+  # NOT the binary (`mcp-hub`), so cargo binstall's default {name} template
+  # (name = crate = mcp-server-hub) resolves them (D-02 / HUB-04).
+  #
+  # macOS is deferred to v2 (D-06 / HUB-V2-01) -- no macOS target here.
+  # Windows is a REDUCED non-unix CLI: nix/axum/dirs/comfy-table/owo-colors/
+  # dialoguer/tower-http/askama are [target.'cfg(unix)'.dependencies], so the
+  # Windows binary has no daemon/web-UI/signal handling -- documented in the
+  # release notes + README, smoke-tested by build success + presence of the
+  # .exe in the archive (it is not runnable on the Linux build host).
   # ──────────────────────────────────────────────────────────────────────────
-  build-linux-x64:
-    name: Build Linux x86_64 + Windows x86_64
+  build-binaries:
+    name: Build ${{ matrix.target }}
     needs: test
-    runs-on: [arc-runner-unityinflow]
+    runs-on: [arc-runner-unityinflow]   # flip to [orangepi] if Hetzner X64 fleet is offline (zigbuild is host-arch-independent)
+    strategy:
+      fail-fast: true                   # a partial binary set is a broken release -- fail the whole matrix
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            ext: tgz
+          - target: aarch64-unknown-linux-gnu
+            ext: tgz
+          - target: x86_64-unknown-linux-musl
+            ext: tgz
+          - target: aarch64-unknown-linux-musl
+            ext: tgz
+          - target: x86_64-pc-windows-gnu
+            ext: zip
+            binext: '.exe'
     steps:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Install Rust stable
+      - name: Install Rust stable + target
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Build Linux x86_64 (native)
-        run: cargo build --release
-
-      - name: Smoke test Linux x86_64 binary
-        run: |
-          cat > /tmp/smoke-test.toml << 'FIXTURE'
-          [servers.echo-test]
-          command = "echo"
-          args = ["hello"]
-          FIXTURE
-          ./target/release/mcp-hub --version
-          timeout 10 ./target/release/mcp-hub start -c /tmp/smoke-test.toml 2>&1 || true
-          echo "Linux x86_64 smoke test passed"
-
-      # NOTE: Windows cross-compilation via cross disabled — Docker/GHCR auth
-      # issue on ARC runners. Re-enable when Docker is available on runners.
-      # - name: Install cross
-      #   run: cargo install cross@0.2.5 --locked
-      # - name: Build Windows x86_64
-      #   run: cross build --release --target x86_64-pc-windows-gnu
-
-      - name: Package Linux x86_64
-        run: tar czf mcp-hub-linux-x86_64.tar.gz -C target/release mcp-hub
-
-      - name: Generate SHA256 checksums
-        run: sha256sum mcp-hub-linux-x86_64.tar.gz > checksums-linux-x64.txt
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v5
         with:
-          name: linux-x64
-          path: |
-            mcp-hub-linux-x86_64.tar.gz
-            checksums-linux-x64.txt
+          targets: ${{ matrix.target }}
 
-  # ──────────────────────────────────────────────────────────────────────────
-  # JOB 4: build-linux-arm64
-  # Builds Linux aarch64 natively on the ARM64 OrangePi runner.
-  # No cross-compilation needed -- native build on ARM64.
-  # Smoke tests: --version AND mcp-hub start with fixture config (SC-4).
-  # ──────────────────────────────────────────────────────────────────────────
-  build-linux-arm64:
-    name: Build Linux aarch64
-    needs: test
-    runs-on: [orangepi]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Add aarch64 target
-        run: rustup target add aarch64-unknown-linux-gnu
-
-      - name: Build Linux aarch64 (native)
-        run: cargo build --release --target aarch64-unknown-linux-gnu
-
-      - name: Smoke test Linux aarch64 binary
+      - name: Install pinned zig + cargo-zigbuild
         run: |
-          # Write inline fixture config
-          cat > /tmp/smoke-test.toml << 'FIXTURE'
-          [servers.echo-test]
-          command = "echo"
-          args = ["hello"]
-          FIXTURE
+          # Pinned versions (03-TOOLING-PINS.md): zig 0.14.1, cargo-zigbuild 0.23.0.
+          # pip installs the ziglang wheel -> `python -m ziglang`, which zigbuild
+          # auto-discovers as the zig backend. Pin BOTH -- never `latest`.
+          pip3 install --user "ziglang==${ZIG_VERSION}"
+          cargo install --locked --version "${CARGO_ZIGBUILD_VERSION}" cargo-zigbuild
 
-          # Smoke test 1: version output
-          ./target/aarch64-unknown-linux-gnu/release/mcp-hub --version
+      - name: Build (cargo zigbuild, cross-compiled from this Linux host)
+        run: cargo zigbuild --release --locked --target ${{ matrix.target }}
 
-          # Smoke test 2: config load + start (SC-4)
-          timeout 10 ./target/aarch64-unknown-linux-gnu/release/mcp-hub start -c /tmp/smoke-test.toml 2>&1 || true
-          echo "Linux aarch64 smoke test passed"
+      - name: Package (crate-named, binstall-compatible; flat archive)
+        run: |
+          VERSION="${GITHUB_REF##refs/tags/v}"
+          BIN="mcp-hub${{ matrix.binext }}"
+          OUT="mcp-server-hub-${{ matrix.target }}-v${VERSION}.${{ matrix.ext }}"
+          SRC="target/${{ matrix.target }}/release"
+          if [ "${{ matrix.ext }}" = "zip" ]; then
+            # Windows: flat .zip containing just mcp-hub.exe (reduced non-unix CLI)
+            (cd "$SRC" && zip "$OLDPWD/$OUT" "$BIN")
+          else
+            # Linux: flat .tgz containing just the mcp-hub binary (no wrapping dir)
+            tar czf "$OUT" -C "$SRC" "$BIN"
+          fi
+          sha256sum "$OUT" > "$OUT.sha256"
+          echo "Packaged: $OUT"
 
-      - name: Package Linux aarch64
-        run: tar czf mcp-hub-linux-aarch64.tar.gz -C target/aarch64-unknown-linux-gnu/release mcp-hub
-
-      - name: Generate SHA256 checksum
-        run: sha256sum mcp-hub-linux-aarch64.tar.gz > checksums-linux-arm64.txt
+      - name: 'Smoke test (Linux: --version; Windows: build+presence only)'
+        run: |
+          if [ "${{ matrix.target }}" = "x86_64-pc-windows-gnu" ]; then
+            # Windows binary is a reduced non-unix CLI cross-built on Linux -- it is
+            # not runnable on this host. Rely on a successful build + the .exe being
+            # present in the archive (Pitfall 2). Do NOT attempt to execute it.
+            test -f "target/${{ matrix.target }}/release/mcp-hub.exe" || {
+              echo "ERROR: mcp-hub.exe missing from the Windows build"
+              exit 1
+            }
+            echo "Windows reduced-CLI build present (not executed on Linux host)."
+          else
+            # Cross-built non-host Linux targets may not be runnable here either;
+            # --version is the portable check we keep (the old start-servers smoke
+            # is dropped for cross-built targets).
+            BIN_PATH="target/${{ matrix.target }}/release/mcp-hub"
+            if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ]; then
+              "$BIN_PATH" --version
+            else
+              echo "Cross-built ${{ matrix.target }} -- skipping execution on host; build success is the check."
+              test -f "$BIN_PATH"
+            fi
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v5
         with:
-          name: linux-arm64
+          name: ${{ matrix.target }}
           path: |
-            mcp-hub-linux-aarch64.tar.gz
-            checksums-linux-arm64.txt
+            mcp-server-hub-*
 
   # ──────────────────────────────────────────────────────────────────────────
-  # JOB 5: build-macos (DISABLED — no self-hosted Mac runner yet)
-  # Uncomment when macos-arm64 runner is registered.
-  # Also re-add build-macos to the release job's `needs` list.
-  # ──────────────────────────────────────────────────────────────────────────
-  # build-macos:
-  #   name: Build macOS universal binary
-  #   needs: test
-  #   runs-on: [macos-arm64]
-  #   timeout-minutes: 30
-  #   steps:
-  #     - uses: actions/checkout@v5
-  #     - run: rustup target add x86_64-apple-darwin
-  #     - run: cargo build --release --target aarch64-apple-darwin
-  #     - run: cargo build --release --target x86_64-apple-darwin
-  #     - name: Create universal binary via lipo
-  #       run: lipo -create target/aarch64-apple-darwin/release/mcp-hub target/x86_64-apple-darwin/release/mcp-hub -output mcp-hub
-  #     - name: Smoke test
-  #       run: |
-  #         cat > /tmp/smoke-test.toml << 'FIXTURE'
-  #         [servers.echo-test]
-  #         command = "echo"
-  #         args = ["hello"]
-  #         FIXTURE
-  #         ./mcp-hub --version
-  #         timeout 10 ./mcp-hub start -c /tmp/smoke-test.toml 2>&1 || true
-  #     - run: tar czf mcp-hub-macos-universal.tar.gz mcp-hub
-  #     - run: sha256sum mcp-hub-macos-universal.tar.gz > checksums-macos.txt
-  #     - uses: actions/upload-artifact@v5
-  #       with:
-  #         name: macos-universal
-  #         path: |
-  #           mcp-hub-macos-universal.tar.gz
-  #           checksums-macos.txt
-
-  # ──────────────────────────────────────────────────────────────────────────
-  # JOB 6: release
-  # Requires ALL build jobs to succeed -- no partial release risk.
-  # Validates all expected archives exist before creating release.
-  # Generates SHA256SUMS.txt, creates GitHub Release, updates Homebrew tap.
-  # crates.io publishing runs in a separate job (JOB 7) that cannot block
-  # the GitHub Release or binary uploads.
+  # JOB 4: release
+  # Requires ALL build-binaries matrix targets to succeed -- no partial release.
+  # Validates all 5 expected archives exist before creating the release,
+  # generates SHA256SUMS.txt, and creates the GitHub Release with the new
+  # crate-named assets. The macOS target and the tap-formula step are removed
+  # (both deferred to v2 per CONTEXT / D-06).
   # ──────────────────────────────────────────────────────────────────────────
   release:
-    name: Create GitHub Release + Homebrew
-    needs: [build-linux-x64, build-linux-arm64]
-    # NOTE: build-macos removed from needs until self-hosted Mac runner is available.
-    # Re-add build-macos to this list when macos-arm64 runner is registered.
+    name: Create GitHub Release
+    needs: [build-binaries]
     runs-on: [arc-runner-unityinflow]
     permissions:
       contents: write
@@ -242,22 +215,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-
       - name: Download all artifacts
         uses: actions/download-artifact@v5
         with:
           merge-multiple: true
           path: artifacts/
 
-      - name: Validate all 4 expected archives exist
+      - name: Validate all 5 expected archives exist
         run: |
-          echo "Validating release artifacts..."
-          # NOTE: macOS + Windows disabled for v0.1.0. Linux only.
+          VERSION="${GITHUB_REF##refs/tags/v}"
+          echo "Validating release artifacts for v${VERSION}..."
           for f in \
-            mcp-hub-linux-x86_64.tar.gz \
-            mcp-hub-linux-aarch64.tar.gz; do
+            "mcp-server-hub-x86_64-unknown-linux-gnu-v${VERSION}.tgz" \
+            "mcp-server-hub-aarch64-unknown-linux-gnu-v${VERSION}.tgz" \
+            "mcp-server-hub-x86_64-unknown-linux-musl-v${VERSION}.tgz" \
+            "mcp-server-hub-aarch64-unknown-linux-musl-v${VERSION}.tgz" \
+            "mcp-server-hub-x86_64-pc-windows-gnu-v${VERSION}.zip"; do
             if test -f "artifacts/$f"; then
               echo "OK: $f"
             else
@@ -265,15 +238,18 @@ jobs:
               exit 1
             fi
           done
-          echo "All 4 release artifacts validated."
+          echo "All 5 release artifacts validated."
 
       - name: Generate SHA256SUMS.txt
         run: |
+          VERSION="${GITHUB_REF##refs/tags/v}"
           cd artifacts
-          # NOTE: macOS + Windows disabled for v0.1.0. Linux only.
           sha256sum \
-            mcp-hub-linux-x86_64.tar.gz \
-            mcp-hub-linux-aarch64.tar.gz \
+            "mcp-server-hub-x86_64-unknown-linux-gnu-v${VERSION}.tgz" \
+            "mcp-server-hub-aarch64-unknown-linux-gnu-v${VERSION}.tgz" \
+            "mcp-server-hub-x86_64-unknown-linux-musl-v${VERSION}.tgz" \
+            "mcp-server-hub-aarch64-unknown-linux-musl-v${VERSION}.tgz" \
+            "mcp-server-hub-x86_64-pc-windows-gnu-v${VERSION}.zip" \
             > SHA256SUMS.txt
           echo "Generated SHA256SUMS.txt:"
           cat SHA256SUMS.txt
@@ -282,87 +258,56 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: |
-            artifacts/mcp-hub-linux-x86_64.tar.gz
-            artifacts/mcp-hub-linux-aarch64.tar.gz
+            artifacts/mcp-server-hub-*.tgz
+            artifacts/mcp-server-hub-*.zip
             artifacts/SHA256SUMS.txt
           generate_release_notes: true
           body: |
             ## Installation
 
-            **Homebrew (macOS):**
+            > The crate is published as `mcp-server-hub`; it installs a binary named **`mcp-hub`**.
+
+            **Prebuilt binary (fastest):**
             ```bash
-            brew tap unityinflow/tap
-            brew install mcp-hub
+            cargo binstall mcp-server-hub      # downloads a prebuilt mcp-hub binary
             ```
 
             **From source:**
             ```bash
-            cargo install mcp-server-hub
+            cargo install mcp-server-hub       # compiles and installs the mcp-hub binary
             ```
 
-            **Pre-built binaries:**
-            Download the appropriate archive below and extract.
+            **Direct download:** grab the appropriate archive below and extract the `mcp-hub` binary.
 
             | Platform | Archive |
             |----------|---------|
-            | Linux x86_64 | `mcp-hub-linux-x86_64.tar.gz` |
-            | Linux aarch64 | `mcp-hub-linux-aarch64.tar.gz` |
-            | Windows x86_64 | `mcp-hub-windows-x86_64.zip` |
-            | macOS universal (arm64 + x86_64) | `mcp-hub-macos-universal.tar.gz` |
+            | Linux x86_64 (gnu) | `mcp-server-hub-x86_64-unknown-linux-gnu-v<version>.tgz` |
+            | Linux aarch64 (gnu) | `mcp-server-hub-aarch64-unknown-linux-gnu-v<version>.tgz` |
+            | Linux x86_64 (musl) | `mcp-server-hub-x86_64-unknown-linux-musl-v<version>.tgz` |
+            | Linux aarch64 (musl) | `mcp-server-hub-aarch64-unknown-linux-musl-v<version>.tgz` |
+            | Windows x86_64 | `mcp-server-hub-x86_64-pc-windows-gnu-v<version>.zip` |
+
+            > **Windows** binary is a **reduced CLI** — no daemon, no web UI, no signal handling
+            > (those features are Unix-only). **macOS** prebuilt binaries are **deferred to v2**.
 
             ## Checksums
             See `SHA256SUMS.txt` for verification.
 
-      # NOTE: Homebrew tap update DISABLED until macOS builds are enabled.
-      # Uncomment when build-macos job is re-enabled.
-      # - name: Update Homebrew tap
-      #   env:
-      #     HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-      #   run: |
-      #     TAG="${GITHUB_REF##refs/tags/}"
-      #     VERSION="${TAG#v}"
-      #     SHA256=$(sha256sum artifacts/mcp-hub-macos-universal.tar.gz | awk '{print $1}')
-      #     git clone https://github.com/unityinflow/homebrew-tap.git tap-repo
-      #     cd tap-repo || { echo "ERROR: tap-repo directory not found"; exit 1; }
-      #     git config credential.helper '!f() { echo "username=x-access-token"; echo "password=${HOMEBREW_TAP_TOKEN}"; }; f'
-      #     git config user.name "github-actions[bot]"
-      #     git config user.email "github-actions[bot]@users.noreply.github.com"
-      #     mkdir -p Formula
-      #     cat > Formula/mcp-hub.rb << FORMULA
-      #     class McpHub < Formula
-      #       desc "PM2 for MCP servers"
-      #       homepage "https://github.com/UnityInFlow/mcp-hub"
-      #       version "${VERSION}"
-      #       license "MIT"
-      #       on_macos do
-      #         url "https://github.com/UnityInFlow/mcp-hub/releases/download/${TAG}/mcp-hub-macos-universal.tar.gz"
-      #         sha256 "${SHA256}"
-      #       end
-      #       def install
-      #         bin.install "mcp-hub"
-      #       end
-      #       test do
-      #         system "#{bin}/mcp-hub", "--version"
-      #       end
-      #     end
-      #     FORMULA
-      #     git add Formula/mcp-hub.rb
-      #     git commit -m "chore: bump mcp-hub to ${VERSION}"
-      #     git push
-
   # ──────────────────────────────────────────────────────────────────────────
-  # JOB 7: publish-crates
+  # JOB 5: publish-crates
   # Publishes the crate to crates.io AFTER the GitHub Release succeeds.
-  # Non-blocking by design (continue-on-error): a registry or token failure
-  # (e.g. CARGO_REGISTRY_TOKEN missing publish scope) must never block the
-  # GitHub Release or binary uploads. If this job fails, rotate the token
-  # and run `cargo publish --locked` manually for the tagged version.
+  # FAIL-LOUD (D-03 / HUB-05): this job is NOT marked non-blocking -- a registry
+  # or token failure (e.g. CARGO_REGISTRY_TOKEN missing publish scope) now fails
+  # the workflow instead of showing a false green.
+  #
+  # NO human-approval / environment-protection gate (D-04): crates.io publish is
+  # immediate and yank-only -- there is no reviewable staging bundle to approve.
+  # The deliberate v* tag + the JOB-1 dry-run preflight ARE the gate.
   # ──────────────────────────────────────────────────────────────────────────
   publish-crates:
-    name: Publish to crates.io (non-blocking)
+    name: Publish to crates.io
     needs: release
     runs-on: [arc-runner-unityinflow]
-    continue-on-error: true
     steps:
       - name: Checkout
         uses: actions/checkout@v5
