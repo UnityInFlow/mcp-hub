@@ -42,7 +42,7 @@ fi
 # --- Path 1: source install via `cargo install` ---
 echo "==> [1/2] cargo install ${CRATE}@${VERSION} (source install)"
 cargo install "${CRATE}" --version "${VERSION}" --locked --force
-echo "==> Asserting '${BIN} --version' after cargo install"
+echo "==> Asserting 'mcp-hub --version' after cargo install"
 "${BIN}" --version
 
 # --- Path 2: prebuilt-asset install via strict `cargo binstall` ---
@@ -64,7 +64,7 @@ if grep -Eiq 'compiling |building |installing from source|fall(ing)? *back|from 
     exit 1
 fi
 
-echo "==> Asserting '${BIN} --version' after cargo binstall"
+echo "==> Asserting 'mcp-hub --version' after cargo binstall"
 "${BIN}" --version
 
 echo
