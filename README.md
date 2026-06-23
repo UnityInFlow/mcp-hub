@@ -33,7 +33,7 @@ cargo install mcp-server-hub       # compiles and installs the mcp-hub binary
 
 **Direct download:**
 
-Grab `mcp-server-hub-<target>-v<version>.tgz` (Linux) or `.zip` (Windows) from
+Grab `mcp-server-hub-<target>-v<version>.tgz` (Linux) from
 [GitHub Releases](https://github.com/UnityInFlow/mcp-hub/releases), extract the
 `mcp-hub` binary, and put it on your `PATH`.
 
@@ -45,14 +45,12 @@ Prebuilt targets that ship:
 | Linux aarch64 (glibc) | `aarch64-unknown-linux-gnu` | `mcp-server-hub-aarch64-unknown-linux-gnu-v<version>.tgz` |
 | Linux x86_64 (musl) | `x86_64-unknown-linux-musl` | `mcp-server-hub-x86_64-unknown-linux-musl-v<version>.tgz` |
 | Linux aarch64 (musl) | `aarch64-unknown-linux-musl` | `mcp-server-hub-aarch64-unknown-linux-musl-v<version>.tgz` |
-| Windows x86_64 | `x86_64-pc-windows-gnu` | `mcp-server-hub-x86_64-pc-windows-gnu-v<version>.zip` |
 
-> **Windows is a reduced CLI.** The daemon mode, Unix-socket IPC, web UI, signal
-> handling, and colored tables are gated behind `cfg(unix)` and are **not** included
-> in the Windows binary — only the cross-platform commands build there.
->
-> **macOS prebuilt binaries are deferred to v2** (HUB-V2-01). On macOS, install from
-> source with `cargo install mcp-server-hub` for now.
+> **Windows** (HUB-V2-02) and **macOS** (HUB-V2-01) prebuilt binaries are
+> **deferred to v2**. Windows additionally needs the `cfg(unix)`-gated features
+> (daemon, Unix-socket IPC, web UI, signal handling, colored tables) refactored
+> before it can cross-compile. On those platforms, install from source with
+> `cargo install mcp-server-hub`.
 
 After installing, verify with:
 

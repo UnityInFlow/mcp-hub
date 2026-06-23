@@ -118,7 +118,10 @@ jobs:
     needs: test
     runs-on: [orangepi]   # flip to [orangepi] if Hetzner X64 fleet is offline (zigbuild is host-arch-independent)
     strategy:
-      fail-fast: true                   # a partial binary set is a broken release -- fail the whole matrix
+      # fail-fast disabled (#03-04): surface ALL target failures in one run instead
+      # of one-at-a-time cancel-and-retry. The release job still requires every
+      # configured target to succeed, so a partial set never ships.
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
@@ -129,9 +132,10 @@ jobs:
             ext: tgz
           - target: aarch64-unknown-linux-musl
             ext: tgz
-          - target: x86_64-pc-windows-gnu
-            ext: zip
-            binext: '.exe'
+          # x86_64-pc-windows-gnu DEFERRED to v2 (HUB-V2-02): the CLI's unix-gated
+          # deps (chrono/rand/owo_colors/comfy_table/dialoguer/dirs are pulled under
+          # cfg(unix) and used unguarded) don't cross-compile to Windows. Re-add with
+          # proper cfg gating in a later release (alongside macOS, HUB-V2-01).
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -247,8 +251,7 @@ jobs:
             "mcp-server-hub-x86_64-unknown-linux-gnu-v${VERSION}.tgz" \
             "mcp-server-hub-aarch64-unknown-linux-gnu-v${VERSION}.tgz" \
             "mcp-server-hub-x86_64-unknown-linux-musl-v${VERSION}.tgz" \
-            "mcp-server-hub-aarch64-unknown-linux-musl-v${VERSION}.tgz" \
-            "mcp-server-hub-x86_64-pc-windows-gnu-v${VERSION}.zip"; do
+            "mcp-server-hub-aarch64-unknown-linux-musl-v${VERSION}.tgz"; do
             if test -f "artifacts/$f"; then
               echo "OK: $f"
             else
@@ -256,7 +259,7 @@ jobs:
               exit 1
             fi
           done
-          echo "All 5 release artifacts validated."
+          echo "All 4 Linux release artifacts validated (Windows deferred to v2)."
 
       - name: Generate SHA256SUMS.txt
         run: |
@@ -267,7 +270,6 @@ jobs:
             "mcp-server-hub-aarch64-unknown-linux-gnu-v${VERSION}.tgz" \
             "mcp-server-hub-x86_64-unknown-linux-musl-v${VERSION}.tgz" \
             "mcp-server-hub-aarch64-unknown-linux-musl-v${VERSION}.tgz" \
-            "mcp-server-hub-x86_64-pc-windows-gnu-v${VERSION}.zip" \
             > SHA256SUMS.txt
           echo "Generated SHA256SUMS.txt:"
           cat SHA256SUMS.txt
@@ -277,7 +279,6 @@ jobs:
         with:
           files: |
             artifacts/mcp-server-hub-*.tgz
-            artifacts/mcp-server-hub-*.zip
             artifacts/SHA256SUMS.txt
           generate_release_notes: true
           body: |
@@ -303,10 +304,10 @@ jobs:
             | Linux aarch64 (gnu) | `mcp-server-hub-aarch64-unknown-linux-gnu-v<version>.tgz` |
             | Linux x86_64 (musl) | `mcp-server-hub-x86_64-unknown-linux-musl-v<version>.tgz` |
             | Linux aarch64 (musl) | `mcp-server-hub-aarch64-unknown-linux-musl-v<version>.tgz` |
-            | Windows x86_64 | `mcp-server-hub-x86_64-pc-windows-gnu-v<version>.zip` |
 
-            > **Windows** binary is a **reduced CLI** — no daemon, no web UI, no signal handling
-            > (those features are Unix-only). **macOS** prebuilt binaries are **deferred to v2**.
+            > **Windows** and **macOS** prebuilt binaries are **deferred to v2**
+            > (HUB-V2-02 / HUB-V2-01). On those platforms install from source with
+            > `cargo install mcp-server-hub`.
 
             ## Checksums
             See `SHA256SUMS.txt` for verification.
