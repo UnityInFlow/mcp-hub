@@ -193,15 +193,18 @@ jobs:
             }
             echo "Windows reduced-CLI build present (not executed on Linux host)."
           else
-            # Cross-built non-host Linux targets may not be runnable here either;
-            # --version is the portable check we keep (the old start-servers smoke
-            # is dropped for cross-built targets).
+            # A cross-compiled binary can only be EXECUTED when its arch matches the
+            # runner's arch. The runner varies (orangepi=aarch64; Hetzner X64=x86_64),
+            # so decide host-vs-target arch at runtime rather than hardcoding a triple
+            # (a hardcoded x86_64 --version fails with "Exec format error" on aarch64).
             BIN_PATH="target/${{ matrix.target }}/release/mcp-hub"
-            if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ]; then
+            test -f "$BIN_PATH" || { echo "ERROR: $BIN_PATH missing"; exit 1; }
+            TARGET_ARCH="${{ matrix.target }}"; TARGET_ARCH="${TARGET_ARCH%%-*}"   # x86_64 | aarch64
+            HOST_ARCH="$(uname -m)"; [ "$HOST_ARCH" = "arm64" ] && HOST_ARCH=aarch64
+            if [ "$TARGET_ARCH" = "$HOST_ARCH" ]; then
               "$BIN_PATH" --version
             else
-              echo "Cross-built ${{ matrix.target }} -- skipping execution on host; build success is the check."
-              test -f "$BIN_PATH"
+              echo "Cross-built $TARGET_ARCH on $HOST_ARCH host -- presence-only (not natively executable)."
             fi
           fi
 
