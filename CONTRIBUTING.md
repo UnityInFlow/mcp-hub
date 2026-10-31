@@ -34,7 +34,7 @@ Run the binary locally:
 2. Make your change, including tests for new behavior
 3. Ensure `cargo fmt --check`, `cargo clippy -- -D warnings`, and `cargo test` all pass locally
 4. Submit a PR with a clear description of the problem and solution
-5. CI runs on self-hosted runners (X64 + ARM64) — all checks must be green before merge
+5. CI runs on GitHub-hosted runners (Linux + macOS) — all checks must be green before merge
 
 ## Commit Convention
 
