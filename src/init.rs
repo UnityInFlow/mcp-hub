@@ -4,9 +4,74 @@ use std::io::Write as _;
 use std::path::Path;
 
 /// Escape a string for placement inside a TOML double-quoted basic string.
-/// Replaces `\` with `\\` and `"` with `\"`.
+///
+/// Replaces `\` with `\\` and `"` with `\"`. TOML basic strings forbid raw
+/// control characters, so `\t`, `\n` and `\r` use their short escapes and every
+/// other control character (U+0000-U+001F, U+007F) becomes `\uXXXX`.
 fn toml_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c if (c as u32) < 0x20 || c == '\u{7f}' => {
+                out.push_str(&format!("\\u{:04X}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Split a line of arguments, shell-style but minimal.
+///
+/// - Arguments are separated by whitespace.
+/// - A double-quoted section groups text, which may contain spaces and commas.
+/// - Inside quotes, `\"` is a literal quote; any other backslash is literal
+///   (so Windows paths like `"C:\Program Files\x"` work).
+/// - `""` yields an explicit empty argument.
+/// - An unterminated quote is an error.
+pub fn parse_args(input: &str) -> anyhow::Result<Vec<String>> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_token = false;
+    let mut in_quotes = false;
+    let mut chars = input.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if in_quotes {
+            match c {
+                '"' => in_quotes = false,
+                '\\' if chars.peek() == Some(&'"') => {
+                    chars.next();
+                    current.push('"');
+                }
+                c => current.push(c),
+            }
+        } else if c == '"' {
+            in_quotes = true;
+            in_token = true;
+        } else if c.is_whitespace() {
+            if in_token {
+                args.push(std::mem::take(&mut current));
+                in_token = false;
+            }
+        } else {
+            current.push(c);
+            in_token = true;
+        }
+    }
+
+    if in_quotes {
+        anyhow::bail!("Unterminated double quote in arguments");
+    }
+    if in_token {
+        args.push(current);
+    }
+    Ok(args)
 }
 
 /// Characters that are invalid in TOML bare keys and would break the generated config.
@@ -97,43 +162,79 @@ pub fn write_server_entry(toml_block: &str) -> anyhow::Result<()> {
 
 /// Write `toml_block` to `path`, appending if the file exists.
 ///
-/// For new files the leading `\n` in `toml_block` is trimmed so the file
-/// does not start with a blank line. For existing files the content is
-/// appended directly (the leading `\n` provides the blank-line separator).
+/// For new (or blank) files the leading `\n` in `toml_block` is trimmed so the
+/// file does not start with a blank line. For existing files the block is
+/// appended after ensuring a trailing newline (the block's leading `\n`
+/// provides the blank-line separator).
+///
+/// The write is atomic: the full new content is built in memory, written to
+/// `<path>.tmp` in the same directory, synced, then renamed over `path`.
+/// An existing file that is not valid TOML is never modified; an error is
+/// returned instead.
 pub fn write_server_entry_to(path: &Path, toml_block: &str) -> anyhow::Result<()> {
-    if path.exists() {
-        // Read first to check trailing newline, then open for append.
-        let existing = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read {}", path.display()))?;
-
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(path)
-            .with_context(|| format!("Failed to open {} for appending", path.display()))?;
-
-        // Ensure the existing file ends with a newline before appending.
-        if !existing.ends_with('\n') {
-            file.write_all(b"\n")
-                .with_context(|| format!("Failed to write newline to {}", path.display()))?;
+    let existing = match std::fs::read_to_string(path) {
+        Ok(content) => Some(content),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(e).with_context(|| format!("Failed to read {}", path.display()));
         }
+    };
 
-        file.write_all(toml_block.as_bytes())
-            .with_context(|| format!("Failed to write to {}", path.display()))?;
-    } else {
-        // New file — trim the leading newline to avoid a blank first line.
-        let content = toml_block.trim_start_matches('\n');
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).with_context(|| {
-                    format!("Failed to create parent directory for {}", path.display())
-                })?;
+    let new_content = match existing {
+        Some(existing) if !existing.trim().is_empty() => {
+            toml::from_str::<toml::Value>(&existing).with_context(|| {
+                format!(
+                    "Existing {} is not valid TOML; refusing to modify it (fix or remove it first)",
+                    path.display()
+                )
+            })?;
+            let mut content = existing;
+            if !content.ends_with('\n') {
+                content.push('\n');
             }
+            content.push_str(toml_block);
+            content
         }
-        std::fs::write(path, content)
-            .with_context(|| format!("Failed to write {}", path.display()))?;
+        Some(_) | None => toml_block.trim_start_matches('\n').to_string(),
+    };
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create parent directory for {}", path.display())
+            })?;
+        }
     }
 
-    Ok(())
+    let mut tmp_name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| "mcp-hub.toml".into());
+    tmp_name.push(".tmp");
+    let tmp_path = path.with_file_name(tmp_name);
+
+    let result = (|| -> anyhow::Result<()> {
+        let mut file = std::fs::File::create(&tmp_path)
+            .with_context(|| format!("Failed to create {}", tmp_path.display()))?;
+        file.write_all(new_content.as_bytes())
+            .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("Failed to sync {}", tmp_path.display()))?;
+        drop(file);
+        std::fs::rename(&tmp_path, path).with_context(|| {
+            format!(
+                "Failed to rename {} over {}",
+                tmp_path.display(),
+                path.display()
+            )
+        })
+    })();
+
+    if result.is_err() {
+        // Best-effort cleanup; the original error is what matters.
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    result
 }
 
 /// Run the interactive `mcp-hub init` wizard.
@@ -182,17 +283,18 @@ pub fn run_init_wizard() -> anyhow::Result<()> {
 
     // ── Prompt 3: args (optional) ─────────────────────────────────────────
     let args_raw: String = Input::new()
-        .with_prompt("Arguments (comma-separated, Enter to skip)")
+        .with_prompt(
+            "Arguments (space-separated; use \"double quotes\" to group, \\\" for a literal quote; Enter to skip)",
+        )
         .default(String::new())
         .allow_empty(true)
+        .validate_with(|input: &String| -> Result<(), String> {
+            parse_args(input).map(|_| ()).map_err(|e| e.to_string())
+        })
         .interact_text()
         .context("Failed to read arguments")?;
 
-    let args: Vec<String> = args_raw
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let args: Vec<String> = parse_args(&args_raw).context("Invalid arguments")?;
 
     // ── Prompt 4: transport ───────────────────────────────────────────────
     let transports = &["stdio", "http"];
@@ -362,6 +464,66 @@ mod tests {
     #[test]
     fn toml_escape_both() {
         assert_eq!(toml_escape("back\\and\"quote"), "back\\\\and\\\"quote");
+    }
+
+    // -- toml_escape: control characters -------------------------------------
+
+    #[test]
+    fn toml_escape_control_chars() {
+        assert_eq!(toml_escape("a\tb\nc\rd"), "a\\tb\\nc\\rd");
+        assert_eq!(toml_escape("\u{1b}"), "\\u001B");
+        assert_eq!(toml_escape("\u{7f}"), "\\u007F");
+        assert_eq!(toml_escape("\u{0}"), "\\u0000");
+    }
+
+    // -- parse_args ------------------------------------------------------------
+
+    #[test]
+    fn parse_args_plain() {
+        assert_eq!(
+            parse_args("a b  c\t d").expect("ok"),
+            vec!["a", "b", "c", "d"]
+        );
+    }
+
+    #[test]
+    fn parse_args_quoted_with_space() {
+        assert_eq!(
+            parse_args(r#"--name "hello world" x"#).expect("ok"),
+            vec!["--name", "hello world", "x"]
+        );
+    }
+
+    #[test]
+    fn parse_args_quoted_with_comma() {
+        assert_eq!(
+            parse_args(r#""--filter=a,b" x"#).expect("ok"),
+            vec!["--filter=a,b", "x"]
+        );
+    }
+
+    #[test]
+    fn parse_args_escaped_quote_inside_quotes() {
+        assert_eq!(
+            parse_args(r#""say \"hi\"" y"#).expect("ok"),
+            vec![r#"say "hi""#, "y"]
+        );
+    }
+
+    #[test]
+    fn parse_args_empty_and_blank() {
+        assert!(parse_args("").expect("ok").is_empty());
+        assert!(parse_args("   \t ").expect("ok").is_empty());
+    }
+
+    #[test]
+    fn parse_args_explicit_empty_string_arg() {
+        assert_eq!(parse_args(r#"a "" b"#).expect("ok"), vec!["a", "", "b"]);
+    }
+
+    #[test]
+    fn parse_args_unterminated_quote_errors() {
+        assert!(parse_args(r#"a "b c"#).is_err());
     }
 
     // -- is_valid_server_name: Unicode rejection ------------------------------
