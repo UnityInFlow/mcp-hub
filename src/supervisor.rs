@@ -113,6 +113,23 @@ pub fn spawn_server(
     })
 }
 
+/// Send `signal` to the whole process group led by `pid`.
+///
+/// Children are spawned with `process_group(0)`, so their PGID equals their PID.
+/// `ESRCH` (no such group — everything already exited) is benign and ignored;
+/// any other failure is logged.
+#[cfg(unix)]
+fn kill_group(pid: u32, signal: nix::sys::signal::Signal) {
+    use nix::errno::Errno;
+    use nix::sys::signal::killpg;
+    use nix::unistd::Pid;
+
+    match killpg(Pid::from_raw(pid as i32), signal) {
+        Ok(()) | Err(Errno::ESRCH) => {}
+        Err(err) => tracing::warn!(pid, ?signal, "killpg failed: {err}"),
+    }
+}
+
 /// Gracefully shut down a child process: SIGTERM → 5 s wait → SIGKILL.
 ///
 /// On Unix, SIGTERM is sent to the **entire process group** via `killpg` so that
@@ -122,18 +139,7 @@ pub fn spawn_server(
 pub async fn shutdown_process(mut child: tokio::process::Child, pid: u32) -> anyhow::Result<()> {
     // Send SIGTERM to the entire process group (D-08).
     #[cfg(unix)]
-    {
-        use nix::sys::signal::{killpg, Signal};
-        use nix::unistd::Pid;
-
-        if let Err(err) = killpg(Pid::from_raw(pid as i32), Signal::SIGTERM) {
-            // ESRCH means the process already exited — benign.
-            tracing::warn!(
-                pid,
-                "killpg(SIGTERM) failed (process may have exited): {err}"
-            );
-        }
-    }
+    kill_group(pid, nix::sys::signal::Signal::SIGTERM);
 
     // Race child.wait() against a 5-second timeout (D-07).
     let result = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
@@ -146,6 +152,10 @@ pub async fn shutdown_process(mut child: tokio::process::Child, pid: u32) -> any
         _ => {
             // Timeout or wait error — escalate to SIGKILL.
             tracing::warn!(pid, "Grace period elapsed; sending SIGKILL");
+            // SIGKILL the whole group: members that ignored SIGTERM must not survive.
+            #[cfg(unix)]
+            kill_group(pid, nix::sys::signal::Signal::SIGKILL);
+            #[cfg(not(unix))]
             child.kill().await.ok();
             child.wait().await.ok(); // reap zombie (PROC-09)
             Ok(())
@@ -310,6 +320,8 @@ pub async fn run_server_supervisor(
         let spawned_stdin = spawned.stdin;
         let spawned_stdout = spawned.stdout;
         let mut child = spawned.child;
+        // Kept so the crash path can abort it if a lingering pipe holder blocks EOF.
+        let mut reader_handle: Option<tokio::task::JoinHandle<()>> = None;
 
         if let (Some(stdin), Some(stdout)) = (spawned_stdin, spawned_stdout) {
             let stdin_shared: SharedStdin = Arc::new(Mutex::new(stdin));
@@ -318,9 +330,9 @@ pub async fn run_server_supervisor(
 
             // Spawn the reader task that owns stdout and routes responses by ID.
             let pending_clone = Arc::clone(&pending);
-            tokio::spawn(async move {
+            reader_handle = Some(tokio::spawn(async move {
                 crate::mcp::dispatcher::reader_task(stdout, pending_clone).await;
-            });
+            }));
 
             // Spawn the health check loop using shared stdin + pending map.
             let health_name = name.clone();
@@ -407,6 +419,15 @@ pub async fn run_server_supervisor(
             // Child exited on its own (crash or clean exit).
             status = child.wait() => {
                 health_cancel.cancel();
+                // The direct child is gone, but wrappers (npx/uvx/node shims) may
+                // have left group members behind that hold the stdout pipe open
+                // and would collide with the respawn. Kill the whole group, then
+                // stop the reader so a lingering pipe cannot keep it alive.
+                #[cfg(unix)]
+                kill_group(pid, nix::sys::signal::Signal::SIGKILL);
+                if let Some(handle) = reader_handle.take() {
+                    handle.abort();
+                }
                 let ran_for = started_at.elapsed().as_secs();
                 tracing::warn!(
                     server = %name,
