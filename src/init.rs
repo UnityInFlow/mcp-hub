@@ -179,6 +179,12 @@ pub fn write_server_entry_to(path: &Path, toml_block: &str) -> anyhow::Result<()
             return Err(e).with_context(|| format!("Failed to read {}", path.display()));
         }
     };
+    // Preserve the existing file's permissions across the temp-file rename
+    // (the config may be chmod 600 because it holds inline env secrets).
+    let existing_perms = existing
+        .as_ref()
+        .and_then(|_| std::fs::metadata(path).ok())
+        .map(|m| m.permissions());
 
     let new_content = match existing {
         Some(existing) if !existing.trim().is_empty() => {
@@ -220,6 +226,10 @@ pub fn write_server_entry_to(path: &Path, toml_block: &str) -> anyhow::Result<()
             .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
         file.sync_all()
             .with_context(|| format!("Failed to sync {}", tmp_path.display()))?;
+        if let Some(perms) = &existing_perms {
+            file.set_permissions(perms.clone())
+                .with_context(|| format!("Failed to set permissions on {}", tmp_path.display()))?;
+        }
         drop(file);
         std::fs::rename(&tmp_path, path).with_context(|| {
             format!(

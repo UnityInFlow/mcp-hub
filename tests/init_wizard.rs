@@ -320,3 +320,28 @@ fn test_no_temp_file_left_after_success() {
     write_server_entry_to(&path, &block).expect("write");
     assert!(!dir.path().join("mcp-hub.toml.tmp").exists());
 }
+
+#[cfg(unix)]
+#[test]
+fn test_append_preserves_existing_file_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("mcp-hub.toml");
+    std::fs::write(&path, "[servers.one]\ncommand = \"echo\"\n").expect("write");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+
+    let block = format_toml_block("two", "echo", &[], "stdio");
+    write_server_entry_to(&path, &block).expect("append");
+
+    let mode = std::fs::metadata(&path)
+        .expect("metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "permissions were not preserved across the atomic write"
+    );
+    let names = existing_server_names_from(&path);
+    assert!(names.contains(&"two".to_string()));
+}
