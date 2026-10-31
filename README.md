@@ -73,7 +73,7 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
 [servers.github]
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-github"]
-env = { GITHUB_PERSONAL_ACCESS_TOKEN = "${GITHUB_TOKEN}" }
+env_file = ".env"   # put GITHUB_PERSONAL_ACCESS_TOKEN=... in .env (values are not ${VAR}-expanded)
 ```
 
 Then start all servers:
@@ -107,16 +107,20 @@ Full server block reference:
 web_port = 3456          # Web UI port (default: 3456)
 
 [servers.my-server]
-command = "npx"          # Executable to run
-args = ["-y", "@scope/server"]  # Arguments
-env = { API_KEY = "${MY_API_KEY}" }  # Environment variables (supports ${VAR} expansion)
-
-[servers.my-server.health]
-interval_secs = 30       # How often to send MCP ping (default: 30)
-
-[servers.my-server.restart]
-max_retries = 5          # Max restart attempts before marking Fatal (default: 5)
+command = "npx"          # Executable to run (required, must not be empty)
+args = ["-y", "@scope/server"]  # Arguments passed to the executable (default: [])
+env = { LOG_LEVEL = "info" }  # Inline environment variables, passed literally (default: none)
+env_file = ".env"        # Path to a KEY=VALUE file (# comments ok); its values override `env` (default: none)
+transport = "stdio"      # "stdio" or "http" (default: "stdio")
+cwd = "/path/to/project" # Working directory for the process (default: inherited)
+health_check_interval = 30  # Seconds between MCP pings (default: 30)
+max_retries = 10         # Consecutive crashes before marking Fatal (default: 10)
+restart_delay = 1        # Base restart backoff delay in seconds (default: 1)
 ```
+
+> **Note:** `${VAR}` references in `env` values are not expanded; the string is passed to the server as written. Use `env_file` for secrets so they stay out of the config.
+
+> **Note:** `max_retries` and `restart_delay` are currently parsed but not applied by the supervisor, which always uses its built-in defaults (tracked in [#15](https://github.com/UnityInFlow/mcp-hub/issues/15)). Setting them has no effect until that lands.
 
 ## Web UI
 
