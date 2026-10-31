@@ -20,6 +20,25 @@ use crate::types::{McpCapabilities, ServerSnapshot};
 // Public entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Run [`run_introspection`], dropping it as soon as `cancel` fires.
+///
+/// Returns `None` if cancelled first. Because the introspection future is
+/// dropped at its current await point, it can never publish capabilities for
+/// a process that has already been replaced.
+pub async fn run_introspection_until_cancelled(
+    server_name: &str,
+    stdin: &SharedStdin,
+    pending: &PendingMap,
+    id_alloc: &Arc<IdAllocator>,
+    snapshot_tx: &tokio::sync::watch::Sender<ServerSnapshot>,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Option<anyhow::Result<McpCapabilities>> {
+    tokio::select! {
+        () = cancel.cancelled() => None,
+        result = run_introspection(server_name, stdin, pending, id_alloc, snapshot_tx) => Some(result),
+    }
+}
+
 /// Run the full MCP introspection sequence for a server.
 ///
 /// Steps:
