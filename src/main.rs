@@ -90,6 +90,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 let sock = daemon::socket_path()?;
                 let pid = daemon::pid_path()?;
 
+                // Web UI reads its own snapshot views so it never contends on
+                // the handles mutex that config reload holds across shutdowns.
+                let server_views = web::new_server_views(&handles);
                 let daemon_state = Arc::new(control::DaemonState {
                     handles: Arc::new(tokio::sync::Mutex::new(handles)),
                     log_agg: Arc::clone(&log_agg),
@@ -100,7 +103,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 // Spawn web UI server (Phase 4 -- WEB-01).
                 let web_port = config.hub.web_port;
                 let web_state = Arc::new(web::WebState {
-                    handles: Arc::clone(&daemon_state.handles),
+                    servers: Arc::clone(&server_views),
                     log_agg: Arc::clone(&log_agg),
                 });
                 let web_shutdown = shutdown.clone();
@@ -143,6 +146,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                 tracing::info!("SIGHUP received — reloading config");
                                 handle_reload(
                                     &daemon_state,
+                                    &server_views,
                                     cli.config.as_deref(),
                                     &mut current_config,
                                     &shutdown,
@@ -208,12 +212,15 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 let states = output::collect_states_from_handles(&handles);
                 output::print_status_table(&states, color);
 
-                // Wrap handles for web server sharing.
+                // Foreground mode has no reload, so the views never change.
+                let server_views = web::new_server_views(&handles);
+
+                // Wrap handles for the foreground loop (shared Arc<Mutex>).
                 let handles_arc = Arc::new(tokio::sync::Mutex::new(handles));
 
                 // Spawn web UI server (Phase 4 -- WEB-01).
                 let web_state = Arc::new(web::WebState {
-                    handles: Arc::clone(&handles_arc),
+                    servers: server_views,
                     log_agg: Arc::clone(&log_agg),
                 });
                 let web_shutdown = shutdown.clone();
@@ -408,6 +415,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 /// diff against the latest state.
 async fn handle_reload(
     state: &Arc<control::DaemonState>,
+    views: &web::SharedServerViews,
     config_path: Option<&std::path::Path>,
     current_config: &mut config::HubConfig,
     shutdown: &CancellationToken,
@@ -424,6 +432,9 @@ async fn handle_reload(
                 log_agg,
             )
             .await;
+            // Publish the new handle set to the web UI only now, with a brief
+            // write lock; until here it kept serving the previous snapshots.
+            web::publish_server_views(views, &handles).await;
             tracing::info!(added, removed, changed, "Config reload complete");
             *current_config = new_config;
         }
