@@ -73,7 +73,7 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
 [servers.github]
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-github"]
-env = { GITHUB_PERSONAL_ACCESS_TOKEN = "${GITHUB_TOKEN}" }
+env_file = ".env"   # put GITHUB_PERSONAL_ACCESS_TOKEN=... in .env (values are not ${VAR}-expanded)
 ```
 
 Then start all servers:
