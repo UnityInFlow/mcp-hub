@@ -10,26 +10,79 @@ use std::path::PathBuf;
 // Path resolution
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Create `dir` (and any missing parents) with mode `0700`.
+///
+/// Directories that already exist are left untouched; only newly created
+/// directories get the restrictive mode (subject to the process umask, which
+/// can only make it stricter).
+#[cfg(unix)]
+fn create_dir_all_private(dir: &std::path::Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .map_err(|e| anyhow::anyhow!("Failed to create {}: {e}", dir.display()))
+}
+
+#[cfg(not(unix))]
+fn create_dir_all_private(dir: &std::path::Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir)
+        .map_err(|e| anyhow::anyhow!("Failed to create {}: {e}", dir.display()))
+}
+
+/// Ensure `dir` exists and is accessible only by its owner (`0700`).
+///
+/// Creates the directory with mode `0700` when missing, and tightens the mode
+/// of an existing directory that is more permissive. Intended for the mcp-hub
+/// state directory that holds the control socket.
+pub fn ensure_private_dir(dir: &std::path::Path) -> anyhow::Result<()> {
+    create_dir_all_private(dir)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = std::fs::metadata(dir)
+            .map_err(|e| anyhow::anyhow!("Failed to stat {}: {e}", dir.display()))?
+            .permissions()
+            .mode()
+            & 0o777;
+        if mode != 0o700 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to restrict {} to owner-only (0700): {e}",
+                    dir.display()
+                )
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Resolve the daemon Unix socket path: `~/.config/mcp-hub/mcp-hub.sock`
 ///
 /// The path can be overridden with the `MCP_HUB_SOCKET` environment variable.
 /// This override is used by integration tests to isolate daemon instances.
 ///
-/// Creates the parent directory if it does not already exist.
+/// Creates the parent directory if it does not already exist, with mode `0700`.
+/// The default state directory is additionally tightened to `0700` if it
+/// already exists with looser permissions. A pre-existing parent of an
+/// `MCP_HUB_SOCKET` override is never modified (it may be e.g. `/tmp`).
 pub fn socket_path() -> anyhow::Result<PathBuf> {
     if let Ok(override_path) = std::env::var("MCP_HUB_SOCKET") {
         let p = PathBuf::from(override_path);
         if let Some(parent) = p.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| anyhow::anyhow!("Failed to create {}: {e}", parent.display()))?;
+            create_dir_all_private(parent)?;
         }
         return Ok(p);
     }
     let config_dir =
         dirs::config_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine config directory"))?;
     let dir = config_dir.join("mcp-hub");
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| anyhow::anyhow!("Failed to create {}: {e}", dir.display()))?;
+    ensure_private_dir(&dir)?;
     Ok(dir.join("mcp-hub.sock"))
 }
 
@@ -68,6 +121,8 @@ pub fn remove_pid_file(path: &std::path::Path) {
 /// Check whether a daemon is already running by attempting a synchronous
 /// connect to `sock_path`.
 ///
+/// - If the socket or PID file exists but is owned by a different user, the
+///   check fails without unlinking anything.
 /// - If the connect succeeds, a live daemon is running — returns an error.
 /// - If the connect fails, there is no live daemon; stale socket/PID files
 ///   are cleaned up and `Ok(())` is returned.
@@ -80,6 +135,9 @@ pub fn check_existing_daemon(
     pid_path: &std::path::Path,
 ) -> anyhow::Result<()> {
     use std::os::unix::net::UnixStream as StdUnixStream;
+
+    ensure_owned_by_current_user(sock_path)?;
+    ensure_owned_by_current_user(pid_path)?;
 
     match StdUnixStream::connect(sock_path) {
         Ok(_) => {
@@ -95,6 +153,30 @@ pub fn check_existing_daemon(
             Ok(())
         }
     }
+}
+
+/// Fail if `path` exists and is owned by a uid other than the current one.
+///
+/// A socket or PID file planted by another user must never be trusted or
+/// unlinked on their behalf. A missing file is fine.
+#[cfg(unix)]
+fn ensure_owned_by_current_user(path: &std::path::Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => anyhow::bail!("Cannot stat {}: {e}", path.display()),
+    };
+    let current = nix::unistd::getuid().as_raw();
+    if meta.uid() != current {
+        anyhow::bail!(
+            "{} is owned by another user (uid {}, expected {current}); refusing to use or remove it",
+            path.display(),
+            meta.uid()
+        );
+    }
+    Ok(())
 }
 
 /// Remove stale socket and PID files left behind by a dead daemon process.
