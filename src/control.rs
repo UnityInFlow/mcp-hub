@@ -107,13 +107,59 @@ pub struct DaemonState {
 // Server-side socket listener (Unix only)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Default time a client may take to deliver its request line.
+pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default maximum length (in bytes) of a request line, excluding the newline.
+pub const DEFAULT_MAX_REQUEST_BYTES: usize = 64 * 1024;
+
+/// After rejecting an oversized request, discard at most this many further bytes...
+#[cfg(unix)]
+const OVERSIZE_DRAIN_BYTES: u64 = 1024 * 1024;
+
+/// ...and for at most this long, so the error response reaches the client.
+#[cfg(unix)]
+const OVERSIZE_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Per-connection limits enforced by the control socket.
+#[derive(Debug, Clone, Copy)]
+pub struct ControlLimits {
+    /// Maximum time to wait for a complete request line.
+    pub read_timeout: Duration,
+    /// Maximum length of a request line in bytes.
+    pub max_request_bytes: usize,
+}
+
+impl Default for ControlLimits {
+    fn default() -> Self {
+        Self {
+            read_timeout: DEFAULT_READ_TIMEOUT,
+            max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
+        }
+    }
+}
+
 #[cfg(unix)]
 /// Bind a Unix domain socket at `sock_path` and accept control connections.
 ///
 /// Each connection receives exactly one request and sends exactly one response
 /// (newline-delimited JSON). The listener shuts down when `state.shutdown` is
 /// cancelled and removes the socket file on exit.
+///
+/// The socket is restricted to the owner (`0600`) right after binding, idle
+/// clients are dropped after [`DEFAULT_READ_TIMEOUT`], and request lines are
+/// capped at [`DEFAULT_MAX_REQUEST_BYTES`].
 pub async fn run_control_socket(sock_path: &Path, state: Arc<DaemonState>) -> anyhow::Result<()> {
+    run_control_socket_with_limits(sock_path, state, ControlLimits::default()).await
+}
+
+#[cfg(unix)]
+/// Like [`run_control_socket`], but with explicit per-connection limits.
+pub async fn run_control_socket_with_limits(
+    sock_path: &Path,
+    state: Arc<DaemonState>,
+    limits: ControlLimits,
+) -> anyhow::Result<()> {
     use tokio::net::UnixListener;
 
     // Remove any leftover socket from a previous run.
@@ -121,6 +167,20 @@ pub async fn run_control_socket(sock_path: &Path, state: Arc<DaemonState>) -> an
 
     let listener = UnixListener::bind(sock_path)
         .map_err(|e| anyhow::anyhow!("Failed to bind socket {}: {e}", sock_path.display()))?;
+
+    // Restrict the socket to the owner. The state directory is already 0700,
+    // so there is no window in which another user can reach the socket.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(sock_path, std::fs::Permissions::from_mode(0o600)).map_err(
+            |e| {
+                anyhow::anyhow!(
+                    "Failed to set permissions 0600 on socket {}: {e}",
+                    sock_path.display()
+                )
+            },
+        )?;
+    }
 
     tracing::info!("Control socket listening on {}", sock_path.display());
 
@@ -131,7 +191,7 @@ pub async fn run_control_socket(sock_path: &Path, state: Arc<DaemonState>) -> an
                     Ok((stream, _addr)) => {
                         let state = Arc::clone(&state);
                         tokio::spawn(async move {
-                            if let Err(e) = handle_connection(stream, state).await {
+                            if let Err(e) = handle_connection(stream, state, limits).await {
                                 tracing::warn!("Control socket connection error: {e}");
                             }
                         });
@@ -165,22 +225,76 @@ pub async fn run_control_socket(_sock_path: &Path, _state: Arc<DaemonState>) -> 
 
 #[cfg(unix)]
 /// Read one request line, dispatch it, and write one response line.
+///
+/// The request must arrive within `limits.read_timeout` and be at most
+/// `limits.max_request_bytes` long; idle clients are dropped silently and
+/// oversized requests get an error response before the connection is closed.
 async fn handle_connection(
     stream: tokio::net::UnixStream,
     state: Arc<DaemonState>,
+    limits: ControlLimits,
 ) -> anyhow::Result<()> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
     let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+    // Allow one byte more than the cap so an over-long line is detectable
+    // without ever buffering more than `max_request_bytes + 1` bytes.
+    let cap = u64::try_from(limits.max_request_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut reader = BufReader::new(reader.take(cap));
 
-    let request_line = lines
-        .next_line()
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("Client disconnected without sending request"))?;
+    let mut buf = Vec::new();
+    let read = tokio::time::timeout(limits.read_timeout, reader.read_until(b'\n', &mut buf)).await;
+    let n = match read {
+        Ok(result) => result?,
+        Err(_elapsed) => {
+            tracing::debug!(
+                "Control socket client sent no complete request within {:?}; dropping",
+                limits.read_timeout
+            );
+            return Ok(());
+        }
+    };
 
-    let request: DaemonRequest = serde_json::from_str(&request_line)
-        .map_err(|e| anyhow::anyhow!("Invalid request JSON: {e}"))?;
+    if n == 0 {
+        anyhow::bail!("Client disconnected without sending request");
+    }
+
+    let has_newline = buf.last() == Some(&b'\n');
+    let line_len = if has_newline {
+        buf.len() - 1
+    } else {
+        buf.len()
+    };
+    if line_len > limits.max_request_bytes {
+        let response = DaemonResponse::err(format!(
+            "Request too large (limit {} bytes)",
+            limits.max_request_bytes
+        ));
+        let mut response_json = serde_json::to_string(&response)?;
+        response_json.push('\n');
+        // The client may already be gone; the error is still reported below.
+        writer.write_all(response_json.as_bytes()).await?;
+        writer.flush().await?;
+        // Closing a socket with unread input makes the kernel send RST, which
+        // can destroy the error response before the client reads it. Briefly
+        // drain (bounded in both bytes and time) so the client sees the reply.
+        let rest = reader.into_inner().into_inner();
+        let mut bounded = rest.take(OVERSIZE_DRAIN_BYTES);
+        let _ = tokio::time::timeout(
+            OVERSIZE_DRAIN_TIMEOUT,
+            tokio::io::copy(&mut bounded, &mut tokio::io::sink()),
+        )
+        .await;
+        anyhow::bail!(
+            "Request exceeded {} bytes; connection closed",
+            limits.max_request_bytes
+        );
+    }
+
+    let request: DaemonRequest =
+        serde_json::from_slice(&buf).map_err(|e| anyhow::anyhow!("Invalid request JSON: {e}"))?;
 
     let response = dispatch_request(request, &state).await;
 
