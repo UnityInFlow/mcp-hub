@@ -372,7 +372,8 @@ pub async fn logs_page(
 /// supervisor `handles` mutex, so it keeps answering while a config reload is
 /// stopping servers.
 ///
-/// Overall status: `failed` if any server is `HealthStatus::Failed` (HTTP 503),
+/// Overall status: `failed` if any server is `HealthStatus::Failed` or in
+/// `ProcessState::Fatal` (HTTP 503),
 /// `healthy` if there are no servers or all are `Healthy`, otherwise `degraded`
 /// (HTTP 200: the hub still serves, only a failed server should page).
 pub async fn health_handler(State(state): State<Arc<WebState>>) -> impl IntoResponse {
@@ -391,6 +392,19 @@ pub async fn health_handler(State(state): State<Arc<WebState>>) -> impl IntoResp
                 }
                 HealthStatus::Healthy { .. } => {}
                 HealthStatus::Degraded { .. } | HealthStatus::Unknown => all_healthy = false,
+            }
+            // A server that gave up restarting is dead regardless of the last
+            // health probe it answered; it must not leave the hub reporting OK.
+            match snap.process_state {
+                ProcessState::Fatal => {
+                    any_failed = true;
+                    all_healthy = false;
+                }
+                ProcessState::Stopped
+                | ProcessState::Starting
+                | ProcessState::Running
+                | ProcessState::Backoff { .. }
+                | ProcessState::Stopping => {}
             }
             ServerHealthEntry {
                 name: v.name.clone(),
@@ -628,6 +642,15 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(json["status"], "failed");
         assert_eq!(json["servers"].as_array().map(Vec::len), Some(2));
+    }
+
+    #[tokio::test]
+    async fn health_fatal_process_with_stale_healthy_probe_returns_503() {
+        let (state, _handles, senders) = make_state_with_health(vec![("dead", healthy())]).await;
+        senders[0].send_modify(|snap| snap.process_state = ProcessState::Fatal);
+        let (status, json) = get_health(state).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["status"], "failed");
     }
 
     #[tokio::test]
