@@ -343,3 +343,72 @@ fn mcp_prompt_roundtrip() {
     assert_eq!(deserialized.description, prompt.description);
     assert!(deserialized.arguments.is_none());
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// JsonRpcResponse strict parsing (issue #24)
+// ─────────────────────────────────────────────────────────────────────────────
+
+mod response_parsing {
+    use mcp_hub::mcp::protocol::JsonRpcResponse;
+
+    fn parse(json: &str) -> Result<JsonRpcResponse, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+
+    #[test]
+    fn accepts_result_response() {
+        let resp = parse(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#).expect("valid response");
+        assert!(resp.result.is_some());
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn accepts_null_result() {
+        let resp = parse(r#"{"jsonrpc":"2.0","id":1,"result":null}"#).expect("valid response");
+        assert_eq!(resp.result, Some(serde_json::Value::Null));
+    }
+
+    #[test]
+    fn accepts_error_response() {
+        let resp = parse(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"x"}}"#)
+            .expect("valid response");
+        assert!(resp.result.is_none());
+        assert!(resp.error.is_some());
+    }
+
+    #[test]
+    fn rejects_neither_result_nor_error() {
+        assert!(parse(r#"{"jsonrpc":"2.0","id":1}"#).is_err());
+    }
+
+    #[test]
+    fn rejects_both_result_and_error() {
+        assert!(parse(r#"{"jsonrpc":"2.0","id":1,"result":{},"error":{}}"#).is_err());
+    }
+
+    #[test]
+    fn rejects_server_initiated_request() {
+        assert!(parse(r#"{"jsonrpc":"2.0","id":3,"method":"roots/list","params":{}}"#).is_err());
+    }
+
+    #[test]
+    fn rejects_notification() {
+        assert!(parse(r#"{"jsonrpc":"2.0","method":"notifications/progress"}"#).is_err());
+    }
+
+    #[test]
+    fn rejects_method_even_alongside_result() {
+        assert!(parse(r#"{"jsonrpc":"2.0","id":1,"method":"x","result":{}}"#).is_err());
+    }
+
+    #[test]
+    fn rejects_missing_and_null_id() {
+        assert!(parse(r#"{"jsonrpc":"2.0","result":{}}"#).is_err());
+        assert!(parse(r#"{"jsonrpc":"2.0","id":null,"result":{}}"#).is_err());
+    }
+
+    #[test]
+    fn accepts_string_id() {
+        assert!(parse(r#"{"jsonrpc":"2.0","id":"abc","result":{}}"#).is_ok());
+    }
+}
