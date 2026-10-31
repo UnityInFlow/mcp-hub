@@ -83,25 +83,9 @@ Superpowers skills (TDD, code review, debugging) activate automatically during e
 
 ---
 
-## CI / Self-Hosted Runners
+## CI / Runners
 
-Use UnityInFlow org-level self-hosted runners. Never use `ubuntu-latest`.
-
-```yaml
-# Default (X64)
-runs-on: [arc-runner-unityinflow]
-
-# ARM64 cross-compilation
-runs-on: [orangepi]
-
-# Matrix for both architectures
-strategy:
-  matrix:
-    runner: [arc-runner-unityinflow, orangepi]
-runs-on: ${{ matrix.runner }}
-```
-
-Available runners: `hetzner-runner-1/2/3` (X64), `orangepi-runner` (ARM64).
+CI and releases run on GitHub-hosted runners: `ubuntu-latest` (Linux) and `macos-14` / `macos-latest` (macOS). Do not use self-hosted runners.
 
 ---
 
@@ -131,7 +115,7 @@ A local MCP server process manager — PM2 for MCP servers. Single Rust binary t
 - **Serialization**: serde + serde_json for all data structures
 - **Error handling**: anyhow for binary, thiserror for library code
 - **Quality**: cargo clippy -D warnings, cargo fmt, no unwrap() in production
-- **CI**: Self-hosted runners (arc-runner-unityinflow for X64, orangepi for ARM64)
+- **CI**: GitHub-hosted runners (ubuntu-latest, macos-14 / macos-latest)
 - **Distribution**: Pre-built binaries + Homebrew tap + cargo install
 <!-- GSD:project-end -->
 

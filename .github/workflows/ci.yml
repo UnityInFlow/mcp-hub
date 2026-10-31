@@ -6,18 +6,28 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   build-and-test:
+    name: Build and test (${{ matrix.os }})
     strategy:
+      fail-fast: false
       matrix:
-        runner: [arc-runner-unityinflow, orangepi]
-    runs-on: ${{ matrix.runner }}
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
-      - run: cargo clippy -- -D warnings
+      - run: cargo clippy --all-targets -- -D warnings
       - run: cargo build
       - run: cargo test
