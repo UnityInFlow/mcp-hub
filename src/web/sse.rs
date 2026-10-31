@@ -50,11 +50,7 @@ pub async fn log_stream_handler(
                     }
                 }
 
-                let ts = crate::logs::format_system_time(line.timestamp);
-                let data = format!(
-                    "<div class=\"log-line\"><span style=\"color: #569cd6;\">[{}]</span> <span style=\"color: #808080;\">{}</span> {}</div>",
-                    line.server, ts, line.message
-                );
+                let data = render_log_line(&line);
 
                 Some(Ok(Event::default().event("log").data(data)))
             }
@@ -62,4 +58,56 @@ pub async fn log_stream_handler(
     );
 
     Sse::new(stream).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)))
+}
+
+/// Render a log line as the HTML fragment swapped into the page by HTMX.
+fn render_log_line(line: &crate::logs::LogLine) -> String {
+    let ts = crate::logs::format_system_time(line.timestamp);
+    format!(
+        "<div class=\"log-line\"><span style=\"color: #569cd6;\">[{}]</span> <span style=\"color: #808080;\">{}</span> {}</div>",
+        html_escape(&line.server),
+        ts,
+        html_escape(&line.message)
+    )
+}
+
+/// Escape the five HTML-significant characters so child-process output cannot
+/// inject markup into the operator's browser.
+fn html_escape(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::logs::LogLine;
+    use std::time::SystemTime;
+
+    #[test]
+    fn render_log_line_escapes_server_and_message() {
+        let line = LogLine {
+            server: "a<b".to_string(),
+            timestamp: SystemTime::now(),
+            message: "<script>alert(1)</script>".to_string(),
+        };
+        let html = render_log_line(&line);
+        assert!(
+            html.contains("&lt;script&gt;"),
+            "message not escaped: {html}"
+        );
+        assert!(html.contains("a&lt;b"), "server not escaped: {html}");
+        assert!(!html.contains("<script>"), "raw script tag present: {html}");
+        assert!(html.starts_with("<div class=\"log-line\">"));
+    }
 }
