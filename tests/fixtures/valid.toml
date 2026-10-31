@@ -7,5 +7,5 @@ transport = "stdio"
 [servers.mcp-filesystem]
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "/home/user"]
-cwd = "/home/user"
+cwd = "/tmp"
 max_retries = 5

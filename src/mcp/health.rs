@@ -64,7 +64,7 @@ pub async fn run_health_check_loop(
 
     let mut consecutive_misses: u32 = 0;
 
-    let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+    let mut interval = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
