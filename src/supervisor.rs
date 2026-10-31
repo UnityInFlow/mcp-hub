@@ -557,6 +557,10 @@ pub async fn start_single_server(
     let cfg = config.clone();
     let agg = Arc::clone(log_agg);
 
+    // Register the log buffer up front so `logs --server <name>` works even
+    // before the server has emitted anything (e.g. servers added via reload).
+    agg.ensure_buffer(name);
+
     let task = tokio::spawn(async move {
         run_server_supervisor(name_owned, cfg, token, cmd_rx, state_tx, agg).await;
     });
@@ -634,6 +638,8 @@ pub async fn apply_config_diff(
         .collect();
     for name in &to_remove {
         stop_named_server(handles, name).await;
+        // Drop the log buffer so repeated add/remove cycles don't leak memory.
+        log_agg.remove_server(name);
         removed += 1;
     }
 
