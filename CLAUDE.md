@@ -185,7 +185,7 @@ A local MCP server process manager — PM2 for MCP servers. Single Rust binary t
 |------|---------|------------|
 | `cargo` | Build system | High |
 | `cross` | Cross-compilation for Linux/Windows from macOS | High |
-| GitHub Actions + self-hosted runners | CI/CD | High |
+| GitHub Actions (GitHub-hosted runners) | CI/CD | High |
 | `cargo-dist` or manual | Binary releases + Homebrew formula generation | Medium |
 ## Summary: Cargo.toml Dependencies
 <!-- GSD:stack-end -->
