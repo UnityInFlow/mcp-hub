@@ -4,6 +4,7 @@
 use std::fmt;
 use std::time::{Duration, Instant};
 
+use crate::config::ServerConfig;
 use crate::mcp::protocol::{McpPrompt, McpResource, McpTool};
 
 /// The lifecycle state of a managed MCP server process.
@@ -64,6 +65,26 @@ impl Default for BackoffConfig {
             jitter_factor: 0.3,
             max_attempts: 10,
             stable_window_secs: 60,
+        }
+    }
+}
+
+impl BackoffConfig {
+    /// Build a backoff config from a server's optional overrides.
+    ///
+    /// `max_retries` maps to `max_attempts` and `restart_delay` (seconds) maps to
+    /// `base_delay_secs`; `None` keeps the default. The base delay is clamped to
+    /// `max_delay_secs` so the cap always holds.
+    pub fn from_server_config(config: &ServerConfig) -> Self {
+        let defaults = Self::default();
+        let base_delay_secs = config
+            .restart_delay
+            .map_or(defaults.base_delay_secs, |secs| secs as f64)
+            .min(defaults.max_delay_secs);
+        Self {
+            base_delay_secs,
+            max_attempts: config.max_retries.unwrap_or(defaults.max_attempts),
+            ..defaults
         }
     }
 }
@@ -209,4 +230,46 @@ pub fn format_uptime(elapsed: Duration) -> String {
     let minutes = (total_secs % 3600) / 60;
     let seconds = total_secs % 60;
     format!("{hours:02}:{minutes:02}:{seconds:02}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn server_config(max_retries: Option<u32>, restart_delay: Option<u64>) -> ServerConfig {
+        ServerConfig {
+            command: "true".to_string(),
+            args: Vec::new(),
+            env: std::collections::HashMap::new(),
+            env_file: None,
+            transport: "stdio".to_string(),
+            cwd: None,
+            health_check_interval: None,
+            max_retries,
+            restart_delay,
+        }
+    }
+
+    #[test]
+    fn backoff_from_server_config_applies_overrides() {
+        let cfg = BackoffConfig::from_server_config(&server_config(Some(3), Some(5)));
+        assert_eq!(cfg.max_attempts, 3);
+        assert!((cfg.base_delay_secs - 5.0).abs() < f64::EPSILON);
+        assert!((cfg.max_delay_secs - 60.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn backoff_from_server_config_falls_back_to_defaults() {
+        let defaults = BackoffConfig::default();
+        let cfg = BackoffConfig::from_server_config(&server_config(None, None));
+        assert_eq!(cfg.max_attempts, defaults.max_attempts);
+        assert!((cfg.base_delay_secs - defaults.base_delay_secs).abs() < f64::EPSILON);
+        assert!((cfg.max_delay_secs - defaults.max_delay_secs).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn backoff_from_server_config_never_exceeds_max_delay() {
+        let cfg = BackoffConfig::from_server_config(&server_config(None, Some(500)));
+        assert!(cfg.base_delay_secs <= cfg.max_delay_secs);
+    }
 }

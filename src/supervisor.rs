@@ -212,7 +212,7 @@ pub async fn run_server_supervisor(
     state_tx: tokio::sync::watch::Sender<ServerSnapshot>,
     log_agg: Arc<LogAggregator>,
 ) {
-    let backoff_cfg = BackoffConfig::default();
+    let backoff_cfg = BackoffConfig::from_server_config(&config);
     let mut consecutive_failures: u32 = 0;
     let mut total_restarts: u32 = 0;
 

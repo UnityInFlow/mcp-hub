@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
