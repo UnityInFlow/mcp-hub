@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use mcp_hub::mcp::dispatcher::{reader_task, send_request, IdAllocator, PendingMap, SharedStdin};
+use mcp_hub::mcp::protocol::JsonRpcId;
 use tokio::sync::Mutex;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -69,7 +70,11 @@ async fn dispatcher_send_request_returns_correct_response() {
     child.kill().await.ok();
 
     let response = response.expect("send_request should succeed");
-    assert_eq!(response.id, 7, "response id should match request id");
+    assert_eq!(
+        response.id,
+        JsonRpcId::Number(7),
+        "response id should match request id"
+    );
     assert!(response.error.is_none(), "response should not have error");
     assert!(response.result.is_some(), "response should have result");
 }
@@ -195,7 +200,10 @@ async fn dispatcher_concurrent_requests() {
     for handle in handles {
         let result = handle.await.expect("task should not panic");
         let response = result.expect("send_request should succeed");
-        responses.push(response.id);
+        match response.id {
+            JsonRpcId::Number(n) => responses.push(n),
+            JsonRpcId::String(s) => panic!("unexpected string id {s}"),
+        }
     }
 
     child.kill().await.ok();
@@ -207,6 +215,155 @@ async fn dispatcher_concurrent_requests() {
         vec![1, 2, 3, 4, 5],
         "all 5 concurrent requests should resolve with correct IDs"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Strict response routing (issue #24)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Spawn `bash -c <script>` and wire up the dispatcher around it.
+#[cfg(unix)]
+async fn spawn_script_dispatcher(
+    script: &'static str,
+) -> (tokio::process::Child, SharedStdin, PendingMap) {
+    let mut child = tokio::process::Command::new("bash")
+        .arg("-c")
+        .arg(script)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("bash should be available");
+
+    let stdin = child.stdin.take().expect("stdin piped");
+    let stdout = child.stdout.take().expect("stdout piped");
+
+    let stdin_shared: SharedStdin = Arc::new(Mutex::new(stdin));
+    let pending = make_pending();
+
+    let pending_clone = Arc::clone(&pending);
+    tokio::spawn(async move {
+        reader_task(stdout, pending_clone).await;
+    });
+
+    (child, stdin_shared, pending)
+}
+
+/// For each request, first emits a server-initiated `roots/list` request that
+/// reuses the request's id, then the real response.
+#[cfg(unix)]
+const COLLIDING_SERVER_REQUEST_SCRIPT: &str = r#"
+while IFS= read -r line; do
+    id=$(echo "$line" | sed 's/.*"id":\([0-9]*\).*/\1/')
+    echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"method\":\"roots/list\",\"params\":{}}"
+    echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"real\":true}}"
+done
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn server_initiated_request_with_colliding_id_is_not_routed_as_response() {
+    use mcp_hub::mcp::protocol::PingRequest;
+
+    let (mut child, stdin_shared, pending) =
+        spawn_script_dispatcher(COLLIDING_SERVER_REQUEST_SCRIPT).await;
+
+    let request = PingRequest::new(3);
+    let response = send_request(&stdin_shared, &pending, 3, &request, 5).await;
+
+    child.kill().await.ok();
+
+    let response = response.expect("send_request should succeed");
+    assert!(response.error.is_none(), "response should not have error");
+    assert_eq!(
+        response.result,
+        Some(serde_json::json!({"real": true})),
+        "caller must receive the real result, not the server-initiated request"
+    );
+}
+
+/// Reads two requests, then answers them in reverse order.
+#[cfg(unix)]
+const OUT_OF_ORDER_SCRIPT: &str = r#"
+IFS= read -r first
+IFS= read -r second
+id1=$(echo "$first" | sed 's/.*"id":\([0-9]*\).*/\1/')
+id2=$(echo "$second" | sed 's/.*"id":\([0-9]*\).*/\1/')
+echo "{\"jsonrpc\":\"2.0\",\"id\":$id2,\"result\":{\"for\":$id2}}"
+echo "{\"jsonrpc\":\"2.0\",\"id\":$id1,\"result\":{\"for\":$id1}}"
+cat > /dev/null
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn out_of_order_responses_are_routed_by_id() {
+    use mcp_hub::mcp::protocol::PingRequest;
+
+    let (mut child, stdin_shared, pending) = spawn_script_dispatcher(OUT_OF_ORDER_SCRIPT).await;
+
+    let mut handles = Vec::new();
+    for id in 1u64..=2 {
+        let stdin_clone = Arc::clone(&stdin_shared);
+        let pending_clone = Arc::clone(&pending);
+        handles.push(tokio::spawn(async move {
+            let request = PingRequest::new(id);
+            send_request(&stdin_clone, &pending_clone, id, &request, 5).await
+        }));
+        // Make sure request 1 reaches the server before request 2.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    for (index, handle) in handles.into_iter().enumerate() {
+        let expected = index as u64 + 1;
+        let response = handle
+            .await
+            .expect("task should not panic")
+            .expect("send_request should succeed");
+        assert_eq!(
+            response.result,
+            Some(serde_json::json!({ "for": expected })),
+            "request {expected} must receive its own response"
+        );
+    }
+
+    child.kill().await.ok();
+}
+
+/// For each request emits noise (non-JSON, unmatched string id, null id) before
+/// the real response.
+#[cfg(unix)]
+const NOISY_SERVER_SCRIPT: &str = r#"
+while IFS= read -r line; do
+    id=$(echo "$line" | sed 's/.*"id":\([0-9]*\).*/\1/')
+    echo "this is not json at all"
+    echo "{\"jsonrpc\":\"2.0\",\"id\":\"abc\",\"result\":{\"stray\":true}}"
+    echo "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":\"parse\"}}"
+    echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"real\":$id}}"
+done
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn non_json_and_unmatched_string_id_lines_do_not_stop_the_reader() {
+    use mcp_hub::mcp::protocol::PingRequest;
+
+    let (mut child, stdin_shared, pending) = spawn_script_dispatcher(NOISY_SERVER_SCRIPT).await;
+
+    // Two sequential requests: the second only succeeds if the reader survived
+    // the noise emitted while handling the first.
+    for id in [1u64, 2] {
+        let request = PingRequest::new(id);
+        let response = send_request(&stdin_shared, &pending, id, &request, 5)
+            .await
+            .expect("send_request should succeed despite noisy output");
+        assert_eq!(
+            response.result,
+            Some(serde_json::json!({ "real": id })),
+            "request {id} must receive the real response"
+        );
+    }
+
+    child.kill().await.ok();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

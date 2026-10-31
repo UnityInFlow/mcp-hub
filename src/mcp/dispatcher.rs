@@ -15,7 +15,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::{oneshot, Mutex};
 
-use crate::mcp::protocol::JsonRpcResponse;
+use crate::mcp::protocol::{JsonRpcId, JsonRpcResponse};
 
 /// Map of pending request IDs to their oneshot response senders.
 ///
@@ -65,12 +65,33 @@ impl Default for IdAllocator {
 // Reader task
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Deliver a validated response to the waiter registered under its id.
+///
+/// The hub only sends numeric ids, so a string id can never match a waiter.
+async fn route_response(pending: &PendingMap, response: JsonRpcResponse) {
+    match response.id {
+        JsonRpcId::Number(id) => {
+            let mut map = pending.lock().await;
+            if let Some(sender) = map.remove(&id) {
+                // Ignore send errors — the waiter may have timed out and moved on.
+                let _ = sender.send(response);
+            } else {
+                tracing::debug!(id, "Received response with no pending waiter");
+            }
+        }
+        JsonRpcId::String(ref id) => {
+            tracing::debug!(id = %id, "Received response with string id (hub only sends numeric ids)");
+        }
+    }
+}
+
 /// Long-running task that owns `stdout` and routes JSON-RPC responses by ID.
 ///
 /// - Each line parsed as a valid `JsonRpcResponse` is matched against `pending`
 ///   by `id`. The corresponding oneshot sender is removed from the map and fired.
-/// - Lines that fail to parse (notifications, log output, etc.) are discarded
-///   via `tracing::debug!` to prevent pipe-buffer backpressure.
+/// - Lines that are not strict responses (notifications, server-initiated requests
+///   carrying a `method`, log output, etc.) are discarded via `tracing::debug!`.
+///   Server-initiated requests are not answered: the reader has no stdin handle.
 /// - When stdout closes (process exited), all remaining pending senders are
 ///   drained (dropped) so their receivers get `RecvError` instead of hanging.
 ///
@@ -82,18 +103,12 @@ pub async fn reader_task(stdout: ChildStdout, pending: PendingMap) {
 
     while let Ok(Some(line)) = lines.next_line().await {
         match serde_json::from_str::<JsonRpcResponse>(&line) {
-            Ok(response) => {
-                let mut map = pending.lock().await;
-                if let Some(sender) = map.remove(&response.id) {
-                    // Ignore send errors — the waiter may have timed out and moved on.
-                    let _ = sender.send(response);
-                } else {
-                    tracing::debug!(id = response.id, "Received response with no pending waiter");
-                }
-            }
-            Err(_) => {
-                // Non-JSON-RPC line (notification, server log, etc.) — discard.
-                tracing::debug!("Non-JSON-RPC stdout line (discarded)");
+            Ok(response) => route_response(&pending, response).await,
+            Err(err) => {
+                // Not a valid response: log output, a notification, or a
+                // server-initiated request (e.g. `roots/list`). None of these
+                // may be routed to a pending waiter, even if the id collides.
+                tracing::debug!("Non-response stdout line (discarded): {err}");
             }
         }
     }
