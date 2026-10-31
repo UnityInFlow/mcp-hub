@@ -5,6 +5,7 @@ use std::sync::Arc;
 use askama::Template;
 use askama_web::WebTemplate;
 use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::Serialize;
@@ -221,7 +222,7 @@ pub struct LogsPage {
 
 /// GET / -- Status tab with server card grid (WEB-02).
 pub async fn status_page(State(state): State<Arc<WebState>>) -> impl IntoResponse {
-    let handles = state.handles.lock().await;
+    let handles = state.servers.read().await;
     let servers: Vec<ServerCardData> = handles
         .iter()
         .map(|h| {
@@ -246,7 +247,7 @@ pub async fn status_page(State(state): State<Arc<WebState>>) -> impl IntoRespons
 
 /// GET /partials/status -- HTMX polling fragment for auto-refresh every 3s (D-06).
 pub async fn status_partial(State(state): State<Arc<WebState>>) -> impl IntoResponse {
-    let handles = state.handles.lock().await;
+    let handles = state.servers.read().await;
     let servers: Vec<ServerCardData> = handles
         .iter()
         .map(|h| {
@@ -260,7 +261,7 @@ pub async fn status_partial(State(state): State<Arc<WebState>>) -> impl IntoResp
 
 /// GET /tools -- Tools accordion page (WEB-03, D-08).
 pub async fn tools_page(State(state): State<Arc<WebState>>) -> impl IntoResponse {
-    let handles = state.handles.lock().await;
+    let handles = state.servers.read().await;
     let servers: Vec<ServerToolsData> = handles
         .iter()
         .map(|h| {
@@ -290,7 +291,7 @@ pub async fn tool_detail_partial(
     Path(server_name): Path<String>,
     State(state): State<Arc<WebState>>,
 ) -> impl IntoResponse {
-    let handles = state.handles.lock().await;
+    let handles = state.servers.read().await;
     let handle = handles.iter().find(|h| h.name == server_name);
 
     match handle {
@@ -343,7 +344,7 @@ pub async fn logs_page(
     State(state): State<Arc<WebState>>,
     Query(params): Query<super::sse::LogParams>,
 ) -> impl IntoResponse {
-    let handles = state.handles.lock().await;
+    let handles = state.servers.read().await;
     let servers: Vec<ServerFilterPill> = handles
         .iter()
         .map(|h| ServerFilterPill {
@@ -367,16 +368,32 @@ pub async fn logs_page(
 
 /// GET /health -- JSON health endpoint for monitoring / load balancers (WEB-05, D-13).
 ///
-/// Uses non-blocking `state_rx.borrow()` -- O(1) per server, responds in microseconds.
+/// Reads `state_rx.borrow()` from the web layer's own server views, never the
+/// supervisor `handles` mutex, so it keeps answering while a config reload is
+/// stopping servers.
+///
+/// Overall status: `failed` if any server is `HealthStatus::Failed` (HTTP 503),
+/// `healthy` if there are no servers or all are `Healthy`, otherwise `degraded`
+/// (HTTP 200: the hub still serves, only a failed server should page).
 pub async fn health_handler(State(state): State<Arc<WebState>>) -> impl IntoResponse {
-    let handles = state.handles.lock().await;
+    let views = state.servers.read().await;
 
-    let servers: Vec<ServerHealthEntry> = handles
+    let mut any_failed = false;
+    let mut all_healthy = true;
+    let servers: Vec<ServerHealthEntry> = views
         .iter()
-        .map(|h| {
-            let snap = h.state_rx.borrow().clone();
+        .map(|v| {
+            let snap = v.state_rx.borrow().clone();
+            match snap.health {
+                HealthStatus::Failed { .. } => {
+                    any_failed = true;
+                    all_healthy = false;
+                }
+                HealthStatus::Healthy { .. } => {}
+                HealthStatus::Degraded { .. } | HealthStatus::Unknown => all_healthy = false,
+            }
             ServerHealthEntry {
-                name: h.name.clone(),
+                name: v.name.clone(),
                 process_state: snap.process_state.to_string(),
                 health: snap.health.to_string(),
                 pid: snap.pid,
@@ -384,21 +401,23 @@ pub async fn health_handler(State(state): State<Arc<WebState>>) -> impl IntoResp
             }
         })
         .collect();
+    drop(views);
 
-    let overall_status = if servers.is_empty() {
-        "healthy"
-    } else if servers.iter().any(|s| s.health.starts_with("failed")) {
-        "failed"
-    } else if servers.iter().all(|s| s.health == "healthy") {
-        "healthy"
+    let (code, overall_status) = if any_failed {
+        (StatusCode::SERVICE_UNAVAILABLE, "failed")
+    } else if all_healthy {
+        (StatusCode::OK, "healthy")
     } else {
-        "degraded"
+        (StatusCode::OK, "degraded")
     };
 
-    Json(HealthResponse {
-        status: overall_status.to_string(),
-        servers,
-    })
+    (
+        code,
+        Json(HealthResponse {
+            status: overall_status.to_string(),
+            servers,
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -413,8 +432,8 @@ mod tests {
             &["test-server".to_string()],
             100,
         ));
-        let handles = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-        Arc::new(super::super::WebState { handles, log_agg })
+        let servers = super::super::new_server_views(&[]);
+        Arc::new(super::super::WebState { servers, log_agg })
     }
 
     #[tokio::test]
@@ -522,11 +541,54 @@ mod tests {
         assert!(json.get("servers").is_some());
     }
 
-    #[tokio::test]
-    async fn health_responds_under_100ms() {
-        let state = make_test_state().await;
+    // ── /health status mapping and lock independence (issue #27) ────────────
+
+    /// Supervisor-side handle list, as shared by the daemon and control socket.
+    type SupervisorHandles = Arc<tokio::sync::Mutex<Vec<crate::supervisor::ServerHandle>>>;
+
+    /// Build a web state with one server per `(name, health)` pair, plus the
+    /// supervisor handle mutex it was derived from. The senders must stay alive
+    /// for the duration of the test.
+    async fn make_state_with_health(
+        servers: Vec<(&str, HealthStatus)>,
+    ) -> (
+        Arc<super::super::WebState>,
+        SupervisorHandles,
+        Vec<tokio::sync::watch::Sender<crate::types::ServerSnapshot>>,
+    ) {
+        let names: Vec<String> = servers.iter().map(|(n, _)| (*n).to_string()).collect();
+        let log_agg = Arc::new(crate::logs::LogAggregator::new(&names, 100));
+        let mut handles = Vec::new();
+        let mut senders = Vec::new();
+        for (name, health) in servers {
+            let snapshot = crate::types::ServerSnapshot {
+                health,
+                ..crate::types::ServerSnapshot::default()
+            };
+            let (state_tx, state_rx) = tokio::sync::watch::channel(snapshot);
+            let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::channel(1);
+            handles.push(crate::supervisor::ServerHandle {
+                name: name.to_string(),
+                state_rx,
+                cmd_tx,
+                task: tokio::spawn(async {}),
+            });
+            senders.push(state_tx);
+        }
+        let views = super::super::new_server_views(&handles);
+        let handles = Arc::new(tokio::sync::Mutex::new(handles));
+        (
+            Arc::new(super::super::WebState {
+                servers: views,
+                log_agg,
+            }),
+            handles,
+            senders,
+        )
+    }
+
+    async fn get_health(state: Arc<super::super::WebState>) -> (StatusCode, serde_json::Value) {
         let app = super::super::build_router(state);
-        let start = std::time::Instant::now();
         let resp = app
             .oneshot(
                 Request::builder()
@@ -536,9 +598,123 @@ mod tests {
             )
             .await
             .unwrap();
-        let elapsed = start.elapsed();
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert!(elapsed.as_millis() < 100);
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    fn healthy() -> HealthStatus {
+        HealthStatus::Healthy {
+            latency_ms: 3,
+            last_checked: std::time::Instant::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn health_failed_server_returns_503() {
+        let (state, _handles, _tx) = make_state_with_health(vec![
+            ("ok", healthy()),
+            (
+                "bad",
+                HealthStatus::Failed {
+                    consecutive_misses: 7,
+                },
+            ),
+        ])
+        .await;
+        let (status, json) = get_health(state).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["status"], "failed");
+        assert_eq!(json["servers"].as_array().map(Vec::len), Some(2));
+    }
+
+    #[tokio::test]
+    async fn health_healthy_server_returns_200() {
+        let (state, _handles, _tx) = make_state_with_health(vec![("ok", healthy())]).await;
+        let (status, json) = get_health(state).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["status"], "healthy");
+    }
+
+    #[tokio::test]
+    async fn health_degraded_server_returns_200() {
+        // Degraded stays 200: the hub is still serving, monitors should only
+        // page on a failed server.
+        let (state, _handles, _tx) = make_state_with_health(vec![
+            ("ok", healthy()),
+            (
+                "slow",
+                HealthStatus::Degraded {
+                    consecutive_misses: 3,
+                    last_success: None,
+                },
+            ),
+        ])
+        .await;
+        let (status, json) = get_health(state).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["status"], "degraded");
+    }
+
+    #[tokio::test]
+    async fn health_unknown_server_is_degraded_not_failed() {
+        let (state, _handles, _tx) =
+            make_state_with_health(vec![("new", HealthStatus::Unknown)]).await;
+        let (status, json) = get_health(state).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["status"], "degraded");
+    }
+
+    #[tokio::test]
+    async fn health_answers_while_handles_lock_is_held() {
+        let (state, handles, _tx) = make_state_with_health(vec![("ok", healthy())]).await;
+
+        // Simulate handle_reload holding the supervisor lock across a slow
+        // apply_config_diff.
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let holder = tokio::spawn(async move {
+            let _guard = handles.lock().await;
+            let _ = locked_tx.send(());
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        });
+        locked_rx.await.unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            get_health(Arc::clone(&state)),
+        )
+        .await;
+        let (status, json) = result.expect("/health must not wait for the handles lock");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["status"], "healthy");
+        holder.abort();
+    }
+
+    #[tokio::test]
+    async fn health_reflects_published_views_after_reload() {
+        let (state, handles, _tx) = make_state_with_health(vec![(
+            "bad",
+            HealthStatus::Failed {
+                consecutive_misses: 9,
+            },
+        )])
+        .await;
+        let (status, _) = get_health(Arc::clone(&state)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+        // A reload removes the failed server and republishes the views.
+        let mut guard = handles.lock().await;
+        let removed = guard.pop();
+        crate::web::publish_server_views(&state.servers, &guard).await;
+        drop(guard);
+        drop(removed);
+
+        let (status, json) = get_health(state).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["status"], "healthy");
+        assert_eq!(json["servers"].as_array().map(Vec::len), Some(0));
     }
 
     #[tokio::test]
