@@ -28,14 +28,28 @@ mod daemon_tests {
         writeln!(
             f,
             r#"
+[hub]
+web_port = {}
+
 [servers.test-server]
 command = "sleep"
 args = ["9999"]
 transport = "stdio"
-"#
+"#,
+            free_port()
         )
         .expect("write config");
         f
+    }
+
+    /// Pick a free TCP port so parallel test daemons never fight over the
+    /// default web UI port (a bind failure is fatal for `start --daemon`).
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind ephemeral port")
+            .local_addr()
+            .expect("local addr")
+            .port()
     }
 
     /// Read the PID from a PID file. Returns None if the file does not exist or
@@ -353,5 +367,365 @@ transport = "stdio"
             second_sock_appeared,
             "New daemon socket should be connectable after stale socket cleanup"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // #18: startup errors must surface in the parent, before/while daemonizing
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Assert that no PID or socket file was left behind by a failed start.
+    fn assert_no_daemon_files(paths: &TestDaemonPaths) {
+        assert!(!paths.pid.exists(), "stale PID file left behind");
+        assert!(!paths.sock.exists(), "stale socket file left behind");
+    }
+
+    #[test]
+    fn start_daemon_missing_config_fails_cleanly() {
+        let paths = TestDaemonPaths::new();
+
+        let output = mcp_hub()
+            .args(["start", "--daemon", "-c", "/nonexistent/mcp-hub.toml"])
+            .envs(paths.env_overrides())
+            .output()
+            .expect("run mcp-hub");
+
+        assert!(
+            !output.status.success(),
+            "start --daemon with a missing config must exit non-zero"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("Failed to load config") && stderr.contains("nonexistent"),
+            "stderr should mention the config error, got: {stderr}"
+        );
+        assert_no_daemon_files(&paths);
+    }
+
+    #[test]
+    fn start_daemon_zero_servers_fails_cleanly() {
+        let paths = TestDaemonPaths::new();
+        let cfg_dir = TempDir::new().expect("cfg tempdir");
+        let mut f = NamedTempFile::new_in(cfg_dir.path()).expect("tempfile");
+        writeln!(f, "[hub]\nweb_port = {}", free_port()).expect("write config");
+
+        let output = mcp_hub()
+            .args(["start", "--daemon", "-c", f.path().to_str().unwrap()])
+            .envs(paths.env_overrides())
+            .output()
+            .expect("run mcp-hub");
+
+        assert!(
+            !output.status.success(),
+            "start --daemon with zero servers must exit non-zero"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("No servers defined"),
+            "stderr should mention the empty server list, got: {stderr}"
+        );
+        assert_no_daemon_files(&paths);
+    }
+
+    #[test]
+    fn start_daemon_web_port_in_use_fails_cleanly() {
+        let paths = TestDaemonPaths::new();
+        let cfg_dir = TempDir::new().expect("cfg tempdir");
+
+        // Occupy a port so the daemon's web UI bind fails after the fork.
+        let blocker = std::net::TcpListener::bind("127.0.0.1:0").expect("bind blocker");
+        let port = blocker.local_addr().expect("local addr").port();
+
+        let mut f = NamedTempFile::new_in(cfg_dir.path()).expect("tempfile");
+        writeln!(
+            f,
+            "[hub]\nweb_port = {port}\n\n[servers.s]\ncommand = \"sleep\"\nargs = [\"9999\"]"
+        )
+        .expect("write config");
+
+        let output = mcp_hub()
+            .args(["start", "--daemon", "-c", f.path().to_str().unwrap()])
+            .envs(paths.env_overrides())
+            .output()
+            .expect("run mcp-hub");
+
+        assert!(
+            !output.status.success(),
+            "start --daemon must exit non-zero when the web port is taken"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("Failed to bind web UI"),
+            "stderr should relay the daemon's bind error, got: {stderr}"
+        );
+        // The daemon removes its PID file and socket on its way out.
+        assert!(
+            wait_for(
+                || !paths.pid.exists() && !paths.sock.exists(),
+                Duration::from_secs(5)
+            ),
+            "PID/socket files should be cleaned up after a failed start"
+        );
+        drop(blocker);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // #19: the daemon logs to a file instead of /dev/null
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Config with one server that prints a line on stderr and then idles.
+    fn write_chatty_config(dir: &TempDir) -> NamedTempFile {
+        let mut f = NamedTempFile::new_in(dir.path()).expect("tempfile");
+        writeln!(
+            f,
+            r#"
+[hub]
+web_port = {}
+
+[servers.chatty]
+command = "bash"
+args = ["-c", "echo child-stderr-line >&2; sleep 9999"]
+transport = "stdio"
+"#,
+            free_port()
+        )
+        .expect("write config");
+        f
+    }
+
+    /// Poll until `path` contains `needle` (the daemon logs asynchronously).
+    fn log_contains(path: &PathBuf, needle: &str) -> bool {
+        wait_for(
+            || {
+                std::fs::read_to_string(path)
+                    .map(|s| s.contains(needle))
+                    .unwrap_or(false)
+            },
+            Duration::from_secs(5),
+        )
+    }
+
+    #[test]
+    fn daemon_logs_to_file_from_env() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let paths = TestDaemonPaths::new();
+        let cfg_dir = TempDir::new().expect("cfg tempdir");
+        let config = write_chatty_config(&cfg_dir);
+        let log = paths.sock.parent().expect("parent").join("custom.log");
+
+        let start = mcp_hub()
+            .args(["start", "--daemon", "-c", config.path().to_str().unwrap()])
+            .envs(paths.env_overrides())
+            .env("MCP_HUB_LOG_FILE", &log)
+            .output()
+            .expect("start daemon");
+        let status = mcp_hub()
+            .arg("status")
+            .envs(paths.env_overrides())
+            .output()
+            .expect("status");
+        let found_listening = log_contains(&log, "Control socket listening");
+        let found_child = log_contains(&log, "child-stderr-line");
+        let mode = std::fs::metadata(&log).map(|m| m.permissions().mode() & 0o777);
+
+        let _ = mcp_hub().arg("stop").envs(paths.env_overrides()).output();
+
+        assert!(
+            start.status.success(),
+            "start --daemon should exit 0; stderr: {}",
+            String::from_utf8_lossy(&start.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&start.stdout);
+        assert!(
+            stdout.contains("Daemon started (pid") && stdout.contains(log.to_str().unwrap()),
+            "start should print pid and log path, got: {stdout}"
+        );
+
+        assert!(status.status.success(), "status should work");
+        assert!(
+            found_listening,
+            "log should contain the control socket line"
+        );
+        assert!(found_child, "log should contain the child's stderr line");
+        assert_eq!(mode.expect("log file exists"), 0o600, "log must be 0600");
+    }
+
+    #[test]
+    fn daemon_log_defaults_next_to_socket_and_flag_beats_env() {
+        // Default: <socket dir>/daemon.log.
+        let paths = TestDaemonPaths::new();
+        let cfg_dir = TempDir::new().expect("cfg tempdir");
+        let config = write_chatty_config(&cfg_dir);
+        let default_log = paths.sock.parent().expect("parent").join("daemon.log");
+
+        let start = mcp_hub()
+            .args(["start", "--daemon", "-c", config.path().to_str().unwrap()])
+            .envs(paths.env_overrides())
+            .output()
+            .expect("start daemon");
+        let default_ok = start.status.success() && log_contains(&default_log, "Control socket");
+        let _ = mcp_hub().arg("stop").envs(paths.env_overrides()).output();
+        assert!(default_ok, "default log should be <socket dir>/daemon.log");
+        wait_for(|| !paths.sock.exists(), Duration::from_secs(8));
+
+        // --log-file wins over MCP_HUB_LOG_FILE.
+        let flag_log = paths.sock.parent().expect("parent").join("flag.log");
+        let env_log = paths.sock.parent().expect("parent").join("env.log");
+        let start = mcp_hub()
+            .args([
+                "start",
+                "--daemon",
+                "-c",
+                config.path().to_str().unwrap(),
+                "--log-file",
+                flag_log.to_str().unwrap(),
+            ])
+            .envs(paths.env_overrides())
+            .env("MCP_HUB_LOG_FILE", &env_log)
+            .output()
+            .expect("start daemon with flag");
+        let flag_ok = start.status.success() && log_contains(&flag_log, "Control socket");
+        let _ = mcp_hub().arg("stop").envs(paths.env_overrides()).output();
+        assert!(flag_ok, "--log-file should be used");
+        assert!(
+            !env_log.exists(),
+            "env log must be ignored when flag is set"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // #20: `reload` returns the real outcome
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Config text with the given server names (each a `sleep` server) on `port`.
+    fn config_text(port: u16, servers: &[&str]) -> String {
+        let mut text = format!("[hub]\nweb_port = {port}\n");
+        for name in servers {
+            text.push_str(&format!(
+                "\n[servers.{name}]\ncommand = \"sleep\"\nargs = [\"9999\"]\ntransport = \"stdio\"\n"
+            ));
+        }
+        text
+    }
+
+    #[test]
+    fn reload_reports_parse_error_then_summary() {
+        let paths = TestDaemonPaths::new();
+        let cfg_dir = TempDir::new().expect("cfg tempdir");
+        let cfg_path = cfg_dir.path().join("hub.toml");
+        let port = free_port();
+        std::fs::write(&cfg_path, config_text(port, &["alpha"])).expect("write config A");
+
+        let start = mcp_hub()
+            .args(["start", "--daemon", "-c", cfg_path.to_str().unwrap()])
+            .envs(paths.env_overrides())
+            .output()
+            .expect("start daemon");
+        assert!(
+            start.status.success(),
+            "start failed: {}",
+            String::from_utf8_lossy(&start.stderr)
+        );
+
+        // 1. Invalid TOML: reload must fail loudly and leave alpha running.
+        std::fs::write(&cfg_path, "this is = [not valid toml").expect("write bad config");
+        let bad = mcp_hub()
+            .arg("reload")
+            .envs(paths.env_overrides())
+            .output()
+            .expect("reload (bad config)");
+        let status_after_bad = mcp_hub()
+            .arg("status")
+            .envs(paths.env_overrides())
+            .output()
+            .expect("status after bad reload");
+
+        // 2. Valid config adding beta: reload succeeds with a summary.
+        std::fs::write(&cfg_path, config_text(port, &["alpha", "beta"])).expect("write config B");
+        let good = mcp_hub()
+            .arg("reload")
+            .envs(paths.env_overrides())
+            .output()
+            .expect("reload (good config)");
+        let status_after_good = mcp_hub()
+            .arg("status")
+            .envs(paths.env_overrides())
+            .output()
+            .expect("status after good reload");
+
+        let _ = mcp_hub().arg("stop").envs(paths.env_overrides()).output();
+
+        let bad_stderr = String::from_utf8_lossy(&bad.stderr);
+        let bad_stdout = String::from_utf8_lossy(&bad.stdout);
+        assert!(
+            !bad.status.success(),
+            "reload of an invalid config must exit non-zero; stdout: {bad_stdout}"
+        );
+        assert!(
+            bad_stderr.contains("Invalid TOML"),
+            "stderr should carry the parse error, got: {bad_stderr}"
+        );
+        assert!(
+            !bad_stdout.contains("Reload signal sent"),
+            "must not claim success, got: {bad_stdout}"
+        );
+        let status_bad = String::from_utf8_lossy(&status_after_bad.stdout);
+        assert!(
+            status_bad.contains("alpha") && status_bad.to_lowercase().contains("running"),
+            "alpha should still be running after a failed reload, got: {status_bad}"
+        );
+
+        let good_stdout = String::from_utf8_lossy(&good.stdout);
+        assert!(
+            good.status.success(),
+            "reload of a valid config must exit 0; stderr: {}",
+            String::from_utf8_lossy(&good.stderr)
+        );
+        assert!(
+            good_stdout.contains("1 added") && good_stdout.contains("0 removed"),
+            "summary should report 1 added / 0 removed, got: {good_stdout}"
+        );
+        let status_good = String::from_utf8_lossy(&status_after_good.stdout);
+        assert!(
+            status_good.contains("alpha") && status_good.contains("beta"),
+            "status should list both servers after reload, got: {status_good}"
+        );
+    }
+
+    #[test]
+    fn sighup_still_reloads_config() {
+        let paths = TestDaemonPaths::new();
+        let cfg_dir = TempDir::new().expect("cfg tempdir");
+        let cfg_path = cfg_dir.path().join("hub.toml");
+        let port = free_port();
+        std::fs::write(&cfg_path, config_text(port, &["alpha"])).expect("write config A");
+
+        let start = mcp_hub()
+            .args(["start", "--daemon", "-c", cfg_path.to_str().unwrap()])
+            .envs(paths.env_overrides())
+            .output()
+            .expect("start daemon");
+        assert!(start.status.success(), "start failed");
+
+        std::fs::write(&cfg_path, config_text(port, &["alpha", "gamma"])).expect("write config B");
+        let pid = read_pid(&paths.pid).expect("pid file");
+        let _ = std::process::Command::new("kill")
+            .args(["-HUP", &pid.to_string()])
+            .output();
+
+        let saw_gamma = wait_for(
+            || {
+                mcp_hub()
+                    .arg("status")
+                    .envs(paths.env_overrides())
+                    .output()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).contains("gamma"))
+                    .unwrap_or(false)
+            },
+            Duration::from_secs(5),
+        );
+
+        let _ = mcp_hub().arg("stop").envs(paths.env_overrides()).output();
+        assert!(saw_gamma, "SIGHUP should still apply the new config");
     }
 }

@@ -87,13 +87,20 @@ pub fn spawn_server(
                 while let Some(line) = next_stderr_line(&mut reader, &server_name).await {
                     // Push to the ring buffer and broadcast.
                     agg.push(&server_name, line.clone()).await;
-                    // Also format and print to terminal stderr.
+                    // Also format and print to stderr (the log file in daemon mode).
                     let log_line = crate::logs::LogLine {
                         server: server_name.clone(),
                         timestamp: std::time::SystemTime::now(),
                         message: line,
                     };
-                    eprintln!("{}", crate::logs::format_log_line(&log_line, false));
+                    // `eprintln!` panics if stderr is closed, which would kill this
+                    // drain and block the child on a full pipe; ignore write errors.
+                    use std::io::Write as _;
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "{}",
+                        crate::logs::format_log_line(&log_line, false)
+                    );
                 }
             });
         } else {
@@ -651,21 +658,6 @@ pub async fn start_all_servers(
     handles
 }
 
-/// Stop a named server, remove it from `handles`, and await its task.
-///
-/// Used by `apply_config_diff` to stop servers that were removed from or changed
-/// in the config file.
-pub async fn stop_named_server(handles: &mut Vec<ServerHandle>, name: &str) {
-    if let Some(pos) = handles.iter().position(|h| h.name == name) {
-        let handle = handles.remove(pos);
-        let _ = handle.cmd_tx.send(SupervisorCommand::Shutdown).await;
-        if let Err(e) = handle.task.await {
-            tracing::warn!(server = %name, "Supervisor task panicked during stop: {e:?}");
-        }
-        tracing::info!(server = %name, "Server stopped (config removed/changed)");
-    }
-}
-
 /// Diff `old_config` against `new_config` and apply the minimum set of changes
 /// to `handles`:
 ///
@@ -674,66 +666,88 @@ pub async fn stop_named_server(handles: &mut Vec<ServerHandle>, name: &str) {
 /// - **Changed servers** (in both, config differs): stopped then re-started.
 /// - **Unchanged servers** (in both, config identical): left running.
 ///
-/// Returns `(added, removed, changed)` counts for logging.
+/// The `handles` mutex is only held for the instant it takes to detach the
+/// stale handles and, later, to append the fresh ones — never while awaiting a
+/// server's shutdown (up to 5 s each). `status`, `/health` and the web UI stay
+/// responsive during a reload; a server being replaced is simply absent from
+/// the list until its replacement has been started.
+///
+/// Callers must serialise reloads themselves (the daemon holds its
+/// `current_config` lock for the whole reload).
+///
+/// Returns `(added, removed, changed)` counts.
 pub async fn apply_config_diff(
-    handles: &mut Vec<ServerHandle>,
+    handles: &tokio::sync::Mutex<Vec<ServerHandle>>,
     old_config: &HubConfig,
     new_config: &HubConfig,
     shutdown: &CancellationToken,
     log_agg: &Arc<LogAggregator>,
 ) -> (usize, usize, usize) {
-    use std::collections::HashSet;
-
-    let old_names: HashSet<&String> = old_config.servers.keys().collect();
-    let new_names: HashSet<&String> = new_config.servers.keys().collect();
-
-    let mut added = 0usize;
-    let mut removed = 0usize;
-    let mut changed = 0usize;
-
-    // Removed servers: in old but not in new.
-    let to_remove: Vec<String> = old_names
-        .difference(&new_names)
-        .map(|s| (*s).clone())
+    // Sorted so reloads behave (and log) deterministically.
+    let mut to_remove: Vec<String> = old_config
+        .servers
+        .keys()
+        .filter(|name| !new_config.servers.contains_key(*name))
+        .cloned()
         .collect();
-    for name in &to_remove {
-        stop_named_server(handles, name).await;
-        // Drop the log buffer so repeated add/remove cycles don't leak memory.
-        log_agg.remove_server(name);
-        removed += 1;
-    }
-
-    // New servers: in new but not in old.
-    let to_add: Vec<String> = new_names
-        .difference(&old_names)
-        .map(|s| (*s).clone())
+    let mut to_add: Vec<String> = new_config
+        .servers
+        .keys()
+        .filter(|name| !old_config.servers.contains_key(*name))
+        .cloned()
         .collect();
-    for name in &to_add {
-        let cfg = &new_config.servers[name];
-        let handle = start_single_server(name, cfg, shutdown, log_agg).await;
-        handles.push(handle);
-        added += 1;
-    }
-
-    // Existing servers: check if config changed.
-    let to_check: Vec<String> = old_names
-        .intersection(&new_names)
-        .map(|s| (*s).clone())
+    let mut to_change: Vec<String> = new_config
+        .servers
+        .iter()
+        .filter(|(name, new_cfg)| {
+            old_config
+                .servers
+                .get(*name)
+                .is_some_and(|old_cfg| old_cfg != *new_cfg)
+        })
+        .map(|(name, _)| name.clone())
         .collect();
-    for name in &to_check {
-        let old_cfg = &old_config.servers[name];
-        let new_cfg = &new_config.servers[name];
-        if old_cfg != new_cfg {
-            // Changed — stop old instance, start new one.
-            stop_named_server(handles, name).await;
-            let handle = start_single_server(name, new_cfg, shutdown, log_agg).await;
-            handles.push(handle);
-            changed += 1;
+    to_remove.sort();
+    to_add.sort();
+    to_change.sort();
+
+    // Short lock: detach everything that must stop.
+    let stale = {
+        let mut guard = handles.lock().await;
+        let mut stale = Vec::with_capacity(to_remove.len() + to_change.len());
+        for name in to_remove.iter().chain(to_change.iter()) {
+            if let Some(pos) = guard.iter().position(|h| &h.name == name) {
+                stale.push(guard.remove(pos));
+            }
         }
-        // If equal: skip entirely — no restart needed.
+        stale
+    };
+
+    // No lock: stop them in parallel (SIGTERM → up to 5 s → SIGKILL each).
+    if !stale.is_empty() {
+        for name in to_remove.iter().chain(to_change.iter()) {
+            tracing::info!(server = %name, "Stopping server (config removed/changed)");
+        }
+        stop_all_servers(stale).await;
     }
 
-    (added, removed, changed)
+    // Drop the log buffers of removed servers so add/remove cycles don't leak.
+    for name in &to_remove {
+        log_agg.remove_server(name);
+    }
+
+    // No lock: start new and replacement supervisors.
+    let mut fresh = Vec::with_capacity(to_add.len() + to_change.len());
+    for name in to_add.iter().chain(to_change.iter()) {
+        if let Some(cfg) = new_config.servers.get(name) {
+            fresh.push(start_single_server(name, cfg, shutdown, log_agg).await);
+        }
+    }
+
+    // Short lock: publish them.
+    handles.lock().await.extend(fresh);
+
+    (to_add.len(), to_remove.len(), to_change.len())
 }
 
 /// Wait until every server has left the `Stopped`/`Starting` transient states,
