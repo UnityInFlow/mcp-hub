@@ -524,11 +524,19 @@ async fn async_main(cli: Cli, startup: Option<DaemonStartup>) -> anyhow::Result<
         Commands::Init => init::run_init_wizard(),
 
         Commands::GenConfig(args) => {
-            let config = config::find_and_load_config(cli.config.as_deref())
+            let (config, secret_vars) = config::find_and_load_config_report(cli.config.as_deref())
                 .context("Failed to load config")?;
 
             if config.servers.is_empty() {
                 eprintln!("\u{26a0} No servers configured in mcp-hub.toml");
+            }
+
+            if !secret_vars.is_empty() {
+                eprintln!(
+                    "warning: gen-config is writing secret values expanded from {} to stdout; \
+                     do not commit or share the output",
+                    secret_vars.join(", ")
+                );
             }
 
             let live_info: Option<Vec<gen_config::ServerLiveInfo>> = if args.live {

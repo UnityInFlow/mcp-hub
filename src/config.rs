@@ -1,6 +1,7 @@
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap};
 
 /// Known field names for a `[servers.<name>]` block.
 const KNOWN_SERVER_FIELDS: &[&str] = &[
@@ -107,10 +108,184 @@ fn warn_unknown_fields(raw: &toml::Value) {
     }
 }
 
+/// Error returned by [`expand_str`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ExpandError {
+    /// `${NAME}` referenced a variable that is not set and has no `:-default`.
+    #[error(
+        "environment variable '{name}' is not set (use ${{{name}:-default}} to provide a fallback)"
+    )]
+    Unset { name: String },
+    /// A `${` was never closed by a matching `}`.
+    #[error("unterminated '${{' (missing closing '}}'; write '$${{' for a literal '${{')")]
+    Unterminated,
+    /// The text after `${` is not a valid variable name (`[A-Za-z_][A-Za-z0-9_]*`).
+    #[error("invalid variable name '{name}' in '${{...}}' (expected [A-Za-z_][A-Za-z0-9_]*)")]
+    BadName { name: String },
+}
+
+/// True if `name` is a valid environment variable name: `[A-Za-z_][A-Za-z0-9_]*`.
+fn is_valid_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+            chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        Some(_) | None => false,
+    }
+}
+
+/// True if `name` looks like it holds a secret (contains `TOKEN`, `SECRET`,
+/// `KEY` or `PASSWORD`, case-insensitive).
+pub fn is_secret_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    ["TOKEN", "SECRET", "KEY", "PASSWORD"]
+        .iter()
+        .any(|needle| upper.contains(needle))
+}
+
+/// Expand `${NAME}` and `${NAME:-default}` references in `input`.
+///
+/// Pure: variables are resolved only through `lookup`, which returns `None`
+/// for an unset variable.
+///
+/// Rules:
+/// - `${NAME}` becomes the value of `NAME`; if unset, [`ExpandError::Unset`].
+///   A variable that is set to the empty string expands to the empty string.
+/// - `${NAME:-default}` becomes the value of `NAME` if it is set *and*
+///   non-empty, otherwise `default` (which may be empty). The default is
+///   literal text up to the first `}`; it is not itself expanded.
+/// - `$${` is an escape and yields a literal `${` (the rest is left as-is, so
+///   `$${X}` becomes `${X}`).
+/// - A lone `$`, or `$NAME` without braces, is kept literally.
+/// - A `${` with no closing `}` is [`ExpandError::Unterminated`]; a name that
+///   is not `[A-Za-z_][A-Za-z0-9_]*` is [`ExpandError::BadName`].
+pub fn expand_str(
+    input: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<String, ExpandError> {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+
+    while let Some(pos) = rest.find('$') {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + 1..];
+
+        if let Some(escaped) = after.strip_prefix("${") {
+            // `$${` -> literal `${`.
+            out.push_str("${");
+            rest = escaped;
+        } else if let Some(body) = after.strip_prefix('{') {
+            let end = body.find('}').ok_or(ExpandError::Unterminated)?;
+            let inner = &body[..end];
+            let (name, default) = match inner.split_once(":-") {
+                Some((name, default)) => (name, Some(default)),
+                None => (inner, None),
+            };
+            if !is_valid_var_name(name) {
+                return Err(ExpandError::BadName {
+                    name: name.to_string(),
+                });
+            }
+            match (lookup(name), default) {
+                (Some(value), Some(default)) => {
+                    out.push_str(if value.is_empty() { default } else { &value })
+                }
+                (Some(value), None) => out.push_str(&value),
+                (None, Some(default)) => out.push_str(default),
+                (None, None) => {
+                    return Err(ExpandError::Unset {
+                        name: name.to_string(),
+                    })
+                }
+            }
+            rest = &body[end + 1..];
+        } else {
+            // Lone `$` or `$NAME`: literal.
+            out.push('$');
+            rest = after;
+        }
+    }
+
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// Expand `${VAR}` references in every server's `env` values and `args`.
+///
+/// `command`, `cwd` and `env_file` are left untouched, and values read later
+/// from `env_file` are never expanded (they are literal).
+///
+/// All errors are collected and reported together, each naming the server,
+/// the field (`env.KEY` or `args[N]`) and the cause. On success, returns the
+/// sorted, de-duplicated names of secret-looking variables
+/// (see [`is_secret_name`]) that were actually read from the environment.
+pub fn expand_config(
+    config: &mut HubConfig,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<Vec<String>> {
+    let secrets: RefCell<BTreeSet<String>> = RefCell::new(BTreeSet::new());
+    let tracking_lookup = |name: &str| {
+        let value = lookup(name);
+        if value.is_some() && is_secret_name(name) {
+            secrets.borrow_mut().insert(name.to_string());
+        }
+        value
+    };
+
+    let mut errors: Vec<String> = Vec::new();
+    let mut server_names: Vec<String> = config.servers.keys().cloned().collect();
+    server_names.sort();
+
+    for name in &server_names {
+        let Some(server) = config.servers.get_mut(name) else {
+            continue;
+        };
+
+        for (i, arg) in server.args.iter_mut().enumerate() {
+            match expand_str(arg, tracking_lookup) {
+                Ok(expanded) => *arg = expanded,
+                Err(err) => errors.push(format!("Server '{name}': field 'args[{i}]': {err}")),
+            }
+        }
+
+        let mut keys: Vec<String> = server.env.keys().cloned().collect();
+        keys.sort();
+        for key in keys {
+            let Some(value) = server.env.get_mut(&key) else {
+                continue;
+            };
+            match expand_str(value, tracking_lookup) {
+                Ok(expanded) => *value = expanded,
+                Err(err) => errors.push(format!("Server '{name}': field 'env.{key}': {err}")),
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(secrets.into_inner().into_iter().collect())
+    } else {
+        anyhow::bail!(errors.join("\n"))
+    }
+}
+
 /// Load and validate a config file at `path`.
 ///
-/// Unknown fields produce warnings; invalid TOML or schema violations are errors.
+/// Unknown fields produce warnings; invalid TOML, schema violations, or
+/// unresolvable `${VAR}` references are errors. See [`load_config_report`].
 pub fn load_config(path: &std::path::Path) -> anyhow::Result<HubConfig> {
+    load_config_report(path).map(|(config, _secrets)| config)
+}
+
+/// Like [`load_config`], but also returns the names of secret-looking
+/// environment variables (`TOKEN|SECRET|KEY|PASSWORD`) whose values were
+/// expanded into the config, so callers that print the config (`gen-config`)
+/// can warn.
+///
+/// `${VAR}` expansion against the hub's own environment happens here, after
+/// parsing and before validation. Because it runs at load time, both the
+/// supervisor (spawning) and `gen-config` see the expanded values.
+pub fn load_config_report(path: &std::path::Path) -> anyhow::Result<(HubConfig, Vec<String>)> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read config: {}", path.display()))?;
 
@@ -136,8 +311,12 @@ pub fn load_config(path: &std::path::Path) -> anyhow::Result<HubConfig> {
         }
     }
 
+    // Expand `${VAR}` in env values and args against the hub's environment.
+    let secret_vars = expand_config(&mut config, |name| std::env::var(name).ok())
+        .map_err(|err| anyhow::anyhow!("Cannot expand variables in {}:\n{err}", path.display()))?;
+
     validate_config(&config)?;
-    Ok(config)
+    Ok((config, secret_vars))
 }
 
 /// Validate all server entries in `config`, collecting all errors before failing.
@@ -216,8 +395,16 @@ pub fn resolve_env(server: &ServerConfig) -> anyhow::Result<HashMap<String, Stri
 ///
 /// If both global and local exist, local servers override global by name.
 pub fn find_and_load_config(explicit_path: Option<&std::path::Path>) -> anyhow::Result<HubConfig> {
+    find_and_load_config_report(explicit_path).map(|(config, _secrets)| config)
+}
+
+/// Like [`find_and_load_config`], but also returns the secret-looking
+/// variable names expanded into the config (see [`load_config_report`]).
+pub fn find_and_load_config_report(
+    explicit_path: Option<&std::path::Path>,
+) -> anyhow::Result<(HubConfig, Vec<String>)> {
     if let Some(path) = explicit_path {
-        return load_config(path);
+        return load_config_report(path);
     }
 
     let global_path = dirs::config_dir().map(|d| d.join("mcp-hub").join("mcp-hub.toml"));
@@ -228,11 +415,11 @@ pub fn find_and_load_config(explicit_path: Option<&std::path::Path>) -> anyhow::
 
     let global = global_path
         .filter(|p| p.exists())
-        .map(|p| load_config(&p))
+        .map(|p| load_config_report(&p))
         .transpose()?;
 
     let local = if local_path.exists() {
-        Some(load_config(&local_path)?)
+        Some(load_config_report(&local_path)?)
     } else {
         None
     };
@@ -241,10 +428,13 @@ pub fn find_and_load_config(explicit_path: Option<&std::path::Path>) -> anyhow::
         (None, None) => anyhow::bail!("No mcp-hub.toml found. Create one or run `mcp-hub init`."),
         (Some(g), None) => Ok(g),
         (None, Some(l)) => Ok(l),
-        (Some(mut g), Some(l)) => {
+        (Some((mut g, mut g_secrets)), Some((l, l_secrets))) => {
             // Local servers override global by name (D-02).
             g.servers.extend(l.servers);
-            Ok(g)
+            g_secrets.extend(l_secrets);
+            g_secrets.sort();
+            g_secrets.dedup();
+            Ok((g, g_secrets))
         }
     }
 }
@@ -426,5 +616,188 @@ command = "echo"
             server.env_file.as_deref(),
             Some(env_path.display().to_string().as_str())
         );
+    }
+
+    fn lookup_from<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            vars.iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| (*v).to_string())
+        }
+    }
+
+    #[test]
+    fn expand_set_variable() {
+        let out = expand_str("${FOO}", lookup_from(&[("FOO", "bar")])).unwrap();
+        assert_eq!(out, "bar");
+    }
+
+    #[test]
+    fn expand_unset_with_default_uses_default() {
+        let out = expand_str("${FOO:-fallback}", lookup_from(&[])).unwrap();
+        assert_eq!(out, "fallback");
+    }
+
+    #[test]
+    fn expand_unset_with_empty_default_is_empty() {
+        let out = expand_str("a${FOO:-}b", lookup_from(&[])).unwrap();
+        assert_eq!(out, "ab");
+    }
+
+    #[test]
+    fn expand_unset_without_default_errors() {
+        let err = expand_str("${FOO}", lookup_from(&[])).unwrap_err();
+        assert_eq!(
+            err,
+            ExpandError::Unset {
+                name: "FOO".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn expand_empty_set_with_default_uses_default() {
+        let out = expand_str("${FOO:-fallback}", lookup_from(&[("FOO", "")])).unwrap();
+        assert_eq!(out, "fallback");
+    }
+
+    #[test]
+    fn expand_empty_set_without_default_is_empty() {
+        let out = expand_str("x${FOO}y", lookup_from(&[("FOO", "")])).unwrap();
+        assert_eq!(out, "xy");
+    }
+
+    #[test]
+    fn expand_set_ignores_default() {
+        let out = expand_str("${FOO:-fallback}", lookup_from(&[("FOO", "real")])).unwrap();
+        assert_eq!(out, "real");
+    }
+
+    #[test]
+    fn expand_escape_yields_literal() {
+        let out = expand_str("$${X}", lookup_from(&[("X", "nope")])).unwrap();
+        assert_eq!(out, "${X}");
+    }
+
+    #[test]
+    fn expand_lone_dollar_is_literal() {
+        let out = expand_str("cost $5 $", lookup_from(&[])).unwrap();
+        assert_eq!(out, "cost $5 $");
+    }
+
+    #[test]
+    fn expand_bare_name_is_literal() {
+        let out = expand_str("$HOME and $$HOME", lookup_from(&[("HOME", "/h")])).unwrap();
+        assert_eq!(out, "$HOME and $$HOME");
+    }
+
+    #[test]
+    fn expand_unterminated_errors() {
+        for input in ["${FOO", "${", "x${FOO:-bar"] {
+            assert_eq!(
+                expand_str(input, lookup_from(&[("FOO", "v")])).unwrap_err(),
+                ExpandError::Unterminated,
+                "input: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn expand_bad_name_errors() {
+        for input in ["${}", "${1X}", "${A-B}", "${A B}", "${:-x}"] {
+            assert!(
+                matches!(
+                    expand_str(input, lookup_from(&[])),
+                    Err(ExpandError::BadName { .. })
+                ),
+                "input: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn expand_multiple_refs_and_adjacent_text() {
+        let out = expand_str(
+            "pre-${A}-mid-${B:-d}${C}-post",
+            lookup_from(&[("A", "1"), ("C", "3")]),
+        )
+        .unwrap();
+        assert_eq!(out, "pre-1-mid-d3-post");
+    }
+
+    #[test]
+    fn expand_non_ascii_text_preserved() {
+        let out = expand_str("héllo ${A} wörld", lookup_from(&[("A", "é")])).unwrap();
+        assert_eq!(out, "héllo é wörld");
+    }
+
+    #[test]
+    fn expand_config_names_server_field_and_var() {
+        let mut config: HubConfig = toml::from_str(
+            r#"
+[servers.gh]
+command = "echo"
+args = ["--x=${MISSING_ARG}"]
+env = { TOKEN = "${MISSING_ENV}" }
+"#,
+        )
+        .unwrap();
+        let err = expand_config(&mut config, lookup_from(&[]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("gh"), "{err}");
+        assert!(
+            err.contains("args[0]") && err.contains("MISSING_ARG"),
+            "{err}"
+        );
+        assert!(
+            err.contains("env.TOKEN") && err.contains("MISSING_ENV"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn expand_config_leaves_command_cwd_and_env_file_alone() {
+        let mut config: HubConfig = toml::from_str(
+            r#"
+[servers.s]
+command = "${CMD}"
+cwd = "${DIR}"
+env_file = "${ENVF}"
+"#,
+        )
+        .unwrap();
+        expand_config(&mut config, lookup_from(&[])).unwrap();
+        let s = &config.servers["s"];
+        assert_eq!(s.command, "${CMD}");
+        assert_eq!(s.cwd.as_deref(), Some("${DIR}"));
+        assert_eq!(s.env_file.as_deref(), Some("${ENVF}"));
+    }
+
+    #[test]
+    fn expand_config_reports_secret_vars_only_when_set() {
+        let mut config: HubConfig = toml::from_str(
+            r#"
+[servers.s]
+command = "echo"
+env = { A = "${GH_TOKEN}", B = "${LEVEL}", C = "${UNSET_KEY:-x}" }
+"#,
+        )
+        .unwrap();
+        let secrets = expand_config(
+            &mut config,
+            lookup_from(&[("GH_TOKEN", "t"), ("LEVEL", "1")]),
+        )
+        .unwrap();
+        assert_eq!(secrets, vec!["GH_TOKEN".to_string()]);
+    }
+
+    #[test]
+    fn is_secret_name_matches_case_insensitively() {
+        assert!(is_secret_name("GITHUB_TOKEN"));
+        assert!(is_secret_name("my_Secret"));
+        assert!(is_secret_name("API_KEY"));
+        assert!(is_secret_name("dbPassword"));
+        assert!(!is_secret_name("HOME"));
     }
 }
