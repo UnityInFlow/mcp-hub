@@ -586,4 +586,28 @@ mod tests {
             .unwrap();
         assert!(ct.contains("text/css"));
     }
+
+    #[tokio::test]
+    async fn static_assets_are_cacheable() {
+        for uri in [
+            "/static/htmx.min.js",
+            "/static/htmx-sse.js",
+            "/static/style.css",
+        ] {
+            let state = make_test_state().await;
+            let app = super::super::build_router(state);
+            let resp = app
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let cc = resp
+                .headers()
+                .get("cache-control")
+                .unwrap()
+                .to_str()
+                .unwrap();
+            assert_eq!(cc, "public, max-age=31536000, immutable", "{uri}");
+        }
+    }
 }
