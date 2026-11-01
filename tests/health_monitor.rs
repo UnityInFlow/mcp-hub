@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use mcp_hub::mcp::dispatcher::{reader_task, IdAllocator, PendingMap, SharedStdin};
 use mcp_hub::mcp::health::{run_health_check_loop, DEFAULT_HEALTH_CHECK_INTERVAL_SECS};
-use mcp_hub::mcp::protocol::{JsonRpcResponse, PingRequest};
+use mcp_hub::mcp::protocol::{JsonRpcId, JsonRpcResponse, PingRequest};
 use mcp_hub::types::{HealthStatus, ServerSnapshot};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -59,7 +59,7 @@ fn successful_ping_response() {
     let json = r#"{"jsonrpc":"2.0","result":{},"id":1}"#;
     let resp: JsonRpcResponse = serde_json::from_str(json).expect("should deserialize");
 
-    assert_eq!(resp.id, 1, "id should be 1");
+    assert_eq!(resp.id, JsonRpcId::Number(1), "id should be 1");
     assert!(resp.result.is_some(), "result should be Some");
     assert!(resp.error.is_none(), "error should be None");
 }
@@ -69,20 +69,14 @@ fn error_ping_response() {
     let json = r#"{"jsonrpc":"2.0","error":{"code":-32601,"message":"Method not found"},"id":1}"#;
     let resp: JsonRpcResponse = serde_json::from_str(json).expect("should deserialize");
 
-    assert_eq!(resp.id, 1, "id should be 1");
+    assert_eq!(resp.id, JsonRpcId::Number(1), "id should be 1");
     assert!(resp.error.is_some(), "error should be Some");
 }
 
 #[test]
-fn ping_response_missing_result_field() {
-    // Some servers only send error or only send result — missing field should be fine.
+fn response_without_result_or_error_is_rejected() {
     let json = r#"{"jsonrpc":"2.0","id":5}"#;
-    let resp: JsonRpcResponse =
-        serde_json::from_str(json).expect("should deserialize with missing fields");
-
-    assert_eq!(resp.id, 5);
-    assert!(resp.result.is_none());
-    assert!(resp.error.is_none());
+    assert!(serde_json::from_str::<JsonRpcResponse>(json).is_err());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -163,6 +157,48 @@ async fn ping_server_returns_latency_for_valid_responder() {
     assert!(
         latency < 5000,
         "latency should be under 5 seconds: {latency}ms"
+    );
+}
+
+/// Answers every request with a message that has no `result` and no `error`.
+#[cfg(unix)]
+const NO_RESULT_RESPONDER_SCRIPT: &str = r#"
+while IFS= read -r line; do
+    id=$(echo "$line" | sed 's/.*"id":\([0-9]*\).*/\1/')
+    echo "{\"jsonrpc\":\"2.0\",\"id\":$id}"
+done
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn ping_server_fails_for_response_without_result() {
+    use mcp_hub::mcp::health::ping_server;
+
+    let mut child = tokio::process::Command::new("bash")
+        .arg("-c")
+        .arg(NO_RESULT_RESPONDER_SCRIPT)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("bash should be available");
+
+    let stdin = child.stdin.take().expect("stdin should be piped");
+    let stdout = child.stdout.take().expect("stdout should be piped");
+    let stdin_shared: SharedStdin = Arc::new(Mutex::new(stdin));
+    let pending: PendingMap = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let pending_clone = Arc::clone(&pending);
+    tokio::spawn(async move {
+        reader_task(stdout, pending_clone).await;
+    });
+
+    let result = ping_server(&stdin_shared, &pending, 1).await;
+
+    child.kill().await.ok();
+
+    assert!(
+        result.is_err(),
+        "ping_server must not report success for a response without a result"
     );
 }
 

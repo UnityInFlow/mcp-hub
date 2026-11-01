@@ -55,15 +55,68 @@ impl PingRequest {
     }
 }
 
+/// JSON-RPC 2.0 request/response identifier.
+///
+/// The hub only ever sends numeric ids, but a peer may legally use strings, so
+/// both are modelled explicitly instead of silently discarding the latter.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+#[serde(untagged)]
+pub enum JsonRpcId {
+    Number(u64),
+    String(String),
+}
+
+/// Why a JSON object was rejected as a JSON-RPC response.
+#[derive(Debug, thiserror::Error)]
+pub enum InvalidResponse {
+    #[error("message carries a `method` (request or notification, not a response)")]
+    HasMethod,
+    #[error("response has no `id`")]
+    MissingId,
+    #[error("response `id` is neither an unsigned integer nor a string")]
+    InvalidId,
+    #[error("response has neither `result` nor `error`")]
+    MissingPayload,
+    #[error("response has both `result` and `error`")]
+    AmbiguousPayload,
+}
+
 /// Generic JSON-RPC 2.0 response.
+///
+/// Deserialisation is strict: a message is only a response if it has no
+/// `method`, has an `id`, and carries exactly one of `result` / `error`
+/// (a `null` result counts as present). Server-initiated requests such as
+/// `roots/list` therefore never parse as a response to one of the hub's own
+/// requests that happens to share their id.
 ///
 /// Phase 2 validates `id` correlation and checks for `error`.
 /// Phase 3 parses `result` for introspection data via `serde_json::from_value`.
 #[derive(Debug, Deserialize)]
+#[serde(try_from = "serde_json::Map<String, serde_json::Value>")]
 pub struct JsonRpcResponse {
-    pub id: u64,
+    pub id: JsonRpcId,
     pub result: Option<serde_json::Value>,
     pub error: Option<serde_json::Value>,
+}
+
+impl TryFrom<serde_json::Map<String, serde_json::Value>> for JsonRpcResponse {
+    type Error = InvalidResponse;
+
+    fn try_from(mut map: serde_json::Map<String, serde_json::Value>) -> Result<Self, Self::Error> {
+        if map.contains_key("method") {
+            return Err(InvalidResponse::HasMethod);
+        }
+        let id_value = map.remove("id").ok_or(InvalidResponse::MissingId)?;
+        let id = serde_json::from_value::<JsonRpcId>(id_value)
+            .map_err(|_| InvalidResponse::InvalidId)?;
+        let result = map.remove("result");
+        let error = map.remove("error");
+        match (&result, &error) {
+            (None, None) => Err(InvalidResponse::MissingPayload),
+            (Some(_), Some(_)) => Err(InvalidResponse::AmbiguousPayload),
+            (Some(_), None) | (None, Some(_)) => Ok(Self { id, result, error }),
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
