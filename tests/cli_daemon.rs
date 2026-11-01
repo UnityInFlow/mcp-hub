@@ -728,4 +728,192 @@ transport = "stdio"
         let _ = mcp_hub().arg("stop").envs(paths.env_overrides()).output();
         assert!(saw_gamma, "SIGHUP should still apply the new config");
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // #22: shutdown must stop servers even with a lingering control client;
+    //      a live PID must never be treated as stale
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// True while `pid` is a running process (zombies count as dead).
+    fn process_alive(pid: u32) -> bool {
+        use nix::sys::signal::kill;
+        use nix::unistd::Pid;
+
+        let Ok(raw) = i32::try_from(pid) else {
+            return false;
+        };
+        if kill(Pid::from_raw(raw), None).is_err() {
+            return false;
+        }
+        // A zombie still answers kill(pid, 0); /proc tells them apart on Linux.
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => !stat
+                .rsplit(')')
+                .next()
+                .is_some_and(|rest| rest.trim_start().starts_with('Z')),
+            Err(_) => true,
+        }
+    }
+
+    /// Config with one server that records its PID in `pid_file`, then `exec`s
+    /// `sleep` so the recorded PID is the long-lived process.
+    ///
+    /// With `ignore_term` the server ignores SIGTERM (the disposition survives
+    /// `exec`), so only the supervisor's SIGKILL escalation after its 5 s grace
+    /// period stops it -- which requires the daemon to wait for its supervisors.
+    fn write_pid_recording_config(
+        dir: &TempDir,
+        pid_file: &std::path::Path,
+        ignore_term: bool,
+    ) -> PathBuf {
+        let cfg = dir.path().join("hub.toml");
+        let trap = if ignore_term { "trap \"\" TERM; " } else { "" };
+        std::fs::write(
+            &cfg,
+            format!(
+                "[hub]\nweb_port = {}\n\n[servers.recorder]\ncommand = \"bash\"\n\
+                 args = ['-c', '{}echo $$ > {}; exec sleep 600']\ntransport = \"stdio\"\n",
+                free_port(),
+                trap,
+                pid_file.display()
+            ),
+        )
+        .expect("write config");
+        cfg
+    }
+
+    #[test]
+    fn stop_stops_servers_even_with_idle_control_client() {
+        let paths = TestDaemonPaths::new();
+        let cfg_dir = TempDir::new().expect("cfg tempdir");
+        let server_pid_file = cfg_dir.path().join("server.pid");
+        let cfg = write_pid_recording_config(&cfg_dir, &server_pid_file, true);
+
+        let start = mcp_hub()
+            .args(["start", "--daemon", "-c", cfg.to_str().unwrap()])
+            .envs(paths.env_overrides())
+            .output()
+            .expect("start daemon");
+        assert!(
+            start.status.success(),
+            "start failed: {}",
+            String::from_utf8_lossy(&start.stderr)
+        );
+
+        assert!(
+            wait_for(
+                || read_pid(&server_pid_file).is_some(),
+                Duration::from_secs(5)
+            ),
+            "managed server never recorded its PID"
+        );
+        let server_pid = read_pid(&server_pid_file).expect("server pid");
+        let daemon_pid = read_pid(&paths.pid).expect("daemon pid");
+
+        // A client that connects and never sends a request keeps a
+        // `DaemonState` clone alive inside the daemon.
+        let idle = std::os::unix::net::UnixStream::connect(&paths.sock).expect("idle client");
+
+        let stop = mcp_hub()
+            .arg("stop")
+            .envs(paths.env_overrides())
+            .output()
+            .expect("mcp-hub stop");
+
+        let daemon_gone = wait_for(|| !process_alive(daemon_pid), Duration::from_secs(8));
+        let server_gone = wait_for(|| !process_alive(server_pid), Duration::from_secs(8));
+        let pid_file_gone = wait_for(|| !paths.pid.exists(), Duration::from_secs(2));
+
+        // Do not leave orphans behind if an assertion below fails.
+        if !server_gone {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &server_pid.to_string()])
+                .output();
+        }
+        if !daemon_gone {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &daemon_pid.to_string()])
+                .output();
+        }
+        drop(idle);
+
+        assert!(
+            stop.status.success(),
+            "stop should exit 0; stderr: {}",
+            String::from_utf8_lossy(&stop.stderr)
+        );
+        assert!(daemon_gone, "daemon process should exit after stop");
+        assert!(server_gone, "managed server must be stopped on shutdown");
+        assert!(pid_file_gone, "PID file should be removed after stop");
+    }
+
+    /// Number of processes whose command line contains `needle`.
+    fn count_processes_matching(needle: &str) -> Option<usize> {
+        let out = std::process::Command::new("pgrep")
+            .args(["-f", "-c", needle])
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+    }
+
+    #[test]
+    fn live_daemon_with_missing_socket_blocks_second_start() {
+        let paths = TestDaemonPaths::new();
+        let cfg_dir = TempDir::new().expect("cfg tempdir");
+        let server_pid_file = cfg_dir.path().join("server.pid");
+        let cfg = write_pid_recording_config(&cfg_dir, &server_pid_file, false);
+        let cfg_str = cfg.to_str().unwrap().to_string();
+
+        let start = mcp_hub()
+            .args(["start", "--daemon", "-c", &cfg_str])
+            .envs(paths.env_overrides())
+            .output()
+            .expect("start daemon");
+        assert!(start.status.success(), "first start failed");
+        let daemon_pid = read_pid(&paths.pid).expect("daemon pid");
+
+        // Simulate the stale-socket case: PID alive, socket file gone.
+        std::fs::remove_file(&paths.sock).expect("remove socket");
+
+        let second = mcp_hub()
+            .args(["start", "--daemon", "-c", &cfg_str])
+            .envs(paths.env_overrides())
+            .output()
+            .expect("second start");
+
+        // Give a wrongly-started second daemon time to show up.
+        std::thread::sleep(Duration::from_millis(500));
+        let sock_recreated = paths.sock.exists();
+        let pid_after = read_pid(&paths.pid);
+        let daemon_alive = process_alive(daemon_pid);
+        let matching = count_processes_matching(&cfg_str);
+
+        // The socket is gone, so `stop` cannot reach the daemon: use SIGTERM.
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &daemon_pid.to_string()])
+            .output();
+        let exited = wait_for(|| !process_alive(daemon_pid), Duration::from_secs(8));
+        if !exited {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &daemon_pid.to_string()])
+                .output();
+        }
+
+        assert!(
+            !second.status.success(),
+            "second start must fail while the first daemon's PID is alive"
+        );
+        let stderr = String::from_utf8_lossy(&second.stderr);
+        assert!(
+            stderr.contains("already running") && stderr.contains(&daemon_pid.to_string()),
+            "stderr should name the running daemon's PID, got: {stderr}"
+        );
+        assert!(!sock_recreated, "a second daemon bound a new socket");
+        assert_eq!(pid_after, Some(daemon_pid), "PID file must be untouched");
+        assert!(daemon_alive, "original daemon must keep running");
+        if let Some(n) = matching {
+            assert_eq!(n, 1, "exactly one daemon process may use this config");
+        }
+        assert!(exited, "daemon should exit on SIGTERM");
+    }
 }
