@@ -107,23 +107,58 @@ pub struct DaemonState {
 // Server-side socket listener (Unix only)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// A bound control socket listener, ready to be served.
+#[cfg(unix)]
+pub type ControlListener = tokio::net::UnixListener;
+
+/// Placeholder: Unix domain sockets are not available on this platform.
+#[cfg(not(unix))]
+pub struct ControlListener;
+
+#[cfg(unix)]
+/// Bind a Unix domain socket at `sock_path`, replacing any leftover socket file.
+///
+/// Split from [`serve_control_socket`] so the daemon can tell its parent
+/// "ready" only after the bind has actually succeeded.
+pub async fn bind_control_socket(sock_path: &Path) -> anyhow::Result<ControlListener> {
+    // Remove any leftover socket from a previous run.
+    let _ = tokio::fs::remove_file(sock_path).await;
+
+    let listener = ControlListener::bind(sock_path)
+        .map_err(|e| anyhow::anyhow!("Failed to bind socket {}: {e}", sock_path.display()))?;
+
+    tracing::info!("Control socket listening on {}", sock_path.display());
+    Ok(listener)
+}
+
+#[cfg(not(unix))]
+/// Stub: Unix domain socket IPC is not supported on non-Unix platforms.
+pub async fn bind_control_socket(_sock_path: &Path) -> anyhow::Result<ControlListener> {
+    anyhow::bail!("Unix domain socket IPC is not supported on this platform. Use foreground mode.")
+}
+
 #[cfg(unix)]
 /// Bind a Unix domain socket at `sock_path` and accept control connections.
+///
+/// Convenience wrapper over [`bind_control_socket`] + [`serve_control_socket`].
+/// The daemon binary binds and serves separately; this is the library entry point.
+#[allow(dead_code)]
+pub async fn run_control_socket(sock_path: &Path, state: Arc<DaemonState>) -> anyhow::Result<()> {
+    let listener = bind_control_socket(sock_path).await?;
+    serve_control_socket(listener, sock_path, state).await
+}
+
+#[cfg(unix)]
+/// Accept control connections on an already-bound `listener`.
 ///
 /// Each connection receives exactly one request and sends exactly one response
 /// (newline-delimited JSON). The listener shuts down when `state.shutdown` is
 /// cancelled and removes the socket file on exit.
-pub async fn run_control_socket(sock_path: &Path, state: Arc<DaemonState>) -> anyhow::Result<()> {
-    use tokio::net::UnixListener;
-
-    // Remove any leftover socket from a previous run.
-    let _ = tokio::fs::remove_file(sock_path).await;
-
-    let listener = UnixListener::bind(sock_path)
-        .map_err(|e| anyhow::anyhow!("Failed to bind socket {}: {e}", sock_path.display()))?;
-
-    tracing::info!("Control socket listening on {}", sock_path.display());
-
+pub async fn serve_control_socket(
+    listener: ControlListener,
+    sock_path: &Path,
+    state: Arc<DaemonState>,
+) -> anyhow::Result<()> {
     loop {
         tokio::select! {
             accept = listener.accept() => {
@@ -156,6 +191,16 @@ pub async fn run_control_socket(sock_path: &Path, state: Arc<DaemonState>) -> an
 #[cfg(not(unix))]
 /// Stub: Unix domain socket IPC is not supported on non-Unix platforms.
 pub async fn run_control_socket(_sock_path: &Path, _state: Arc<DaemonState>) -> anyhow::Result<()> {
+    anyhow::bail!("Unix domain socket IPC is not supported on this platform. Use foreground mode.")
+}
+
+#[cfg(not(unix))]
+/// Stub: Unix domain socket IPC is not supported on non-Unix platforms.
+pub async fn serve_control_socket(
+    _listener: ControlListener,
+    _sock_path: &Path,
+    _state: Arc<DaemonState>,
+) -> anyhow::Result<()> {
     anyhow::bail!("Unix domain socket IPC is not supported on this platform. Use foreground mode.")
 }
 

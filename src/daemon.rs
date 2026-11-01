@@ -145,13 +145,144 @@ fn cleanup_stale_files(sock_path: &std::path::Path, pid_path: &std::path::Path) 
 // Fork / daemonize
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// How long the foreground parent waits for the daemon to report readiness.
+///
+/// Slightly above the 10 s the daemon itself may spend waiting for servers to
+/// reach their initial state before it binds its sockets.
+pub const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Write end of the readiness pipe, owned by the daemon child.
+///
+/// The foreground parent blocks on the read end until the daemon reports that
+/// it finished starting (`ready`) or why it could not (`fail`). Dropping the
+/// notifier without calling either closes the pipe, which the parent reports
+/// as "daemon exited before becoming ready".
+#[cfg(unix)]
+pub struct ReadyNotifier {
+    pipe: std::fs::File,
+}
+
+/// Non-Unix stub: daemon mode is unavailable, so there is nothing to notify.
+#[cfg(not(unix))]
+pub struct ReadyNotifier;
+
+#[cfg(unix)]
+impl ReadyNotifier {
+    /// Tell the parent the daemon is up (control socket bound, web UI listening).
+    ///
+    /// The payload is `b"1"` followed by the daemon's PID so the parent can
+    /// print it.
+    pub fn ready(self) {
+        let msg = format!("1{}", std::process::id());
+        self.send(msg.as_bytes());
+    }
+
+    /// Tell the parent startup failed; `message` is printed on the parent's stderr.
+    pub fn fail(self, message: &str) {
+        let mut payload = Vec::with_capacity(message.len() + 1);
+        payload.push(b'E');
+        payload.extend_from_slice(message.as_bytes());
+        self.send(&payload);
+    }
+
+    fn send(mut self, payload: &[u8]) {
+        use std::io::Write as _;
+        // The parent may already have timed out and gone away; nothing to do then.
+        let _ = self.pipe.write_all(payload);
+    }
+}
+
+#[cfg(not(unix))]
+impl ReadyNotifier {
+    /// No-op on platforms without daemon support.
+    pub fn ready(self) {}
+    /// No-op on platforms without daemon support.
+    pub fn fail(self, _message: &str) {}
+}
+
+/// Outcome of waiting on the readiness pipe, as seen by the foreground parent.
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+enum ReadyOutcome {
+    Ready { pid: String },
+    Failed(String),
+    ExitedEarly,
+    TimedOut,
+}
+
+/// Interpret the bytes a daemon wrote to the readiness pipe.
+#[cfg(unix)]
+fn parse_ready_message(bytes: &[u8]) -> ReadyOutcome {
+    match bytes.split_first() {
+        None => ReadyOutcome::ExitedEarly,
+        Some((b'1', rest)) => ReadyOutcome::Ready {
+            pid: String::from_utf8_lossy(rest).into_owned(),
+        },
+        Some((b'E', rest)) => ReadyOutcome::Failed(String::from_utf8_lossy(rest).into_owned()),
+        Some((_, _)) => ReadyOutcome::Failed(format!(
+            "unexpected readiness message: {}",
+            String::from_utf8_lossy(bytes)
+        )),
+    }
+}
+
+/// Read the daemon's readiness message from `pipe`, giving up after `timeout`.
+#[cfg(unix)]
+fn wait_for_ready(pipe: &mut std::fs::File, timeout: std::time::Duration) -> ReadyOutcome {
+    use std::io::Read as _;
+    use std::os::unix::io::AsRawFd as _;
+
+    let deadline = std::time::Instant::now() + timeout;
+    let mut buf = Vec::new();
+
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return ReadyOutcome::TimedOut;
+        }
+        let mut pfd = nix::libc::pollfd {
+            fd: pipe.as_raw_fd(),
+            events: nix::libc::POLLIN,
+            revents: 0,
+        };
+        let millis = remaining.as_millis().min(i32::MAX as u128) as nix::libc::c_int;
+        // SAFETY: `pfd` is a valid pollfd for the duration of the call and nfds is 1.
+        let rc = unsafe { nix::libc::poll(&mut pfd, 1, millis) };
+        if rc < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return ReadyOutcome::Failed(format!(
+                "waiting for the daemon failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if rc == 0 {
+            return ReadyOutcome::TimedOut;
+        }
+        let mut chunk = [0u8; 1024];
+        match pipe.read(&mut chunk) {
+            // EOF: the writer closed the pipe, the message (if any) is complete.
+            Ok(0) => return parse_ready_message(&buf),
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return ReadyOutcome::Failed(format!("reading daemon readiness failed: {e}")),
+        }
+    }
+}
+
 /// Fork the current process into a background daemon.
 ///
 /// Performs the classic double-fork daemonization:
-/// 1. First fork — the parent exits so the shell regains control.
+/// 1. First fork — the original process stays in the foreground and **waits for
+///    the daemon to report readiness** over a pipe, then exits 0 (ready) or 1
+///    (startup failed / timed out), relaying the daemon's error to its stderr.
 /// 2. `setsid()` — create a new session so the daemon has no controlling terminal.
 /// 3. Second fork — ensures the daemon cannot re-acquire a controlling terminal.
 /// 4. Redirects stdin/stdout/stderr to `/dev/null`.
+///
+/// Only the daemon returns from this function; it receives the
+/// [`ReadyNotifier`] it must call once startup finished (or failed).
 ///
 /// **Must be called before the Tokio runtime is created** — forking after
 /// threads are running leads to undefined behaviour.
@@ -159,35 +290,84 @@ fn cleanup_stale_files(sock_path: &std::path::Path, pid_path: &std::path::Path) 
 /// Note: `nix::unistd::daemon()` is only available on Linux/FreeBSD/Solaris;
 /// this implementation works on any Unix including macOS.
 #[cfg(unix)]
-pub fn daemonize_process() -> anyhow::Result<()> {
-    use nix::unistd::{fork, setsid, ForkResult};
+pub fn daemonize_process() -> anyhow::Result<ReadyNotifier> {
+    use nix::fcntl::OFlag;
+    use nix::unistd::{fork, pipe2, ForkResult};
 
-    // First fork — parent exits, child continues.
+    // CLOEXEC so the managed MCP servers never inherit the pipe and keep the
+    // parent waiting after the daemon is done with it.
+    let (read_fd, write_fd) =
+        pipe2(OFlag::O_CLOEXEC).map_err(|e| anyhow::anyhow!("pipe failed: {e}"))?;
+
+    // First fork — parent waits for readiness, child continues.
     // SAFETY: called before Tokio runtime is created; no threads exist yet.
     match unsafe { fork() }.map_err(|e| anyhow::anyhow!("First fork failed: {e}"))? {
         ForkResult::Parent { .. } => {
-            // Parent exits cleanly — shell regains control.
-            std::process::exit(0);
+            // Close our copy of the write end so EOF is observable.
+            drop(write_fd);
+            let mut pipe = std::fs::File::from(read_fd);
+            let code = match wait_for_ready(&mut pipe, READY_TIMEOUT) {
+                ReadyOutcome::Ready { pid } => {
+                    println!("Daemon started (pid {pid})");
+                    0
+                }
+                ReadyOutcome::Failed(message) => {
+                    eprintln!("Error: {message}");
+                    1
+                }
+                ReadyOutcome::ExitedEarly => {
+                    eprintln!("Error: daemon exited before becoming ready");
+                    1
+                }
+                ReadyOutcome::TimedOut => {
+                    eprintln!(
+                        "Error: daemon did not become ready within {}s",
+                        READY_TIMEOUT.as_secs()
+                    );
+                    1
+                }
+            };
+            std::process::exit(code);
         }
-        ForkResult::Child => {}
+        ForkResult::Child => drop(read_fd),
     }
+
+    let notifier = ReadyNotifier {
+        pipe: std::fs::File::from(write_fd),
+    };
+
+    // Everything between here and the return reports failures to the parent
+    // before propagating them, since stderr is about to disappear.
+    match detach_from_terminal() {
+        Ok(()) => Ok(notifier),
+        Err(e) => {
+            notifier.fail(&format!("{e:#}"));
+            Err(e)
+        }
+    }
+}
+
+/// `setsid`, second fork, and stdio redirection — the daemon-side half of
+/// [`daemonize_process`].
+#[cfg(unix)]
+fn detach_from_terminal() -> anyhow::Result<()> {
+    use nix::unistd::{fork, setsid, ForkResult};
 
     // Create a new session — detach from the controlling terminal.
     setsid().map_err(|e| anyhow::anyhow!("setsid failed: {e}"))?;
 
     // Second fork — prevents the daemon from re-acquiring a controlling terminal.
+    // SAFETY: still single-threaded; the Tokio runtime has not been built.
     match unsafe { fork() }.map_err(|e| anyhow::anyhow!("Second fork failed: {e}"))? {
         ForkResult::Parent { .. } => {
-            // Intermediate parent exits.
+            // Intermediate parent exits; its copy of the pipe closes with it.
             std::process::exit(0);
         }
         ForkResult::Child => {}
     }
 
     // Redirect stdin/stdout/stderr to /dev/null.
-    redirect_to_dev_null()?;
-
-    Ok(())
+    redirect_to_dev_null()
 }
 
 /// Redirect the standard file descriptors to `/dev/null`.
@@ -224,6 +404,6 @@ fn redirect_to_dev_null() -> anyhow::Result<()> {
 
 /// Daemon mode is not supported on Windows.
 #[cfg(not(unix))]
-pub fn daemonize_process() -> anyhow::Result<()> {
+pub fn daemonize_process() -> anyhow::Result<ReadyNotifier> {
     anyhow::bail!("Daemon mode is not supported on Windows. Use foreground mode instead.")
 }

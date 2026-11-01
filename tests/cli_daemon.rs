@@ -28,14 +28,28 @@ mod daemon_tests {
         writeln!(
             f,
             r#"
+[hub]
+web_port = {}
+
 [servers.test-server]
 command = "sleep"
 args = ["9999"]
 transport = "stdio"
-"#
+"#,
+            free_port()
         )
         .expect("write config");
         f
+    }
+
+    /// Pick a free TCP port so parallel test daemons never fight over the
+    /// default web UI port (a bind failure is fatal for `start --daemon`).
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind ephemeral port")
+            .local_addr()
+            .expect("local addr")
+            .port()
     }
 
     /// Read the PID from a PID file. Returns None if the file does not exist or
@@ -353,5 +367,104 @@ transport = "stdio"
             second_sock_appeared,
             "New daemon socket should be connectable after stale socket cleanup"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // #18: startup errors must surface in the parent, before/while daemonizing
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Assert that no PID or socket file was left behind by a failed start.
+    fn assert_no_daemon_files(paths: &TestDaemonPaths) {
+        assert!(!paths.pid.exists(), "stale PID file left behind");
+        assert!(!paths.sock.exists(), "stale socket file left behind");
+    }
+
+    #[test]
+    fn start_daemon_missing_config_fails_cleanly() {
+        let paths = TestDaemonPaths::new();
+
+        let output = mcp_hub()
+            .args(["start", "--daemon", "-c", "/nonexistent/mcp-hub.toml"])
+            .envs(paths.env_overrides())
+            .output()
+            .expect("run mcp-hub");
+
+        assert!(
+            !output.status.success(),
+            "start --daemon with a missing config must exit non-zero"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("Failed to load config") && stderr.contains("nonexistent"),
+            "stderr should mention the config error, got: {stderr}"
+        );
+        assert_no_daemon_files(&paths);
+    }
+
+    #[test]
+    fn start_daemon_zero_servers_fails_cleanly() {
+        let paths = TestDaemonPaths::new();
+        let cfg_dir = TempDir::new().expect("cfg tempdir");
+        let mut f = NamedTempFile::new_in(cfg_dir.path()).expect("tempfile");
+        writeln!(f, "[hub]\nweb_port = {}", free_port()).expect("write config");
+
+        let output = mcp_hub()
+            .args(["start", "--daemon", "-c", f.path().to_str().unwrap()])
+            .envs(paths.env_overrides())
+            .output()
+            .expect("run mcp-hub");
+
+        assert!(
+            !output.status.success(),
+            "start --daemon with zero servers must exit non-zero"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("No servers defined"),
+            "stderr should mention the empty server list, got: {stderr}"
+        );
+        assert_no_daemon_files(&paths);
+    }
+
+    #[test]
+    fn start_daemon_web_port_in_use_fails_cleanly() {
+        let paths = TestDaemonPaths::new();
+        let cfg_dir = TempDir::new().expect("cfg tempdir");
+
+        // Occupy a port so the daemon's web UI bind fails after the fork.
+        let blocker = std::net::TcpListener::bind("127.0.0.1:0").expect("bind blocker");
+        let port = blocker.local_addr().expect("local addr").port();
+
+        let mut f = NamedTempFile::new_in(cfg_dir.path()).expect("tempfile");
+        writeln!(
+            f,
+            "[hub]\nweb_port = {port}\n\n[servers.s]\ncommand = \"sleep\"\nargs = [\"9999\"]"
+        )
+        .expect("write config");
+
+        let output = mcp_hub()
+            .args(["start", "--daemon", "-c", f.path().to_str().unwrap()])
+            .envs(paths.env_overrides())
+            .output()
+            .expect("run mcp-hub");
+
+        assert!(
+            !output.status.success(),
+            "start --daemon must exit non-zero when the web port is taken"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("Failed to bind web UI"),
+            "stderr should relay the daemon's bind error, got: {stderr}"
+        );
+        // The daemon removes its PID file and socket on its way out.
+        assert!(
+            wait_for(
+                || !paths.pid.exists() && !paths.sock.exists(),
+                Duration::from_secs(5)
+            ),
+            "PID/socket files should be cleaned up after a failed start"
+        );
+        drop(blocker);
     }
 }
