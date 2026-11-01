@@ -201,11 +201,14 @@ pub fn remove_pid_file(path: &std::path::Path) {
 /// - another process holds the exclusive lock on the PID file (see
 ///   [`write_pid_file`]),
 /// - the control socket accepts a connection, or
-/// - the PID recorded in the PID file is alive.
+/// - the PID recorded in the PID file is alive **and** is (or may be) an
+///   `mcp-hub` process — a live PID that demonstrably belongs to something
+///   else was reused after a reboot and is treated as stale.
 ///
 /// In those cases an error naming the PID and socket is returned and nothing
-/// is deleted. Only when none holds (dead PID, unreadable PID file, or no PID
-/// file) are the leftover socket and PID file removed and `Ok(())` returned.
+/// is deleted. Only when none holds (dead or foreign PID, unreadable PID file,
+/// or no PID file) are the leftover socket and PID file removed and `Ok(())`
+/// returned.
 ///
 /// This must be called *before* `daemonize_process()` and *before* the Tokio
 /// runtime is created. The daemon itself closes the remaining race by locking
@@ -241,14 +244,26 @@ pub fn check_existing_daemon(
 
     if let Some(pid) = read_recorded_pid(pid_path) {
         if pid_is_alive(pid) {
-            anyhow::bail!(
-                "A daemon with PID {pid} is already running (socket: {}, PID file: {}). \
-                 Use `mcp-hub stop` to stop it.",
-                sock_path.display(),
-                pid_path.display()
-            );
+            // Every daemon of this version holds the PID-file lock and a live
+            // older daemon answers on its socket, so reaching here with a live
+            // PID almost always means the PID was reused after a reboot. Only
+            // refuse when the process actually looks like mcp-hub (or we cannot
+            // tell).
+            match looks_like_mcp_hub(pid) {
+                Some(false) => tracing::info!(
+                    "PID {pid} from the PID file is alive but is not an mcp-hub process \
+                     (reused after a reboot?); treating daemon files as stale"
+                ),
+                Some(true) | None => anyhow::bail!(
+                    "A daemon with PID {pid} is already running (socket: {}, PID file: {}). \
+                     Use `mcp-hub stop` to stop it.",
+                    sock_path.display(),
+                    pid_path.display()
+                ),
+            }
+        } else {
+            tracing::info!("Cleaning up stale daemon files (PID {pid} is dead)");
         }
-        tracing::info!("Cleaning up stale daemon files (PID {pid} is dead)");
     }
 
     // No live daemon: remove what a dead one left behind.
@@ -293,6 +308,16 @@ fn pid_is_alive(pid: i32) -> bool {
         // Anything else cannot be a live process we could be racing with.
         Err(_) => false,
     }
+}
+
+/// Whether process `pid` is an `mcp-hub` binary, judged by `/proc/<pid>/comm`.
+///
+/// `None` when that cannot be determined (not Linux, or the entry is
+/// unreadable); callers should then err on the side of "running".
+#[cfg(unix)]
+fn looks_like_mcp_hub(pid: i32) -> Option<bool> {
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    Some(comm.trim_end().starts_with("mcp-hub"))
 }
 
 /// True if `/proc/<pid>/stat` reports state `Z` (always false off Linux).
