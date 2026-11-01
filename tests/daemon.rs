@@ -100,6 +100,93 @@ fn check_existing_daemon_with_no_socket() {
     assert!(result.is_ok(), "should return Ok when no socket exists");
 }
 
+#[cfg(unix)]
+#[test]
+fn check_existing_daemon_live_pid_without_socket_is_running() {
+    use mcp_hub::daemon::check_existing_daemon;
+
+    let dir = TempDir::new().expect("temp dir");
+    let sock = dir.path().join("mcp-hub.sock");
+    let pid = dir.path().join("mcp-hub.pid");
+    // Our own PID is certainly alive; there is no live socket and no lock held.
+    std::fs::write(&pid, std::process::id().to_string()).expect("write pid");
+    std::fs::write(&sock, b"").expect("leftover socket file");
+
+    let err = check_existing_daemon(&sock, &pid).expect_err("live PID means running");
+    let msg = err.to_string();
+    assert!(msg.contains("already running"), "got: {msg}");
+    assert!(msg.contains(&std::process::id().to_string()), "got: {msg}");
+    assert!(msg.contains(&sock.display().to_string()), "got: {msg}");
+    assert!(sock.exists(), "socket of a live daemon must not be removed");
+    assert!(
+        pid.exists(),
+        "PID file of a live daemon must not be removed"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn check_existing_daemon_dead_pid_cleans_stale_files() {
+    use mcp_hub::daemon::check_existing_daemon;
+
+    let dir = TempDir::new().expect("temp dir");
+    let sock = dir.path().join("mcp-hub.sock");
+    let pid = dir.path().join("mcp-hub.pid");
+    let mut child = std::process::Command::new("true").spawn().expect("spawn");
+    let dead_pid = child.id();
+    child.wait().expect("reap child");
+    std::fs::write(&pid, dead_pid.to_string()).expect("write pid");
+    std::fs::write(&sock, b"").expect("leftover socket file");
+
+    check_existing_daemon(&sock, &pid).expect("dead PID is stale");
+    assert!(!sock.exists(), "stale socket should be removed");
+    assert!(!pid.exists(), "stale PID file should be removed");
+}
+
+#[cfg(unix)]
+#[test]
+fn check_existing_daemon_unreadable_pid_file_is_stale() {
+    use mcp_hub::daemon::check_existing_daemon;
+
+    let dir = TempDir::new().expect("temp dir");
+    let sock = dir.path().join("mcp-hub.sock");
+    let pid = dir.path().join("mcp-hub.pid");
+    std::fs::write(&pid, "not a pid").expect("write pid");
+    std::fs::write(&sock, b"").expect("leftover socket file");
+
+    check_existing_daemon(&sock, &pid).expect("garbage PID file is stale");
+    assert!(!sock.exists());
+    assert!(!pid.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn pid_file_lock_blocks_second_writer_and_check() {
+    use mcp_hub::daemon::check_existing_daemon;
+
+    let dir = TempDir::new().expect("temp dir");
+    let sock = dir.path().join("mcp-hub.sock");
+    let pid_file = dir.path().join("mcp-hub.pid");
+
+    let lock = write_pid_file(&pid_file).expect("first writer takes the lock");
+
+    // A second writer must fail without clobbering the recorded PID.
+    assert!(
+        write_pid_file(&pid_file).is_err(),
+        "second write_pid_file must fail while the lock is held"
+    );
+    let content = std::fs::read_to_string(&pid_file).expect("read pid");
+    assert_eq!(content.trim(), std::process::id().to_string());
+
+    let err = check_existing_daemon(&sock, &pid_file).expect_err("lock held means running");
+    assert!(err.to_string().contains("already running"), "got: {err}");
+
+    // Once the holder is gone the lock is free again.
+    drop(lock);
+    remove_pid_file(&pid_file);
+    write_pid_file(&pid_file).expect("lock is reusable after release");
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // DaemonRequest serialization round-trip
 // ─────────────────────────────────────────────────────────────────────────────

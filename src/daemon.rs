@@ -89,10 +89,100 @@ pub fn pid_path() -> anyhow::Result<PathBuf> {
 // PID file management
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Write the current process ID to `path`.
-pub fn write_pid_file(path: &std::path::Path) -> anyhow::Result<()> {
+/// An exclusive advisory lock on the PID file, held for the daemon's lifetime.
+///
+/// The lock lives on the open file description, so it is released when this
+/// guard is dropped or the process dies (even via `SIGKILL`). The descriptor is
+/// `O_CLOEXEC`, so managed servers never inherit it.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct PidFileLock {
+    _file: nix::fcntl::Flock<std::fs::File>,
+}
+
+/// Non-Unix stub: there is no daemon mode, hence nothing to lock.
+#[cfg(not(unix))]
+#[derive(Debug)]
+pub struct PidFileLock;
+
+/// Take an exclusive, non-blocking `flock` on `file`.
+///
+/// `Ok(None)` means another process holds the lock.
+#[cfg(unix)]
+fn try_lock_exclusive(
+    file: std::fs::File,
+) -> std::io::Result<Option<nix::fcntl::Flock<std::fs::File>>> {
+    use nix::errno::Errno;
+    use nix::fcntl::{Flock, FlockArg};
+
+    match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+        Ok(lock) => Ok(Some(lock)),
+        Err((_, Errno::EWOULDBLOCK)) => Ok(None),
+        Err((_, errno)) => Err(std::io::Error::from(errno)),
+    }
+}
+
+/// Write the current process ID to `path` and lock it exclusively.
+///
+/// The returned guard must be kept alive for as long as the daemon runs: it is
+/// what makes a second daemon (and `check_existing_daemon`) see this one as
+/// running. Fails if another process already holds the lock; the existing
+/// file's contents are left untouched in that case.
+#[cfg(unix)]
+pub fn write_pid_file(path: &std::path::Path) -> anyhow::Result<PidFileLock> {
+    use std::io::Write as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    let fail = |e: &dyn std::fmt::Display| {
+        anyhow::anyhow!("Failed to write PID file {}: {e}", path.display())
+    };
+
+    // Retry if the file is unlinked between our open and our lock (a daemon
+    // exiting removes its PID file): a lock on an unlinked inode protects nothing.
+    for _ in 0..5 {
+        // No truncation before the lock is held: a losing writer must not
+        // clobber the running daemon's PID.
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)
+            .map_err(|e| fail(&e))?;
+        let Some(mut lock) = try_lock_exclusive(file).map_err(|e| fail(&e))? else {
+            anyhow::bail!(
+                "Failed to write PID file {}: another daemon holds the lock \
+                 (already running)",
+                path.display()
+            );
+        };
+
+        let locked = lock.metadata().map_err(|e| fail(&e))?;
+        let linked = match std::fs::metadata(path) {
+            Ok(m) => m.dev() == locked.dev() && m.ino() == locked.ino(),
+            Err(_) => false,
+        };
+        if !linked {
+            continue;
+        }
+
+        lock.set_len(0).map_err(|e| fail(&e))?;
+        lock.write_all(std::process::id().to_string().as_bytes())
+            .map_err(|e| fail(&e))?;
+        lock.flush().map_err(|e| fail(&e))?;
+        return Ok(PidFileLock { _file: lock });
+    }
+    anyhow::bail!(
+        "Failed to write PID file {}: file kept disappearing while locking",
+        path.display()
+    )
+}
+
+/// Non-Unix stub: write the PID without locking.
+#[cfg(not(unix))]
+pub fn write_pid_file(path: &std::path::Path) -> anyhow::Result<PidFileLock> {
     std::fs::write(path, std::process::id().to_string())
-        .map_err(|e| anyhow::anyhow!("Failed to write PID file {}: {e}", path.display()))
+        .map_err(|e| anyhow::anyhow!("Failed to write PID file {}: {e}", path.display()))?;
+    Ok(PidFileLock)
 }
 
 /// Remove the PID file at `path`, silently ignoring errors.
@@ -107,12 +197,19 @@ pub fn remove_pid_file(path: &std::path::Path) {
 /// Check whether a daemon is already running by attempting a synchronous
 /// connect to `sock_path`.
 ///
-/// - If the connect succeeds, a live daemon is running — returns an error.
-/// - If the connect fails, there is no live daemon; stale socket/PID files
-///   are cleaned up and `Ok(())` is returned.
+/// A daemon counts as running when any of these holds:
+/// - another process holds the exclusive lock on the PID file (see
+///   [`write_pid_file`]),
+/// - the control socket accepts a connection, or
+/// - the PID recorded in the PID file is alive.
+///
+/// In those cases an error naming the PID and socket is returned and nothing
+/// is deleted. Only when none holds (dead PID, unreadable PID file, or no PID
+/// file) are the leftover socket and PID file removed and `Ok(())` returned.
 ///
 /// This must be called *before* `daemonize_process()` and *before* the Tokio
-/// runtime is created.
+/// runtime is created. The daemon itself closes the remaining race by locking
+/// the PID file in [`write_pid_file`], which fails if another daemon won.
 #[cfg(unix)]
 pub fn check_existing_daemon(
     sock_path: &std::path::Path,
@@ -120,64 +217,105 @@ pub fn check_existing_daemon(
 ) -> anyhow::Result<()> {
     use std::os::unix::net::UnixStream as StdUnixStream;
 
-    match StdUnixStream::connect(sock_path) {
-        Ok(_) => {
-            // Socket is live — a daemon is already running.
-            anyhow::bail!(
-                "A daemon is already running (socket: {}). Use `mcp-hub stop` to stop it.",
+    // Hold the lock (if the file exists) while we inspect and clean up, so a
+    // daemon that is mid-startup cannot have its files removed under it.
+    let _guard = match std::fs::File::open(pid_path) {
+        Ok(file) => match try_lock_exclusive(file) {
+            Ok(Some(guard)) => Some(guard),
+            Ok(None) => anyhow::bail!(
+                "A daemon is already running ({}; socket: {}). Use `mcp-hub stop` to stop it.",
+                describe_recorded_pid(pid_path),
                 sock_path.display()
+            ),
+            Err(e) => anyhow::bail!("Failed to lock PID file {}: {e}", pid_path.display()),
+        },
+        Err(_) => None,
+    };
+
+    if StdUnixStream::connect(sock_path).is_ok() {
+        anyhow::bail!(
+            "A daemon is already running (socket: {}). Use `mcp-hub stop` to stop it.",
+            sock_path.display()
+        );
+    }
+
+    if let Some(pid) = read_recorded_pid(pid_path) {
+        if pid_is_alive(pid) {
+            anyhow::bail!(
+                "A daemon with PID {pid} is already running (socket: {}, PID file: {}). \
+                 Use `mcp-hub stop` to stop it.",
+                sock_path.display(),
+                pid_path.display()
             );
         }
-        Err(_) => {
-            // Socket not connectable. Remove any stale files.
-            cleanup_stale_files(sock_path, pid_path);
-            Ok(())
-        }
+        tracing::info!("Cleaning up stale daemon files (PID {pid} is dead)");
+    }
+
+    // No live daemon: remove what a dead one left behind.
+    cleanup_stale_files(sock_path, pid_path);
+    Ok(())
+}
+
+/// The PID recorded in `pid_path`, if the file exists and holds a valid PID.
+#[cfg(unix)]
+fn read_recorded_pid(pid_path: &std::path::Path) -> Option<i32> {
+    std::fs::read_to_string(pid_path)
+        .ok()?
+        .trim()
+        .parse::<i32>()
+        // 0 and negative values would make `kill` address process groups.
+        .ok()
+        .filter(|pid| *pid > 0)
+}
+
+/// Human-readable form of the PID recorded in `pid_path`, for error messages.
+#[cfg(unix)]
+fn describe_recorded_pid(pid_path: &std::path::Path) -> String {
+    match read_recorded_pid(pid_path) {
+        Some(pid) => format!("PID {pid}"),
+        None => format!("PID file {} is locked", pid_path.display()),
     }
 }
 
-/// Remove stale socket and PID files left behind by a dead daemon process.
+/// Whether process `pid` exists (`kill(pid, 0)`); `EPERM` still means it exists.
 ///
-/// Uses `kill(pid, 0)` to check whether the process is still alive:
-/// - `ESRCH` → process is dead → remove both files.
-/// - `Ok(())` → process is alive but socket is broken → remove socket only.
-/// - Other errors → remove both files to be safe.
+/// On Linux a zombie (killed but not yet reaped, e.g. by a slow init) counts as
+/// dead: it holds no sockets or locks any more.
+#[cfg(unix)]
+fn pid_is_alive(pid: i32) -> bool {
+    use nix::errno::Errno;
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+
+    match kill(Pid::from_raw(pid), None) {
+        Ok(()) | Err(Errno::EPERM) => !is_zombie(pid),
+        Err(Errno::ESRCH) => false,
+        // Anything else cannot be a live process we could be racing with.
+        Err(_) => false,
+    }
+}
+
+/// True if `/proc/<pid>/stat` reports state `Z` (always false off Linux).
+#[cfg(unix)]
+fn is_zombie(pid: i32) -> bool {
+    // Format: `pid (comm) S ...`; `comm` may contain spaces and parentheses,
+    // so the state follows the *last* `)`.
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            stat.rsplit_once(')')
+                .map(|(_, rest)| rest.trim_start().starts_with('Z'))
+        })
+        .unwrap_or(false)
+}
+
+/// Remove the socket and PID file left behind by a dead daemon.
+///
+/// Callers must have established that no live daemon owns them.
 #[cfg(unix)]
 fn cleanup_stale_files(sock_path: &std::path::Path, pid_path: &std::path::Path) {
-    if let Ok(pid_str) = std::fs::read_to_string(pid_path) {
-        if let Ok(pid) = pid_str.trim().parse::<i32>() {
-            use nix::sys::signal::kill;
-            use nix::unistd::Pid;
-
-            match kill(Pid::from_raw(pid), None) {
-                Err(nix::errno::Errno::ESRCH) => {
-                    // Process is dead — remove both stale files.
-                    tracing::info!("Cleaning up stale daemon files (PID {pid} is dead)");
-                    let _ = std::fs::remove_file(sock_path);
-                    let _ = std::fs::remove_file(pid_path);
-                }
-                Ok(()) => {
-                    // Process is alive but socket is not connectable — unusual.
-                    // Remove stale socket so we can bind a new one.
-                    tracing::warn!(
-                        "PID {pid} is alive but socket is not connectable — removing stale socket"
-                    );
-                    let _ = std::fs::remove_file(sock_path);
-                }
-                Err(_) => {
-                    // Permission or other error — clean up both to be safe.
-                    let _ = std::fs::remove_file(sock_path);
-                    let _ = std::fs::remove_file(pid_path);
-                }
-            }
-            return;
-        }
-    }
-
-    // No PID file (or parse error) — remove the stale socket if it exists.
-    if sock_path.exists() {
-        let _ = std::fs::remove_file(sock_path);
-    }
+    let _ = std::fs::remove_file(sock_path);
+    let _ = std::fs::remove_file(pid_path);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
