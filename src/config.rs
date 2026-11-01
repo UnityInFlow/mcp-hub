@@ -275,6 +275,9 @@ pub fn expand_config(
 ///
 /// Unknown fields produce warnings; invalid TOML, schema violations, or
 /// unresolvable `${VAR}` references are errors. See [`load_config_report`].
+// Used by the library API and tests; the binary goes through
+// `load_config_report` (see #29 for the bin/lib double compilation).
+#[allow(dead_code)]
 pub fn load_config(path: &std::path::Path) -> anyhow::Result<HubConfig> {
     load_config_report(path).map(|(config, _secrets)| config)
 }
