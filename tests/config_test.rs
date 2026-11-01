@@ -113,3 +113,75 @@ command = "echo"
         .expect("default-transport server should exist");
     assert_eq!(server.transport, "stdio");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ${VAR} expansion (issue #36)
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn write_config(dir: &tempfile::TempDir, toml: &str) -> PathBuf {
+    let path = dir.path().join("mcp-hub.toml");
+    std::fs::write(&path, toml).expect("write config");
+    path
+}
+
+#[test]
+fn test_load_config_expands_env_and_args() {
+    std::env::set_var("MCPHUB_T36_TOKEN", "abc123");
+    std::env::remove_var("MCPHUB_T36_UNSET");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = write_config(
+        &dir,
+        r#"
+[servers.gh]
+command = "npx"
+args = ["--token=${MCPHUB_T36_TOKEN}", "--mode=${MCPHUB_T36_UNSET:-dev}", "$${LITERAL}"]
+env = { PAT = "${MCPHUB_T36_TOKEN}", PLAIN = "x" }
+"#,
+    );
+    let config = load_config(&path).expect("should load");
+    let gh = &config.servers["gh"];
+    assert_eq!(gh.args, vec!["--token=abc123", "--mode=dev", "${LITERAL}"]);
+    assert_eq!(gh.env["PAT"], "abc123");
+    assert_eq!(gh.env["PLAIN"], "x");
+}
+
+#[test]
+fn test_load_config_unset_var_error_names_server_field_and_var() {
+    std::env::remove_var("MCPHUB_T36_DEFINITELY_UNSET");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = write_config(
+        &dir,
+        r#"
+[servers.gh]
+command = "npx"
+env = { PAT = "${MCPHUB_T36_DEFINITELY_UNSET}" }
+"#,
+    );
+    let err = load_config(&path)
+        .expect_err("unset var must error")
+        .to_string();
+    assert!(err.contains("gh"), "missing server name: {err}");
+    assert!(err.contains("env.PAT"), "missing field: {err}");
+    assert!(
+        err.contains("MCPHUB_T36_DEFINITELY_UNSET"),
+        "missing var: {err}"
+    );
+}
+
+#[test]
+fn test_env_file_values_are_not_expanded() {
+    std::env::set_var("MCPHUB_T36_OTHER", "should-not-appear");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let env_file = dir.path().join("secrets.env");
+    std::fs::write(&env_file, "FROM_FILE=${MCPHUB_T36_OTHER}\n").expect("write env file");
+    let path = write_config(
+        &dir,
+        &format!(
+            "[servers.s]\ncommand = \"echo\"\nenv_file = '{}'\n",
+            env_file.display()
+        ),
+    );
+    let config = load_config(&path).expect("should load");
+    let resolved = resolve_env(&config.servers["s"]).expect("resolve");
+    assert_eq!(resolved["FROM_FILE"], "${MCPHUB_T36_OTHER}");
+}

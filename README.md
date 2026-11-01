@@ -73,7 +73,7 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
 [servers.github]
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-github"]
-env_file = ".env"   # put GITHUB_PERSONAL_ACCESS_TOKEN=... in .env (values are not ${VAR}-expanded)
+env = { GITHUB_PERSONAL_ACCESS_TOKEN = "${GITHUB_TOKEN}" }
 ```
 
 Then start all servers:
@@ -109,7 +109,7 @@ web_port = 3456          # Web UI port (default: 3456)
 [servers.my-server]
 command = "npx"          # Executable to run (required, must not be empty)
 args = ["-y", "@scope/server"]  # Arguments passed to the executable (default: [])
-env = { LOG_LEVEL = "info" }  # Inline environment variables, passed literally (default: none)
+env = { LOG_LEVEL = "info" }  # Inline environment variables; ${VAR} is expanded (default: none)
 env_file = ".env"        # Path to a KEY=VALUE file (# comments ok); its values override `env` (default: none)
 transport = "stdio"      # "stdio" or "http" (default: "stdio")
 cwd = "/path/to/project" # Working directory for the process (default: inherited)
@@ -118,7 +118,16 @@ max_retries = 10         # Consecutive crashes before marking Fatal (default: 10
 restart_delay = 1        # Base restart backoff delay in seconds (default: 1)
 ```
 
-> **Note:** `${VAR}` references in `env` values are not expanded; the string is passed to the server as written. Use `env_file` for secrets so they stay out of the config.
+### Environment variable expansion
+
+`env` values and `args` may reference the environment `mcp-hub` itself runs in, so secrets can stay out of the config file:
+
+- `${NAME}` is replaced by the value of `NAME`. If `NAME` is not set, loading the config fails with an error naming the server, the field and the variable.
+- `${NAME:-default}` uses `default` (which may be empty) when `NAME` is unset or empty.
+- `$${` is an escape and produces a literal `${`.
+- A lone `$` or `$NAME` without braces is left as written. `NAME` must match `[A-Za-z_][A-Za-z0-9_]*`, and an unterminated `${` is an error.
+
+`command`, `cwd` and `env_file` are not expanded, and values read from `env_file` are always literal; `env_file` remains the alternative for secrets you would rather keep in a separate file. `mcp-hub gen-config` writes the expanded values (that is what ends up in `.mcp.json`), and prints a warning on stderr when one of them came from a variable whose name contains `TOKEN`, `SECRET`, `KEY` or `PASSWORD`.
 
 > **Note:** `max_retries` and `restart_delay` are currently parsed but not applied by the supervisor, which always uses its built-in defaults (tracked in [#15](https://github.com/UnityInFlow/mcp-hub/issues/15)). Setting them has no effect until that lands.
 
