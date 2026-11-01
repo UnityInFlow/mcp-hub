@@ -33,6 +33,45 @@ pub fn socket_path() -> anyhow::Result<PathBuf> {
     Ok(dir.join("mcp-hub.sock"))
 }
 
+/// Resolve the daemon log file path.
+///
+/// `explicit` (from `--log-file` / `MCP_HUB_LOG_FILE`) wins; otherwise the log
+/// lives next to the control socket as `daemon.log`, so a `MCP_HUB_SOCKET`
+/// override keeps test daemons isolated.
+pub fn log_path(explicit: Option<&std::path::Path>) -> anyhow::Result<PathBuf> {
+    if let Some(p) = explicit {
+        return Ok(p.to_path_buf());
+    }
+    let sock = socket_path()?;
+    let dir = sock
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Socket path {} has no parent", sock.display()))?;
+    Ok(dir.join("daemon.log"))
+}
+
+/// Open (creating if needed) the daemon log file for appending, mode 0600.
+///
+/// The mode is enforced on pre-existing files too, since the log can contain
+/// MCP server output.
+#[cfg(unix)]
+pub fn open_log_file(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow::anyhow!("Failed to create {}: {e}", parent.display()))?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| anyhow::anyhow!("Failed to open log file {}: {e}", path.display()))?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| anyhow::anyhow!("Failed to chmod log file {}: {e}", path.display()))?;
+    Ok(file)
+}
+
 /// Resolve the daemon PID file path: `~/.config/mcp-hub/mcp-hub.pid`
 ///
 /// The path can be overridden with the `MCP_HUB_PID` environment variable.
@@ -279,7 +318,8 @@ fn wait_for_ready(pipe: &mut std::fs::File, timeout: std::time::Duration) -> Rea
 ///    (startup failed / timed out), relaying the daemon's error to its stderr.
 /// 2. `setsid()` — create a new session so the daemon has no controlling terminal.
 /// 3. Second fork — ensures the daemon cannot re-acquire a controlling terminal.
-/// 4. Redirects stdin/stdout/stderr to `/dev/null`.
+/// 4. Redirects stdin to `/dev/null` and stdout/stderr to the log file at
+///    `log_path` (opened before forking so problems surface in the terminal).
 ///
 /// Only the daemon returns from this function; it receives the
 /// [`ReadyNotifier`] it must call once startup finished (or failed).
@@ -290,9 +330,12 @@ fn wait_for_ready(pipe: &mut std::fs::File, timeout: std::time::Duration) -> Rea
 /// Note: `nix::unistd::daemon()` is only available on Linux/FreeBSD/Solaris;
 /// this implementation works on any Unix including macOS.
 #[cfg(unix)]
-pub fn daemonize_process() -> anyhow::Result<ReadyNotifier> {
+pub fn daemonize_process(log_path: &std::path::Path) -> anyhow::Result<ReadyNotifier> {
     use nix::fcntl::OFlag;
     use nix::unistd::{fork, pipe2, ForkResult};
+
+    // Open the log before forking: a bad path is reported on the terminal.
+    let log_file = open_log_file(log_path)?;
 
     // CLOEXEC so the managed MCP servers never inherit the pipe and keep the
     // parent waiting after the daemon is done with it.
@@ -308,7 +351,7 @@ pub fn daemonize_process() -> anyhow::Result<ReadyNotifier> {
             let mut pipe = std::fs::File::from(read_fd);
             let code = match wait_for_ready(&mut pipe, READY_TIMEOUT) {
                 ReadyOutcome::Ready { pid } => {
-                    println!("Daemon started (pid {pid})");
+                    println!("Daemon started (pid {pid}), logs: {}", log_path.display());
                     0
                 }
                 ReadyOutcome::Failed(message) => {
@@ -338,7 +381,7 @@ pub fn daemonize_process() -> anyhow::Result<ReadyNotifier> {
 
     // Everything between here and the return reports failures to the parent
     // before propagating them, since stderr is about to disappear.
-    match detach_from_terminal() {
+    match detach_from_terminal(&log_file) {
         Ok(()) => Ok(notifier),
         Err(e) => {
             notifier.fail(&format!("{e:#}"));
@@ -350,7 +393,7 @@ pub fn daemonize_process() -> anyhow::Result<ReadyNotifier> {
 /// `setsid`, second fork, and stdio redirection — the daemon-side half of
 /// [`daemonize_process`].
 #[cfg(unix)]
-fn detach_from_terminal() -> anyhow::Result<()> {
+fn detach_from_terminal(log_file: &std::fs::File) -> anyhow::Result<()> {
     use nix::unistd::{fork, setsid, ForkResult};
 
     // Create a new session — detach from the controlling terminal.
@@ -366,15 +409,15 @@ fn detach_from_terminal() -> anyhow::Result<()> {
         ForkResult::Child => {}
     }
 
-    // Redirect stdin/stdout/stderr to /dev/null.
-    redirect_to_dev_null()
+    // stdin from /dev/null; stdout and stderr into the log file.
+    redirect_stdio(log_file)
 }
 
-/// Redirect the standard file descriptors to `/dev/null`.
+/// Point stdin at `/dev/null` and stdout/stderr at `log_file`.
 #[cfg(unix)]
-fn redirect_to_dev_null() -> anyhow::Result<()> {
+fn redirect_stdio(log_file: &std::fs::File) -> anyhow::Result<()> {
     use std::fs::OpenOptions;
-    use std::os::unix::io::IntoRawFd;
+    use std::os::unix::io::AsRawFd as _;
 
     let devnull = OpenOptions::new()
         .read(true)
@@ -382,28 +425,29 @@ fn redirect_to_dev_null() -> anyhow::Result<()> {
         .open("/dev/null")
         .map_err(|e| anyhow::anyhow!("Failed to open /dev/null: {e}"))?;
 
-    let fd = devnull.into_raw_fd();
-
-    // SAFETY: dup2 is safe when both fds are valid.
-    for target_fd in [0i32, 1, 2] {
-        if unsafe { nix::libc::dup2(fd, target_fd) } == -1 {
+    let redirects = [
+        (devnull.as_raw_fd(), 0i32),
+        (log_file.as_raw_fd(), 1),
+        (log_file.as_raw_fd(), 2),
+    ];
+    for (source_fd, target_fd) in redirects {
+        // SAFETY: dup2 is safe when both fds are valid; `devnull` and
+        // `log_file` outlive this loop.
+        if unsafe { nix::libc::dup2(source_fd, target_fd) } == -1 {
             return Err(anyhow::anyhow!(
-                "dup2(/dev/null, {target_fd}) failed: {}",
+                "dup2({source_fd}, {target_fd}) failed: {}",
                 std::io::Error::last_os_error()
             ));
         }
     }
 
-    // Close the extra fd (only if it is not one of the standard ones).
-    if fd > 2 {
-        unsafe { nix::libc::close(fd) };
-    }
-
+    // `devnull` and `log_file` are dropped (closed) by their owners; fds 0-2
+    // keep the duplicated descriptions open.
     Ok(())
 }
 
 /// Daemon mode is not supported on Windows.
 #[cfg(not(unix))]
-pub fn daemonize_process() -> anyhow::Result<ReadyNotifier> {
+pub fn daemonize_process(_log_path: &std::path::Path) -> anyhow::Result<ReadyNotifier> {
     anyhow::bail!("Daemon mode is not supported on Windows. Use foreground mode instead.")
 }

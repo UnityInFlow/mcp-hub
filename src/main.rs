@@ -55,13 +55,19 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // Detect whether `--daemon` was requested so we can fork before Tokio starts.
-    let is_daemon = matches!(cli.command, Commands::Start { daemon: true });
+    let is_daemon = matches!(cli.command, Commands::Start { daemon: true, .. });
 
     #[cfg_attr(not(unix), allow(unused_mut))]
     let mut startup: Option<DaemonStartup> = None;
 
     #[cfg(unix)]
     if is_daemon {
+        let log_file = if let Commands::Start { log_file, .. } = &cli.command {
+            log_file.clone()
+        } else {
+            None
+        };
+        let log_path = daemon::log_path(log_file.as_deref())?;
         let sock = daemon::socket_path()?;
         let pid = daemon::pid_path()?;
         // If a live daemon is already running, bail out here (before fork).
@@ -71,7 +77,7 @@ fn main() -> anyhow::Result<()> {
         let config = load_start_config(cli.config.as_deref())?;
         // Fork into background — the original process waits for readiness and
         // exits inside this call; only the daemon returns.
-        let notifier = daemon::daemonize_process()?;
+        let notifier = daemon::daemonize_process(&log_path)?;
         // We are now the daemon child. Write our PID.
         if let Err(e) = daemon::write_pid_file(&pid) {
             notifier.fail(&format!("{e:#}"));
@@ -302,11 +308,19 @@ async fn run_daemon_inner(
 
 /// Async main — all Tokio-dependent code lives here.
 async fn async_main(cli: Cli, startup: Option<DaemonStartup>) -> anyhow::Result<()> {
-    output::configure_tracing(cli.verbose);
+    // A daemon has no terminal to be quiet for: its log file is the only record
+    // of bind failures, reloads, backoff and Fatal transitions, so log at least
+    // `info` there.
+    let verbose = if startup.is_some() {
+        cli.verbose.max(1)
+    } else {
+        cli.verbose
+    };
+    output::configure_tracing(verbose);
     let color = output::use_colors(cli.no_color);
 
     match cli.command {
-        Commands::Start { daemon } => {
+        Commands::Start { daemon, .. } => {
             if daemon {
                 let startup = startup
                     .ok_or_else(|| anyhow::anyhow!("Daemon startup state missing after fork"))?;

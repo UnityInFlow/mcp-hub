@@ -467,4 +467,129 @@ transport = "stdio"
         );
         drop(blocker);
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // #19: the daemon logs to a file instead of /dev/null
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Config with one server that prints a line on stderr and then idles.
+    fn write_chatty_config(dir: &TempDir) -> NamedTempFile {
+        let mut f = NamedTempFile::new_in(dir.path()).expect("tempfile");
+        writeln!(
+            f,
+            r#"
+[hub]
+web_port = {}
+
+[servers.chatty]
+command = "bash"
+args = ["-c", "echo child-stderr-line >&2; sleep 9999"]
+transport = "stdio"
+"#,
+            free_port()
+        )
+        .expect("write config");
+        f
+    }
+
+    /// Poll until `path` contains `needle` (the daemon logs asynchronously).
+    fn log_contains(path: &PathBuf, needle: &str) -> bool {
+        wait_for(
+            || {
+                std::fs::read_to_string(path)
+                    .map(|s| s.contains(needle))
+                    .unwrap_or(false)
+            },
+            Duration::from_secs(5),
+        )
+    }
+
+    #[test]
+    fn daemon_logs_to_file_from_env() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let paths = TestDaemonPaths::new();
+        let cfg_dir = TempDir::new().expect("cfg tempdir");
+        let config = write_chatty_config(&cfg_dir);
+        let log = paths.sock.parent().expect("parent").join("custom.log");
+
+        let start = mcp_hub()
+            .args(["start", "--daemon", "-c", config.path().to_str().unwrap()])
+            .envs(paths.env_overrides())
+            .env("MCP_HUB_LOG_FILE", &log)
+            .output()
+            .expect("start daemon");
+        let status = mcp_hub()
+            .arg("status")
+            .envs(paths.env_overrides())
+            .output()
+            .expect("status");
+        let found_listening = log_contains(&log, "Control socket listening");
+        let found_child = log_contains(&log, "child-stderr-line");
+        let mode = std::fs::metadata(&log).map(|m| m.permissions().mode() & 0o777);
+
+        let _ = mcp_hub().arg("stop").envs(paths.env_overrides()).output();
+
+        assert!(
+            start.status.success(),
+            "start --daemon should exit 0; stderr: {}",
+            String::from_utf8_lossy(&start.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&start.stdout);
+        assert!(
+            stdout.contains("Daemon started (pid") && stdout.contains(log.to_str().unwrap()),
+            "start should print pid and log path, got: {stdout}"
+        );
+
+        assert!(status.status.success(), "status should work");
+        assert!(
+            found_listening,
+            "log should contain the control socket line"
+        );
+        assert!(found_child, "log should contain the child's stderr line");
+        assert_eq!(mode.expect("log file exists"), 0o600, "log must be 0600");
+    }
+
+    #[test]
+    fn daemon_log_defaults_next_to_socket_and_flag_beats_env() {
+        // Default: <socket dir>/daemon.log.
+        let paths = TestDaemonPaths::new();
+        let cfg_dir = TempDir::new().expect("cfg tempdir");
+        let config = write_chatty_config(&cfg_dir);
+        let default_log = paths.sock.parent().expect("parent").join("daemon.log");
+
+        let start = mcp_hub()
+            .args(["start", "--daemon", "-c", config.path().to_str().unwrap()])
+            .envs(paths.env_overrides())
+            .output()
+            .expect("start daemon");
+        let default_ok = start.status.success() && log_contains(&default_log, "Control socket");
+        let _ = mcp_hub().arg("stop").envs(paths.env_overrides()).output();
+        assert!(default_ok, "default log should be <socket dir>/daemon.log");
+        wait_for(|| !paths.sock.exists(), Duration::from_secs(8));
+
+        // --log-file wins over MCP_HUB_LOG_FILE.
+        let flag_log = paths.sock.parent().expect("parent").join("flag.log");
+        let env_log = paths.sock.parent().expect("parent").join("env.log");
+        let start = mcp_hub()
+            .args([
+                "start",
+                "--daemon",
+                "-c",
+                config.path().to_str().unwrap(),
+                "--log-file",
+                flag_log.to_str().unwrap(),
+            ])
+            .envs(paths.env_overrides())
+            .env("MCP_HUB_LOG_FILE", &env_log)
+            .output()
+            .expect("start daemon with flag");
+        let flag_ok = start.status.success() && log_contains(&flag_log, "Control socket");
+        let _ = mcp_hub().arg("stop").envs(paths.env_overrides()).output();
+        assert!(flag_ok, "--log-file should be used");
+        assert!(
+            !env_log.exists(),
+            "env log must be ignored when flag is set"
+        );
+    }
 }

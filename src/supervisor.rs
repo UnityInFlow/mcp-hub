@@ -85,13 +85,20 @@ pub fn spawn_server(
                 while let Ok(Some(line)) = lines.next_line().await {
                     // Push to the ring buffer and broadcast.
                     agg.push(&server_name, line.clone()).await;
-                    // Also format and print to terminal stderr.
+                    // Also format and print to stderr (the log file in daemon mode).
                     let log_line = crate::logs::LogLine {
                         server: server_name.clone(),
                         timestamp: std::time::SystemTime::now(),
                         message: line,
                     };
-                    eprintln!("{}", crate::logs::format_log_line(&log_line, false));
+                    // `eprintln!` panics if stderr is closed, which would kill this
+                    // drain and block the child on a full pipe; ignore write errors.
+                    use std::io::Write as _;
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "{}",
+                        crate::logs::format_log_line(&log_line, false)
+                    );
                 }
             });
         } else {
