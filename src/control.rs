@@ -10,8 +10,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
+use crate::config::HubConfig;
 use crate::logs::LogAggregator;
 use crate::supervisor::ServerHandle;
+use crate::web::SharedServerViews;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // IPC message types
@@ -101,6 +103,81 @@ pub struct DaemonState {
     /// Reserved for future use when log output is colorized in the daemon.
     #[allow(dead_code)]
     pub color: bool,
+    /// Explicit `--config` path used by reloads (`None` = default search).
+    pub config_path: Option<std::path::PathBuf>,
+    /// The config the running servers were started from; reloads diff against it.
+    ///
+    /// Holding this lock serialises reloads (SIGHUP and `Reload` requests).
+    pub current_config: tokio::sync::Mutex<HubConfig>,
+    /// Snapshot views published to the web UI; refreshed after every reload.
+    pub views: SharedServerViews,
+}
+
+/// What a successful config reload changed (server counts).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReloadSummary {
+    /// Servers newly started.
+    pub added: usize,
+    /// Servers stopped because they left the config.
+    pub removed: usize,
+    /// Servers restarted because their config changed.
+    pub changed: usize,
+    /// Servers left running untouched.
+    pub unchanged: usize,
+}
+
+impl std::fmt::Display for ReloadSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} added, {} removed, {} changed, {} unchanged",
+            self.added, self.removed, self.changed, self.unchanged
+        )
+    }
+}
+
+/// Reload the config from disk and apply the difference to the running servers.
+///
+/// Used by both the `Reload` control request and the SIGHUP handler. On error
+/// (unreadable or invalid config) nothing is touched: the servers keep running
+/// from the previous config.
+pub async fn reload_config(state: &DaemonState) -> anyhow::Result<ReloadSummary> {
+    // Held for the whole reload so concurrent reloads cannot interleave.
+    let mut current = state.current_config.lock().await;
+
+    let new_config = crate::config::find_and_load_config(state.config_path.as_deref())?;
+
+    let (added, removed, changed) = crate::supervisor::apply_config_diff(
+        &state.handles,
+        &current,
+        &new_config,
+        &state.shutdown,
+        &state.log_agg,
+    )
+    .await;
+
+    // Publish the new handle set to the web UI only now, with a brief lock;
+    // until here it kept serving the previous snapshots.
+    {
+        let handles = state.handles.lock().await;
+        crate::web::publish_server_views(&state.views, &handles).await;
+    }
+
+    let summary = ReloadSummary {
+        added,
+        removed,
+        changed,
+        unchanged: new_config.servers.len().saturating_sub(added + changed),
+    };
+    *current = new_config;
+    tracing::info!(
+        added = summary.added,
+        removed = summary.removed,
+        changed = summary.changed,
+        unchanged = summary.unchanged,
+        "Config reload complete"
+    );
+    Ok(summary)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -311,19 +388,16 @@ async fn dispatch_request(request: DaemonRequest, state: &DaemonState) -> Daemon
             }
         },
 
-        DaemonRequest::Reload => {
-            // Send SIGHUP to self so the main event loop's sighup handler triggers
-            // the config reload without requiring a separate reload channel.
-            {
-                use nix::sys::signal::{kill, Signal};
-                use nix::unistd::Pid;
-                let pid = Pid::from_raw(std::process::id() as i32);
-                match kill(pid, Signal::SIGHUP) {
-                    Ok(()) => DaemonResponse::ok_empty(),
-                    Err(e) => DaemonResponse::err(format!("Failed to send SIGHUP: {e}")),
-                }
+        DaemonRequest::Reload => match reload_config(state).await {
+            Ok(summary) => match serde_json::to_value(summary) {
+                Ok(data) => DaemonResponse::success(data),
+                Err(e) => DaemonResponse::err(format!("Failed to encode reload summary: {e}")),
+            },
+            Err(e) => {
+                tracing::error!("Config reload failed: {e:#}");
+                DaemonResponse::err(format!("{e:#}"))
             }
-        }
+        },
     }
 }
 

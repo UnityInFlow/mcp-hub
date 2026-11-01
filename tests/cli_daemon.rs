@@ -592,4 +592,140 @@ transport = "stdio"
             "env log must be ignored when flag is set"
         );
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // #20: `reload` returns the real outcome
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Config text with the given server names (each a `sleep` server) on `port`.
+    fn config_text(port: u16, servers: &[&str]) -> String {
+        let mut text = format!("[hub]\nweb_port = {port}\n");
+        for name in servers {
+            text.push_str(&format!(
+                "\n[servers.{name}]\ncommand = \"sleep\"\nargs = [\"9999\"]\ntransport = \"stdio\"\n"
+            ));
+        }
+        text
+    }
+
+    #[test]
+    fn reload_reports_parse_error_then_summary() {
+        let paths = TestDaemonPaths::new();
+        let cfg_dir = TempDir::new().expect("cfg tempdir");
+        let cfg_path = cfg_dir.path().join("hub.toml");
+        let port = free_port();
+        std::fs::write(&cfg_path, config_text(port, &["alpha"])).expect("write config A");
+
+        let start = mcp_hub()
+            .args(["start", "--daemon", "-c", cfg_path.to_str().unwrap()])
+            .envs(paths.env_overrides())
+            .output()
+            .expect("start daemon");
+        assert!(
+            start.status.success(),
+            "start failed: {}",
+            String::from_utf8_lossy(&start.stderr)
+        );
+
+        // 1. Invalid TOML: reload must fail loudly and leave alpha running.
+        std::fs::write(&cfg_path, "this is = [not valid toml").expect("write bad config");
+        let bad = mcp_hub()
+            .arg("reload")
+            .envs(paths.env_overrides())
+            .output()
+            .expect("reload (bad config)");
+        let status_after_bad = mcp_hub()
+            .arg("status")
+            .envs(paths.env_overrides())
+            .output()
+            .expect("status after bad reload");
+
+        // 2. Valid config adding beta: reload succeeds with a summary.
+        std::fs::write(&cfg_path, config_text(port, &["alpha", "beta"])).expect("write config B");
+        let good = mcp_hub()
+            .arg("reload")
+            .envs(paths.env_overrides())
+            .output()
+            .expect("reload (good config)");
+        let status_after_good = mcp_hub()
+            .arg("status")
+            .envs(paths.env_overrides())
+            .output()
+            .expect("status after good reload");
+
+        let _ = mcp_hub().arg("stop").envs(paths.env_overrides()).output();
+
+        let bad_stderr = String::from_utf8_lossy(&bad.stderr);
+        let bad_stdout = String::from_utf8_lossy(&bad.stdout);
+        assert!(
+            !bad.status.success(),
+            "reload of an invalid config must exit non-zero; stdout: {bad_stdout}"
+        );
+        assert!(
+            bad_stderr.contains("Invalid TOML"),
+            "stderr should carry the parse error, got: {bad_stderr}"
+        );
+        assert!(
+            !bad_stdout.contains("Reload signal sent"),
+            "must not claim success, got: {bad_stdout}"
+        );
+        let status_bad = String::from_utf8_lossy(&status_after_bad.stdout);
+        assert!(
+            status_bad.contains("alpha") && status_bad.to_lowercase().contains("running"),
+            "alpha should still be running after a failed reload, got: {status_bad}"
+        );
+
+        let good_stdout = String::from_utf8_lossy(&good.stdout);
+        assert!(
+            good.status.success(),
+            "reload of a valid config must exit 0; stderr: {}",
+            String::from_utf8_lossy(&good.stderr)
+        );
+        assert!(
+            good_stdout.contains("1 added") && good_stdout.contains("0 removed"),
+            "summary should report 1 added / 0 removed, got: {good_stdout}"
+        );
+        let status_good = String::from_utf8_lossy(&status_after_good.stdout);
+        assert!(
+            status_good.contains("alpha") && status_good.contains("beta"),
+            "status should list both servers after reload, got: {status_good}"
+        );
+    }
+
+    #[test]
+    fn sighup_still_reloads_config() {
+        let paths = TestDaemonPaths::new();
+        let cfg_dir = TempDir::new().expect("cfg tempdir");
+        let cfg_path = cfg_dir.path().join("hub.toml");
+        let port = free_port();
+        std::fs::write(&cfg_path, config_text(port, &["alpha"])).expect("write config A");
+
+        let start = mcp_hub()
+            .args(["start", "--daemon", "-c", cfg_path.to_str().unwrap()])
+            .envs(paths.env_overrides())
+            .output()
+            .expect("start daemon");
+        assert!(start.status.success(), "start failed");
+
+        std::fs::write(&cfg_path, config_text(port, &["alpha", "gamma"])).expect("write config B");
+        let pid = read_pid(&paths.pid).expect("pid file");
+        let _ = std::process::Command::new("kill")
+            .args(["-HUP", &pid.to_string()])
+            .output();
+
+        let saw_gamma = wait_for(
+            || {
+                mcp_hub()
+                    .arg("status")
+                    .envs(paths.env_overrides())
+                    .output()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).contains("gamma"))
+                    .unwrap_or(false)
+            },
+            Duration::from_secs(5),
+        );
+
+        let _ = mcp_hub().arg("stop").envs(paths.env_overrides()).output();
+        assert!(saw_gamma, "SIGHUP should still apply the new config");
+    }
 }

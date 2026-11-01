@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use mcp_hub::config::{HubConfig, ServerConfig};
 use mcp_hub::logs::LogAggregator;
-use mcp_hub::supervisor::{apply_config_diff, start_all_servers};
+use mcp_hub::supervisor::{apply_config_diff, start_all_servers, ServerHandle};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -86,6 +86,20 @@ fn server_config_partial_eq() {
     assert_ne!(a, g, "Different cwd must not be equal");
 }
 
+/// Run `apply_config_diff` against a plain `Vec` of handles.
+async fn apply(
+    handles: &mut Vec<ServerHandle>,
+    old_cfg: &HubConfig,
+    new_cfg: &HubConfig,
+    shutdown: &CancellationToken,
+    log_agg: &Arc<LogAggregator>,
+) -> (usize, usize, usize) {
+    let shared = tokio::sync::Mutex::new(std::mem::take(handles));
+    let result = apply_config_diff(&shared, old_cfg, new_cfg, shutdown, log_agg).await;
+    *handles = shared.into_inner();
+    result
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // apply_config_diff tests (async — require a Tokio runtime)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -100,8 +114,7 @@ async fn unchanged_config_no_restarts() {
     assert_eq!(handles.len(), 1, "Should have 1 handle after start");
 
     // Diff with an identical config — nothing should change.
-    let (added, removed, changed) =
-        apply_config_diff(&mut handles, &cfg, &cfg, &shutdown, &log_agg).await;
+    let (added, removed, changed) = apply(&mut handles, &cfg, &cfg, &shutdown, &log_agg).await;
 
     assert_eq!(added, 0, "Unchanged config: no servers should be added");
     assert_eq!(removed, 0, "Unchanged config: no servers should be removed");
@@ -128,7 +141,7 @@ async fn add_new_server() {
     assert_eq!(handles.len(), 1);
 
     let (added, removed, changed) =
-        apply_config_diff(&mut handles, &old_cfg, &new_cfg, &shutdown, &log_agg).await;
+        apply(&mut handles, &old_cfg, &new_cfg, &shutdown, &log_agg).await;
 
     assert_eq!(added, 1, "One new server should be added");
     assert_eq!(removed, 0);
@@ -157,7 +170,7 @@ async fn remove_server() {
     assert_eq!(handles.len(), 2);
 
     let (added, removed, changed) =
-        apply_config_diff(&mut handles, &old_cfg, &new_cfg, &shutdown, &log_agg).await;
+        apply(&mut handles, &old_cfg, &new_cfg, &shutdown, &log_agg).await;
 
     assert_eq!(added, 0);
     assert_eq!(removed, 1, "One server should be removed");
@@ -185,7 +198,7 @@ async fn change_server_command() {
     let old_task_id = handles[0].task.id();
 
     let (added, removed, changed) =
-        apply_config_diff(&mut handles, &old_cfg, &new_cfg, &shutdown, &log_agg).await;
+        apply(&mut handles, &old_cfg, &new_cfg, &shutdown, &log_agg).await;
 
     assert_eq!(added, 0);
     assert_eq!(removed, 0);
@@ -235,7 +248,7 @@ async fn mixed_config_diff() {
     assert_eq!(handles.len(), 3);
 
     let (added, removed, changed) =
-        apply_config_diff(&mut handles, &old_cfg, &new_cfg, &shutdown, &log_agg).await;
+        apply(&mut handles, &old_cfg, &new_cfg, &shutdown, &log_agg).await;
 
     assert_eq!(added, 1, "Expected 1 added (d)");
     assert_eq!(removed, 1, "Expected 1 removed (b)");
@@ -250,4 +263,51 @@ async fn mixed_config_diff() {
 
     shutdown.cancel();
     mcp_hub::supervisor::stop_all_servers(handles).await;
+}
+
+#[tokio::test]
+async fn handles_lock_is_free_while_a_removed_server_shuts_down() {
+    // "stubborn" ignores SIGTERM (the disposition survives exec into `sleep`),
+    // so stopping it takes the full 5 s grace period before SIGKILL.
+    let stubborn = make_server_config("bash", &["-c", "trap '' TERM; sleep 30"]);
+    let shutdown = CancellationToken::new();
+    let old_cfg = make_hub_config(&[("a", sleep_server()), ("stubborn", stubborn)]);
+    let new_cfg = make_hub_config(&[("a", sleep_server())]);
+    let log_agg = Arc::new(LogAggregator::new(
+        &["a".to_string(), "stubborn".to_string()],
+        100,
+    ));
+
+    let handles = start_all_servers(&old_cfg, shutdown.clone(), Arc::clone(&log_agg)).await;
+    let shared = Arc::new(tokio::sync::Mutex::new(handles));
+    // Give the stubborn server time to install its trap before we stop it.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let reload = {
+        let shared = Arc::clone(&shared);
+        let shutdown = shutdown.clone();
+        let log_agg = Arc::clone(&log_agg);
+        tokio::spawn(async move {
+            apply_config_diff(&shared, &old_cfg, &new_cfg, &shutdown, &log_agg).await
+        })
+    };
+
+    // Mid-reload, status-style readers must still get the lock promptly.
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    assert!(
+        !reload.is_finished(),
+        "reload should still be stopping 'stubborn'"
+    );
+    let guard = tokio::time::timeout(std::time::Duration::from_millis(500), shared.lock())
+        .await
+        .expect("handles mutex must not be held across server shutdown");
+    assert_eq!(guard.len(), 1, "'stubborn' is detached while it stops");
+    drop(guard);
+
+    let (added, removed, changed) = reload.await.expect("reload task");
+    assert_eq!((added, removed, changed), (0, 1, 0));
+
+    shutdown.cancel();
+    let final_handles = std::mem::take(&mut *shared.lock().await);
+    mcp_hub::supervisor::stop_all_servers(final_handles).await;
 }

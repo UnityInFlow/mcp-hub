@@ -202,6 +202,10 @@ async fn run_daemon_inner(
         log_agg: Arc::clone(&log_agg),
         shutdown: shutdown.clone(),
         color: false,
+        config_path: config_path.map(std::path::Path::to_path_buf),
+        // Reloads diff against this, so it must be what the servers started from.
+        current_config: tokio::sync::Mutex::new(config),
+        views: Arc::clone(&server_views),
     });
 
     // Spawn web UI server (Phase 4 -- WEB-01).
@@ -235,9 +239,6 @@ async fn run_daemon_inner(
         n.ready();
     }
 
-    // Track the current config so reloads can diff against it.
-    let mut current_config = config;
-
     // Block until a shutdown signal (SIGTERM, Ctrl+C) or a Stop
     // command via the control socket cancels the token.
     // SIGHUP triggers a config reload without stopping the daemon.
@@ -246,14 +247,9 @@ async fn run_daemon_inner(
         tokio::select! {
             _ = sighup.recv() => {
                 tracing::info!("SIGHUP received — reloading config");
-                handle_reload(
-                    &daemon_state,
-                    &server_views,
-                    config_path,
-                    &mut current_config,
-                    &shutdown,
-                    &log_agg,
-                ).await;
+                if let Err(e) = control::reload_config(&daemon_state).await {
+                    tracing::error!("Config reload failed: {e:#}");
+                }
             }
             _ = sigterm.recv() => {
                 tracing::info!("SIGTERM received — shutting down daemon");
@@ -273,7 +269,6 @@ async fn run_daemon_inner(
 
     #[cfg(not(unix))]
     {
-        let _ = (config_path, &server_views, &mut current_config);
         tokio::select! {
             result = tokio::signal::ctrl_c() => {
                 result.context("Failed to listen for Ctrl+C")?;
@@ -490,14 +485,21 @@ async fn async_main(cli: Cli, startup: Option<DaemonStartup>) -> anyhow::Result<
         }
 
         Commands::Reload => {
-            // Send a Reload request to the running daemon via the control socket.
-            // The daemon receives this, sends SIGHUP to itself, and the main event
-            // loop picks it up and calls handle_reload.
+            // Ask the running daemon to reload; it applies the new config
+            // itself and reports what changed (or why it could not).
             let sock = daemon::socket_path()?;
+            // Replacing servers can take up to 5 s each to shut down.
             let response =
-                control::send_daemon_command(&sock, &control::DaemonRequest::Reload, 5).await?;
+                control::send_daemon_command(&sock, &control::DaemonRequest::Reload, 30).await?;
             if response.ok {
-                println!("Reload signal sent to daemon.");
+                match response.data {
+                    Some(data) => {
+                        let summary: control::ReloadSummary = serde_json::from_value(data)
+                            .context("Daemon returned an invalid reload summary")?;
+                        println!("Reload complete: {summary}.");
+                    }
+                    None => println!("Reload complete."),
+                }
             } else {
                 eprintln!(
                     "Reload failed: {}",
@@ -539,42 +541,6 @@ async fn async_main(cli: Cli, startup: Option<DaemonStartup>) -> anyhow::Result<
 
             print!("{output}");
             Ok(())
-        }
-    }
-}
-
-/// Reload configuration from disk and apply changes to the running daemon.
-///
-/// Diffs the new config against `current_config` and starts/stops/restarts
-/// servers as needed. Updates `current_config` on success so subsequent reloads
-/// diff against the latest state.
-async fn handle_reload(
-    state: &Arc<control::DaemonState>,
-    views: &web::SharedServerViews,
-    config_path: Option<&std::path::Path>,
-    current_config: &mut config::HubConfig,
-    shutdown: &CancellationToken,
-    log_agg: &Arc<logs::LogAggregator>,
-) {
-    match config::find_and_load_config(config_path) {
-        Ok(new_config) => {
-            let mut handles = state.handles.lock().await;
-            let (added, removed, changed) = supervisor::apply_config_diff(
-                &mut handles,
-                current_config,
-                &new_config,
-                shutdown,
-                log_agg,
-            )
-            .await;
-            // Publish the new handle set to the web UI only now, with a brief
-            // write lock; until here it kept serving the previous snapshots.
-            web::publish_server_views(views, &handles).await;
-            tracing::info!(added, removed, changed, "Config reload complete");
-            *current_config = new_config;
-        }
-        Err(e) => {
-            tracing::error!("Config reload failed: {e}");
         }
     }
 }
