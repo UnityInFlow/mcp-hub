@@ -95,6 +95,15 @@ pub async fn start_web_server(
     state: Arc<WebState>,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
+    let listener = bind_web_listener(port).await?;
+    serve_web(listener, state, shutdown).await
+}
+
+/// Bind the web UI listener on 127.0.0.1:{port}.
+///
+/// Split from [`serve_web`] so the daemon can report a bind failure to its
+/// parent instead of discovering it later inside a background task.
+pub async fn bind_web_listener(port: u16) -> anyhow::Result<tokio::net::TcpListener> {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
         anyhow::anyhow!(
@@ -102,9 +111,16 @@ pub async fn start_web_server(
              Set [hub] web_port = <other> in mcp-hub.toml"
         )
     })?;
-
     tracing::info!("Web UI listening on http://{addr}");
+    Ok(listener)
+}
 
+/// Serve the web UI on an already-bound `listener` until `shutdown` is cancelled.
+pub async fn serve_web(
+    listener: tokio::net::TcpListener,
+    state: Arc<WebState>,
+    shutdown: CancellationToken,
+) -> anyhow::Result<()> {
     axum::serve(listener, build_router(state))
         .with_graceful_shutdown(async move { shutdown.cancelled().await })
         .await?;

@@ -146,5 +146,7 @@ pub fn configure_tracing(verbose: u8) {
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
+        // Escape codes would litter the daemon log file; only colour a terminal.
+        .with_ansi(std::io::stderr().is_terminal())
         .init();
 }

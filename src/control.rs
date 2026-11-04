@@ -10,8 +10,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
+use crate::config::HubConfig;
 use crate::logs::LogAggregator;
 use crate::supervisor::ServerHandle;
+use crate::web::SharedServerViews;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // IPC message types
@@ -101,6 +103,81 @@ pub struct DaemonState {
     /// Reserved for future use when log output is colorized in the daemon.
     #[allow(dead_code)]
     pub color: bool,
+    /// Explicit `--config` path used by reloads (`None` = default search).
+    pub config_path: Option<std::path::PathBuf>,
+    /// The config the running servers were started from; reloads diff against it.
+    ///
+    /// Holding this lock serialises reloads (SIGHUP and `Reload` requests).
+    pub current_config: tokio::sync::Mutex<HubConfig>,
+    /// Snapshot views published to the web UI; refreshed after every reload.
+    pub views: SharedServerViews,
+}
+
+/// What a successful config reload changed (server counts).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReloadSummary {
+    /// Servers newly started.
+    pub added: usize,
+    /// Servers stopped because they left the config.
+    pub removed: usize,
+    /// Servers restarted because their config changed.
+    pub changed: usize,
+    /// Servers left running untouched.
+    pub unchanged: usize,
+}
+
+impl std::fmt::Display for ReloadSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} added, {} removed, {} changed, {} unchanged",
+            self.added, self.removed, self.changed, self.unchanged
+        )
+    }
+}
+
+/// Reload the config from disk and apply the difference to the running servers.
+///
+/// Used by both the `Reload` control request and the SIGHUP handler. On error
+/// (unreadable or invalid config) nothing is touched: the servers keep running
+/// from the previous config.
+pub async fn reload_config(state: &DaemonState) -> anyhow::Result<ReloadSummary> {
+    // Held for the whole reload so concurrent reloads cannot interleave.
+    let mut current = state.current_config.lock().await;
+
+    let new_config = crate::config::find_and_load_config(state.config_path.as_deref())?;
+
+    let (added, removed, changed) = crate::supervisor::apply_config_diff(
+        &state.handles,
+        &current,
+        &new_config,
+        &state.shutdown,
+        &state.log_agg,
+    )
+    .await;
+
+    // Publish the new handle set to the web UI only now, with a brief lock;
+    // until here it kept serving the previous snapshots.
+    {
+        let handles = state.handles.lock().await;
+        crate::web::publish_server_views(&state.views, &handles).await;
+    }
+
+    let summary = ReloadSummary {
+        added,
+        removed,
+        changed,
+        unchanged: new_config.servers.len().saturating_sub(added + changed),
+    };
+    *current = new_config;
+    tracing::info!(
+        added = summary.added,
+        removed = summary.removed,
+        changed = summary.changed,
+        unchanged = summary.unchanged,
+        "Config reload complete"
+    );
+    Ok(summary)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -139,33 +216,24 @@ impl Default for ControlLimits {
     }
 }
 
+/// A bound control socket listener, ready to be served.
 #[cfg(unix)]
-/// Bind a Unix domain socket at `sock_path` and accept control connections.
-///
-/// Each connection receives exactly one request and sends exactly one response
-/// (newline-delimited JSON). The listener shuts down when `state.shutdown` is
-/// cancelled and removes the socket file on exit.
-///
-/// The socket is restricted to the owner (`0600`) right after binding, idle
-/// clients are dropped after [`DEFAULT_READ_TIMEOUT`], and request lines are
-/// capped at [`DEFAULT_MAX_REQUEST_BYTES`].
-pub async fn run_control_socket(sock_path: &Path, state: Arc<DaemonState>) -> anyhow::Result<()> {
-    run_control_socket_with_limits(sock_path, state, ControlLimits::default()).await
-}
+pub type ControlListener = tokio::net::UnixListener;
+
+/// Placeholder: Unix domain sockets are not available on this platform.
+#[cfg(not(unix))]
+pub struct ControlListener;
 
 #[cfg(unix)]
-/// Like [`run_control_socket`], but with explicit per-connection limits.
-pub async fn run_control_socket_with_limits(
-    sock_path: &Path,
-    state: Arc<DaemonState>,
-    limits: ControlLimits,
-) -> anyhow::Result<()> {
-    use tokio::net::UnixListener;
-
+/// Bind a Unix domain socket at `sock_path`, replacing any leftover socket file.
+///
+/// Split from [`serve_control_socket`] so the daemon can tell its parent
+/// "ready" only after the bind has actually succeeded.
+pub async fn bind_control_socket(sock_path: &Path) -> anyhow::Result<ControlListener> {
     // Remove any leftover socket from a previous run.
     let _ = tokio::fs::remove_file(sock_path).await;
 
-    let listener = UnixListener::bind(sock_path)
+    let listener = ControlListener::bind(sock_path)
         .map_err(|e| anyhow::anyhow!("Failed to bind socket {}: {e}", sock_path.display()))?;
 
     // Restrict the socket to the owner. The state directory is already 0700,
@@ -183,7 +251,60 @@ pub async fn run_control_socket_with_limits(
     }
 
     tracing::info!("Control socket listening on {}", sock_path.display());
+    Ok(listener)
+}
 
+#[cfg(not(unix))]
+/// Stub: Unix domain socket IPC is not supported on non-Unix platforms.
+pub async fn bind_control_socket(_sock_path: &Path) -> anyhow::Result<ControlListener> {
+    anyhow::bail!("Unix domain socket IPC is not supported on this platform. Use foreground mode.")
+}
+
+#[cfg(unix)]
+/// Bind a Unix domain socket at `sock_path` and accept control connections.
+///
+/// Convenience wrapper over [`bind_control_socket`] + [`serve_control_socket`].
+/// The daemon binary binds and serves separately; this is the library entry point.
+#[allow(dead_code)]
+pub async fn run_control_socket(sock_path: &Path, state: Arc<DaemonState>) -> anyhow::Result<()> {
+    run_control_socket_with_limits(sock_path, state, ControlLimits::default()).await
+}
+
+#[cfg(unix)]
+/// Like [`run_control_socket`], but with explicit per-connection limits.
+pub async fn run_control_socket_with_limits(
+    sock_path: &Path,
+    state: Arc<DaemonState>,
+    limits: ControlLimits,
+) -> anyhow::Result<()> {
+    let listener = bind_control_socket(sock_path).await?;
+    serve_control_socket_with_limits(listener, sock_path, state, limits).await
+}
+
+#[cfg(unix)]
+/// Accept control connections on an already-bound `listener`.
+///
+/// Each connection receives exactly one request and sends exactly one response
+/// (newline-delimited JSON). The listener shuts down when `state.shutdown` is
+/// cancelled and removes the socket file on exit.
+pub async fn serve_control_socket(
+    listener: ControlListener,
+    sock_path: &Path,
+    state: Arc<DaemonState>,
+) -> anyhow::Result<()> {
+    serve_control_socket_with_limits(listener, sock_path, state, ControlLimits::default()).await
+}
+
+#[cfg(unix)]
+/// Like [`serve_control_socket`], but with explicit per-connection limits:
+/// idle clients are dropped after `limits.read_timeout` and request lines are
+/// capped at `limits.max_request_bytes`.
+pub async fn serve_control_socket_with_limits(
+    listener: ControlListener,
+    sock_path: &Path,
+    state: Arc<DaemonState>,
+    limits: ControlLimits,
+) -> anyhow::Result<()> {
     loop {
         tokio::select! {
             accept = listener.accept() => {
@@ -216,6 +337,16 @@ pub async fn run_control_socket_with_limits(
 #[cfg(not(unix))]
 /// Stub: Unix domain socket IPC is not supported on non-Unix platforms.
 pub async fn run_control_socket(_sock_path: &Path, _state: Arc<DaemonState>) -> anyhow::Result<()> {
+    anyhow::bail!("Unix domain socket IPC is not supported on this platform. Use foreground mode.")
+}
+
+#[cfg(not(unix))]
+/// Stub: Unix domain socket IPC is not supported on non-Unix platforms.
+pub async fn serve_control_socket(
+    _listener: ControlListener,
+    _sock_path: &Path,
+    _state: Arc<DaemonState>,
+) -> anyhow::Result<()> {
     anyhow::bail!("Unix domain socket IPC is not supported on this platform. Use foreground mode.")
 }
 
@@ -380,19 +511,16 @@ async fn dispatch_request(request: DaemonRequest, state: &DaemonState) -> Daemon
             }
         },
 
-        DaemonRequest::Reload => {
-            // Send SIGHUP to self so the main event loop's sighup handler triggers
-            // the config reload without requiring a separate reload channel.
-            {
-                use nix::sys::signal::{kill, Signal};
-                use nix::unistd::Pid;
-                let pid = Pid::from_raw(std::process::id() as i32);
-                match kill(pid, Signal::SIGHUP) {
-                    Ok(()) => DaemonResponse::ok_empty(),
-                    Err(e) => DaemonResponse::err(format!("Failed to send SIGHUP: {e}")),
-                }
+        DaemonRequest::Reload => match reload_config(state).await {
+            Ok(summary) => match serde_json::to_value(summary) {
+                Ok(data) => DaemonResponse::success(data),
+                Err(e) => DaemonResponse::err(format!("Failed to encode reload summary: {e}")),
+            },
+            Err(e) => {
+                tracing::error!("Config reload failed: {e:#}");
+                DaemonResponse::err(format!("{e:#}"))
             }
-        }
+        },
     }
 }
 

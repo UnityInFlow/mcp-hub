@@ -9,3 +9,4 @@ pub mod mcp;
 pub mod output;
 pub mod supervisor;
 pub mod types;
+pub mod web;

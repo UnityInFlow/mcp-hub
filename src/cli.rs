@@ -33,6 +33,12 @@ pub enum Commands {
         /// Run as a background daemon.
         #[arg(long)]
         daemon: bool,
+
+        /// Where the daemon writes its log (stdout/stderr and managed servers'
+        /// stderr). Defaults to `daemon.log` next to the control socket.
+        /// Only used with --daemon.
+        #[arg(long, value_name = "PATH", env = "MCP_HUB_LOG_FILE")]
+        log_file: Option<PathBuf>,
     },
 
     /// Stop all running servers.

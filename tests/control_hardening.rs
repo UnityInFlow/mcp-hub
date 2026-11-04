@@ -38,6 +38,12 @@ mod hardening {
             log_agg: Arc::new(LogAggregator::new(&[], 1000)),
             shutdown: shutdown.clone(),
             color: false,
+            config_path: None,
+            current_config: tokio::sync::Mutex::new(mcp_hub::config::HubConfig {
+                hub: Default::default(),
+                servers: Default::default(),
+            }),
+            views: mcp_hub::web::new_server_views(&[]),
         });
         let sock_owned = sock.to_path_buf();
         let handle = tokio::spawn(async move {

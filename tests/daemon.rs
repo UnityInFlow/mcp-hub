@@ -2,6 +2,7 @@
 /// and the control socket round-trip.
 use std::sync::Arc;
 
+use mcp_hub::config::HubConfig;
 use mcp_hub::control::{run_control_socket, DaemonRequest, DaemonResponse, DaemonState};
 use mcp_hub::daemon::{pid_path, remove_pid_file, socket_path, write_pid_file};
 use mcp_hub::logs::LogAggregator;
@@ -228,6 +229,12 @@ async fn control_socket_round_trip() {
         log_agg: Arc::clone(&log_agg),
         shutdown: shutdown.clone(),
         color: false,
+        config_path: None,
+        current_config: tokio::sync::Mutex::new(HubConfig {
+            hub: Default::default(),
+            servers: Default::default(),
+        }),
+        views: mcp_hub::web::new_server_views(&[]),
     });
 
     // Spawn the control socket listener.
