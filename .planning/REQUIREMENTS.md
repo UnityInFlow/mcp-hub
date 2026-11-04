@@ -7,52 +7,52 @@
 
 ### Configuration
 
-- [ ] **CFG-01**: User can define MCP servers in a TOML config file (name, command, args, env, transport type)
-- [ ] **CFG-02**: Config validates on load with clear error messages for invalid entries
-- [ ] **CFG-03**: User can reload config without restarting the hub (SIGHUP or command)
+- [x] **CFG-01**: User can define MCP servers in a TOML config file (name, command, args, env, transport type)
+- [x] **CFG-02**: Config validates on load with clear error messages for invalid entries
+- [x] **CFG-03**: User can reload config without restarting the hub (SIGHUP or command)
 
 ### Process Lifecycle
 
-- [ ] **PROC-01**: User can start all configured servers with `mcp-hub start`
-- [ ] **PROC-02**: User can stop all servers with `mcp-hub stop`
-- [ ] **PROC-03**: User can restart a specific server by name with `mcp-hub restart <name>`
-- [ ] **PROC-04**: User can view status of all servers with `mcp-hub status` (name, state, PID, uptime, restarts)
-- [ ] **PROC-05**: Servers auto-restart on crash with exponential backoff (1s -> 2s -> 4s -> max 60s) with jitter
-- [ ] **PROC-06**: After N consecutive failures, server is marked Fatal and stops restarting
-- [ ] **PROC-07**: Hub performs graceful shutdown on Ctrl+C: SIGTERM to all children, wait up to 5s, then SIGKILL
-- [ ] **PROC-08**: Child processes are spawned in separate process groups to avoid signal races
-- [ ] **PROC-09**: No zombie processes after stop — all child handles properly awaited/killed
+- [x] **PROC-01**: User can start all configured servers with `mcp-hub start`
+- [x] **PROC-02**: User can stop all servers with `mcp-hub stop`
+- [x] **PROC-03**: User can restart a specific server by name with `mcp-hub restart <name>`
+- [x] **PROC-04**: User can view status of all servers with `mcp-hub status` (name, state, PID, uptime, restarts)
+- [x] **PROC-05**: Servers auto-restart on crash with exponential backoff (1s -> 2s -> 4s -> max 60s) with jitter
+- [x] **PROC-06**: After N consecutive failures, server is marked Fatal and stops restarting
+- [x] **PROC-07**: Hub performs graceful shutdown on Ctrl+C: SIGTERM to all children, wait up to 5s, then SIGKILL
+- [x] **PROC-08**: Child processes are spawned in separate process groups to avoid signal races
+- [x] **PROC-09**: No zombie processes after stop — all child handles properly awaited/killed
 
 ### Health Monitoring
 
-- [ ] **HLTH-01**: Hub performs periodic health checks on each server at configurable intervals
-- [ ] **HLTH-02**: Health checks use MCP protocol ping (JSON-RPC), not just process liveness
-- [ ] **HLTH-03**: Servers have distinct health states: Starting, Running, Healthy, Degraded, Failed, Stopped
-- [ ] **HLTH-04**: Health check timeout (default 5s) prevents slow servers from blocking others
-- [ ] **HLTH-05**: Degraded state triggers after N consecutive missed pings before transitioning to Failed
+- [x] **HLTH-01**: Hub performs periodic health checks on each server at configurable intervals
+- [x] **HLTH-02**: Health checks use MCP protocol ping (JSON-RPC), not just process liveness
+- [x] **HLTH-03**: Servers have distinct health states: Starting, Running, Healthy, Degraded, Failed, Stopped
+- [x] **HLTH-04**: Health check timeout (default 5s) prevents slow servers from blocking others
+- [x] **HLTH-05**: Degraded state triggers after N consecutive missed pings before transitioning to Failed
 
 ### Logging
 
-- [ ] **LOG-01**: User can stream unified logs from all servers with `mcp-hub logs --follow`
-- [ ] **LOG-02**: User can filter logs to a specific server with `mcp-hub logs --server <name>`
-- [ ] **LOG-03**: Each log line is prefixed with timestamp and server name
-- [ ] **LOG-04**: Logs are captured from stderr (stdout is reserved for MCP protocol)
-- [ ] **LOG-05**: In-memory ring buffer stores last N lines per server (configurable, default 10000)
+- [x] **LOG-01**: User can stream unified logs from all servers with `mcp-hub logs --follow`
+- [x] **LOG-02**: User can filter logs to a specific server with `mcp-hub logs --server <name>`
+- [x] **LOG-03**: Each log line is prefixed with timestamp and server name
+- [x] **LOG-04**: Logs are captured from stderr (stdout is reserved for MCP protocol)
+- [x] **LOG-05**: In-memory ring buffer stores last N lines per server (configurable, default 10000)
 
 ### MCP Introspection
 
-- [ ] **MCP-01**: Hub introspects each server on startup: initialize, tools/list, resources/list, prompts/list
-- [ ] **MCP-02**: JSON-RPC request IDs are properly correlated for concurrent introspection calls
-- [ ] **MCP-03**: Introspection results are stored and available via status/web UI
-- [ ] **MCP-04**: Transport type (stdio/HTTP) is explicit in config; v1 implements stdio transport
+- [x] **MCP-01**: Hub introspects each server on startup: initialize, tools/list, resources/list, prompts/list
+- [x] **MCP-02**: JSON-RPC request IDs are properly correlated for concurrent introspection calls
+- [x] **MCP-03**: Introspection results are stored and available via status/web UI
+- [x] **MCP-04**: Transport type (stdio/HTTP) is explicit in config; v1 implements stdio transport
 
 ### Config Generation
 
-- [ ] **GEN-01**: User can generate Claude Code settings.json mcpServers block with `mcp-hub gen-config --format claude`
-- [ ] **GEN-02**: User can generate Cursor MCP config snippet with `mcp-hub gen-config --format cursor`
-- [ ] **GEN-03**: Default mode generates from TOML config (offline, no servers need to be running)
-- [ ] **GEN-04**: `--live` flag generates from running introspected state including tool/resource/prompt lists
-- [ ] **GEN-05**: Generated config includes a timestamp and mcp-hub version comment
+- [x] **GEN-01**: User can generate Claude Code settings.json mcpServers block with `mcp-hub gen-config --format claude`
+- [x] **GEN-02**: User can generate Cursor MCP config snippet with `mcp-hub gen-config --format cursor`
+- [x] **GEN-03**: Default mode generates from TOML config (offline, no servers need to be running)
+- [x] **GEN-04**: `--live` flag generates from running introspected state including tool/resource/prompt lists
+- [x] **GEN-05**: Generated config includes a timestamp and mcp-hub version comment
 
 ### Web UI
 
@@ -64,23 +64,23 @@
 
 ### Daemon Mode
 
-- [ ] **DMN-01**: User can run hub in foreground (default) — runs in terminal, Ctrl+C stops everything
-- [ ] **DMN-02**: User can run hub as background daemon with `mcp-hub start --daemon`
-- [ ] **DMN-03**: Daemon communicates via Unix domain socket (not just PID file)
-- [ ] **DMN-04**: `mcp-hub stop` connects to daemon socket and triggers graceful shutdown
-- [ ] **DMN-05**: Multiple daemon instances prevented by socket liveness check
+- [x] **DMN-01**: User can run hub in foreground (default) — runs in terminal, Ctrl+C stops everything
+- [x] **DMN-02**: User can run hub as background daemon with `mcp-hub start --daemon`
+- [x] **DMN-03**: Daemon communicates via Unix domain socket (not just PID file)
+- [x] **DMN-04**: `mcp-hub stop` connects to daemon socket and triggers graceful shutdown
+- [x] **DMN-05**: Multiple daemon instances prevented by socket liveness check
 
 ### Setup Wizard
 
-- [ ] **WIZ-01**: User can add a new server interactively with `mcp-hub init`
-- [ ] **WIZ-02**: Wizard prompts for name, command, args, env vars, transport type
-- [ ] **WIZ-03**: Wizard appends to existing TOML config or creates a new one
+- [x] **WIZ-01**: User can add a new server interactively with `mcp-hub init`
+- [x] **WIZ-02**: Wizard prompts for name, command, args, env vars, transport type
+- [x] **WIZ-03**: Wizard appends to existing TOML config or creates a new one
 
 ### Distribution
 
-- [ ] **DIST-01**: Pre-built binaries for macOS (arm64, x86_64), Linux (x86_64, aarch64), Windows (x86_64)
-- [ ] **DIST-02**: Homebrew formula: `brew install unityinflow/tap/mcp-hub`
-- [ ] **DIST-03**: Installable via `cargo install mcp-hub`
+- [x] **DIST-01**: Pre-built binaries for macOS (arm64, x86_64), Linux (x86_64, aarch64), Windows (x86_64)
+- [x] **DIST-02**: Homebrew formula: `brew install unityinflow/tap/mcp-hub`
+- [x] **DIST-03**: Installable via `cargo install mcp-hub`
 
 ## v2 Requirements
 
