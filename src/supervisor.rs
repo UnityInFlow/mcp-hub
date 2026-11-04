@@ -4,14 +4,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::BufReader;
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{resolve_env, HubConfig, ServerConfig};
 use crate::logs::LogAggregator;
-use crate::mcp::dispatcher::{IdAllocator, PendingMap, SharedStdin};
+use crate::mcp::dispatcher::{
+    read_bounded_line, BoundedLine, IdAllocator, PendingMap, SharedStdin, MAX_LINE_BYTES,
+};
 use crate::types::{BackoffConfig, HealthStatus, ProcessState, ServerSnapshot};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -81,8 +83,8 @@ pub fn spawn_server(
         let server_name = name.to_string();
         if let Some(agg) = log_agg {
             tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
+                let mut reader = BufReader::new(stderr);
+                while let Some(line) = next_stderr_line(&mut reader, &server_name).await {
                     // Push to the ring buffer and broadcast.
                     agg.push(&server_name, line.clone()).await;
                     // Also format and print to stderr (the log file in daemon mode).
@@ -104,8 +106,8 @@ pub fn spawn_server(
         } else {
             // Backward-compatible drain for tests and cases without a LogAggregator.
             tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
+                let mut reader = BufReader::new(stderr);
+                while let Some(line) = next_stderr_line(&mut reader, &server_name).await {
                     tracing::debug!(server = %server_name, "{}", line);
                 }
             });
@@ -120,6 +122,50 @@ pub fn spawn_server(
     })
 }
 
+/// Read the next stderr line, skipping over-long lines and decoding lossily.
+///
+/// Returns `None` only at EOF or on a genuine read error, so a huge or
+/// non-UTF-8 line cannot stop stderr draining (which would let the pipe fill
+/// and block the server) or grow memory without bound.
+async fn next_stderr_line(
+    reader: &mut BufReader<tokio::process::ChildStderr>,
+    server_name: &str,
+) -> Option<String> {
+    loop {
+        match read_bounded_line(reader, MAX_LINE_BYTES).await {
+            Ok(Some(BoundedLine::Line(line))) => return Some(line),
+            Ok(Some(BoundedLine::Oversized)) => {
+                tracing::warn!(
+                    server = %server_name,
+                    "Skipped stderr line longer than {MAX_LINE_BYTES} bytes"
+                );
+            }
+            Ok(None) => return None,
+            Err(err) => {
+                tracing::debug!(server = %server_name, "stderr read error: {err}");
+                return None;
+            }
+        }
+    }
+}
+
+/// Send `signal` to the whole process group led by `pid`.
+///
+/// Children are spawned with `process_group(0)`, so their PGID equals their PID.
+/// `ESRCH` (no such group — everything already exited) is benign and ignored;
+/// any other failure is logged.
+#[cfg(unix)]
+fn kill_group(pid: u32, signal: nix::sys::signal::Signal) {
+    use nix::errno::Errno;
+    use nix::sys::signal::killpg;
+    use nix::unistd::Pid;
+
+    match killpg(Pid::from_raw(pid as i32), signal) {
+        Ok(()) | Err(Errno::ESRCH) => {}
+        Err(err) => tracing::warn!(pid, ?signal, "killpg failed: {err}"),
+    }
+}
+
 /// Gracefully shut down a child process: SIGTERM → 5 s wait → SIGKILL.
 ///
 /// On Unix, SIGTERM is sent to the **entire process group** via `killpg` so that
@@ -129,18 +175,7 @@ pub fn spawn_server(
 pub async fn shutdown_process(mut child: tokio::process::Child, pid: u32) -> anyhow::Result<()> {
     // Send SIGTERM to the entire process group (D-08).
     #[cfg(unix)]
-    {
-        use nix::sys::signal::{killpg, Signal};
-        use nix::unistd::Pid;
-
-        if let Err(err) = killpg(Pid::from_raw(pid as i32), Signal::SIGTERM) {
-            // ESRCH means the process already exited — benign.
-            tracing::warn!(
-                pid,
-                "killpg(SIGTERM) failed (process may have exited): {err}"
-            );
-        }
-    }
+    kill_group(pid, nix::sys::signal::Signal::SIGTERM);
 
     // Race child.wait() against a 5-second timeout (D-07).
     let result = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
@@ -153,6 +188,10 @@ pub async fn shutdown_process(mut child: tokio::process::Child, pid: u32) -> any
         _ => {
             // Timeout or wait error — escalate to SIGKILL.
             tracing::warn!(pid, "Grace period elapsed; sending SIGKILL");
+            // SIGKILL the whole group: members that ignored SIGTERM must not survive.
+            #[cfg(unix)]
+            kill_group(pid, nix::sys::signal::Signal::SIGKILL);
+            #[cfg(not(unix))]
             child.kill().await.ok();
             child.wait().await.ok(); // reap zombie (PROC-09)
             Ok(())
@@ -219,7 +258,7 @@ pub async fn run_server_supervisor(
     state_tx: tokio::sync::watch::Sender<ServerSnapshot>,
     log_agg: Arc<LogAggregator>,
 ) {
-    let backoff_cfg = BackoffConfig::default();
+    let backoff_cfg = BackoffConfig::from_server_config(&config);
     let mut consecutive_failures: u32 = 0;
     let mut total_restarts: u32 = 0;
 
@@ -317,6 +356,8 @@ pub async fn run_server_supervisor(
         let spawned_stdin = spawned.stdin;
         let spawned_stdout = spawned.stdout;
         let mut child = spawned.child;
+        // Kept so the crash path can abort it if a lingering pipe holder blocks EOF.
+        let mut reader_handle: Option<tokio::task::JoinHandle<()>> = None;
 
         if let (Some(stdin), Some(stdout)) = (spawned_stdin, spawned_stdout) {
             let stdin_shared: SharedStdin = Arc::new(Mutex::new(stdin));
@@ -325,9 +366,10 @@ pub async fn run_server_supervisor(
 
             // Spawn the reader task that owns stdout and routes responses by ID.
             let pending_clone = Arc::clone(&pending);
-            tokio::spawn(async move {
-                crate::mcp::dispatcher::reader_task(stdout, pending_clone).await;
-            });
+            let stdin_reader = Arc::clone(&stdin_shared);
+            reader_handle = Some(tokio::spawn(async move {
+                crate::mcp::dispatcher::reader_task(stdout, pending_clone, stdin_reader).await;
+            }));
 
             // Spawn the health check loop using shared stdin + pending map.
             let health_name = name.clone();
@@ -373,22 +415,31 @@ pub async fn run_server_supervisor(
                             let snapshot = health_rx.borrow().clone();
                             if matches!(snapshot.health, crate::types::HealthStatus::Healthy { .. }) {
                                 // First Healthy — run introspection once for this process spawn.
-                                match crate::mcp::introspect::run_introspection(
+                                // Dropped (not just ignored) on cancel, so a respawn can
+                                // never see capabilities from the previous process.
+                                match crate::mcp::introspect::run_introspection_until_cancelled(
                                     &introspect_name,
                                     &stdin_introspect,
                                     &pending_introspect,
                                     &id_introspect,
                                     &snapshot_introspect,
+                                    &introspect_cancel,
                                 )
                                 .await
                                 {
-                                    Ok(_caps) => {
+                                    None => {
+                                        tracing::debug!(
+                                            server = %introspect_name,
+                                            "MCP introspection cancelled"
+                                        );
+                                    }
+                                    Some(Ok(_caps)) => {
                                         tracing::info!(
                                             server = %introspect_name,
                                             "MCP introspection succeeded"
                                         );
                                     }
-                                    Err(err) => {
+                                    Some(Err(err)) => {
                                         tracing::warn!(
                                             server = %introspect_name,
                                             "MCP introspection failed: {err}"
@@ -414,6 +465,15 @@ pub async fn run_server_supervisor(
             // Child exited on its own (crash or clean exit).
             status = child.wait() => {
                 health_cancel.cancel();
+                // The direct child is gone, but wrappers (npx/uvx/node shims) may
+                // have left group members behind that hold the stdout pipe open
+                // and would collide with the respawn. Kill the whole group, then
+                // stop the reader so a lingering pipe cannot keep it alive.
+                #[cfg(unix)]
+                kill_group(pid, nix::sys::signal::Signal::SIGKILL);
+                if let Some(handle) = reader_handle.take() {
+                    handle.abort();
+                }
                 let ran_for = started_at.elapsed().as_secs();
                 tracing::warn!(
                     server = %name,
@@ -564,6 +624,10 @@ pub async fn start_single_server(
     let cfg = config.clone();
     let agg = Arc::clone(log_agg);
 
+    // Register the log buffer up front so `logs --server <name>` works even
+    // before the server has emitted anything (e.g. servers added via reload).
+    agg.ensure_buffer(name);
+
     let task = tokio::spawn(async move {
         run_server_supervisor(name_owned, cfg, token, cmd_rx, state_tx, agg).await;
     });
@@ -665,6 +729,11 @@ pub async fn apply_config_diff(
             tracing::info!(server = %name, "Stopping server (config removed/changed)");
         }
         stop_all_servers(stale).await;
+    }
+
+    // Drop the log buffers of removed servers so add/remove cycles don't leak.
+    for name in &to_remove {
+        log_agg.remove_server(name);
     }
 
     // No lock: start new and replacement supervisors.

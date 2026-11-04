@@ -531,7 +531,7 @@ async fn async_main(cli: Cli, startup: Option<DaemonStartup>) -> anyhow::Result<
                 None
             };
 
-            let output = match args.format.as_str() {
+            let rendered = match args.format.as_str() {
                 "claude" => gen_config::render_claude_config(&config, live_info.as_deref())?,
                 "cursor" => gen_config::render_cursor_config(&config, live_info.as_deref())?,
                 other => anyhow::bail!(
@@ -539,7 +539,12 @@ async fn async_main(cli: Cli, startup: Option<DaemonStartup>) -> anyhow::Result<
                 ),
             };
 
-            print!("{output}");
+            // Annotations go to stderr; stdout is the bare JSON document so it
+            // can be redirected straight into .mcp.json / Cursor's config.
+            for note in &rendered.notes {
+                eprintln!("{note}");
+            }
+            print!("{}", rendered.json);
             Ok(())
         }
     }

@@ -10,7 +10,7 @@ PM2-equivalent for MCP servers. Manages lifecycle (start/stop/restart/status), h
 
 ## Status
 
-Planned — no strict blocking dependencies.
+v0.1.1 shipped (Linux binaries, crates.io). v0.2.0 revive in progress — see GitHub issues #2 (launch plan) and #11 (code-review tracker).
 
 ## Reference Documents
 
@@ -47,15 +47,15 @@ Read these before making architectural or scope decisions.
 
 ## Acceptance Criteria — v0.0.1
 
-- [ ] TOML config file: define all MCP servers with name, command, args, env
-- [ ] Process lifecycle: start, stop, restart, status for all servers
-- [ ] Health monitoring: heartbeat checks with configurable interval
-- [ ] Auto-restart on crash with exponential backoff (1s -> 2s -> 4s -> max 60s)
+- [x] TOML config file: define all MCP servers with name, command, args, env
+- [x] Process lifecycle: start, stop, restart, status for all servers
+- [x] Health monitoring: heartbeat checks with configurable interval
+- [x] Auto-restart on crash with exponential backoff (1s -> 2s -> 4s -> max 60s)
 - [ ] Unified log view: `mcp-hub logs --follow` streams all servers interleaved
-- [ ] Web UI: lists all running servers and available tools from MCP introspection
-- [ ] Claude Code config generator: outputs correct settings.json mcpServers block
-- [ ] Cursor config generator: outputs Cursor MCP config snippet
-- [ ] `mcp-hub init`: interactive wizard to add a new server
+- [x] Web UI: lists all running servers and available tools from MCP introspection
+- [x] Claude Code config generator: outputs correct settings.json mcpServers block
+- [x] Cursor config generator: outputs Cursor MCP config snippet
+- [x] `mcp-hub init`: interactive wizard to add a new server
 - [ ] Pre-built binaries for macOS, Linux, Windows
 - [ ] Homebrew formula
 
@@ -83,25 +83,9 @@ Superpowers skills (TDD, code review, debugging) activate automatically during e
 
 ---
 
-## CI / Self-Hosted Runners
+## CI / Runners
 
-Use UnityInFlow org-level self-hosted runners. Never use `ubuntu-latest`.
-
-```yaml
-# Default (X64)
-runs-on: [arc-runner-unityinflow]
-
-# ARM64 cross-compilation
-runs-on: [orangepi]
-
-# Matrix for both architectures
-strategy:
-  matrix:
-    runner: [arc-runner-unityinflow, orangepi]
-runs-on: ${{ matrix.runner }}
-```
-
-Available runners: `hetzner-runner-1/2/3` (X64), `orangepi-runner` (ARM64).
+CI and releases run on GitHub-hosted runners: `ubuntu-latest` (Linux) and `macos-14` / `macos-latest` (macOS). Do not use self-hosted runners.
 
 ---
 
@@ -131,7 +115,7 @@ A local MCP server process manager — PM2 for MCP servers. Single Rust binary t
 - **Serialization**: serde + serde_json for all data structures
 - **Error handling**: anyhow for binary, thiserror for library code
 - **Quality**: cargo clippy -D warnings, cargo fmt, no unwrap() in production
-- **CI**: Self-hosted runners (arc-runner-unityinflow for X64, orangepi for ARM64)
+- **CI**: GitHub-hosted runners (ubuntu-latest, macos-14 / macos-latest)
 - **Distribution**: Pre-built binaries + Homebrew tap + cargo install
 <!-- GSD:project-end -->
 
@@ -201,7 +185,7 @@ A local MCP server process manager — PM2 for MCP servers. Single Rust binary t
 |------|---------|------------|
 | `cargo` | Build system | High |
 | `cross` | Cross-compilation for Linux/Windows from macOS | High |
-| GitHub Actions + self-hosted runners | CI/CD | High |
+| GitHub Actions (GitHub-hosted runners) | CI/CD | High |
 | `cargo-dist` or manual | Binary releases + Homebrew formula generation | Medium |
 ## Summary: Cargo.toml Dependencies
 <!-- GSD:stack-end -->
