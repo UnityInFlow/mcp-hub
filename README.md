@@ -1,23 +1,49 @@
 # mcp-hub
 
-PM2 for MCP servers -- manage, monitor, and configure your MCP servers from a single binary.
+PM2 for MCP servers: one config file, one command, one log stream.
 
-## Features
+mcp-hub is a single Rust binary that runs your local (stdio) MCP servers as
+supervised child processes, restarts them when they crash, shows their health
+and logs in one place, and generates the client config for Claude Code, Cursor,
+Codex CLI and Gemini CLI from the same server list.
 
-- **TOML config** -- define all MCP servers in one file (name, command, args, env)
-- **Process lifecycle** -- start, stop, restart, and status commands for all servers
-- **Health monitoring** -- MCP ping checks with configurable interval; Healthy/Degraded/Failed states
-- **Auto-restart** -- exponential backoff on crash (1s -> 2s -> 4s -> max 60s)
-- **Unified log streaming** -- all server logs interleaved in one view, docker-compose style
-- **Web UI dashboard** -- status card grid, tools accordion, SSE log streaming at `http://localhost:3456`
-- **Config generation** -- output ready-to-paste mcpServers blocks for Claude Code and Cursor
-- **Interactive setup wizard** -- `mcp-hub init` adds a new server with prompts and TOML-safe validation
-- **Daemon mode** -- runs in background with Unix socket IPC, PID file, and duplicate prevention
+<!-- demo GIF: docs/demo/demo.gif (see docs/demo/README.md) -->
+
+```sh
+cargo binstall mcp-server-hub        # installs the `mcp-hub` binary
+mcp-hub init                         # add a server to ./mcp-hub.toml
+mcp-hub start --daemon               # run everything in the background
+mcp-hub status                       # state, health, PID, uptime, restarts
+mcp-hub logs --follow                # all servers' logs, interleaved
+mcp-hub gen-config --format claude   # paste into .mcp.json
+```
+
+## What it does
+
+- **Supervises processes.** Reads server definitions (`command`, `args`, `env`) from a TOML file, and starts, stops and restarts them. Each server runs in its own process group, so stopping it also kills the child processes it spawned.
+- **Restarts on crash.** Exponential backoff (1s, 2s, 4s, up to 60s) with a retry limit (`max_retries`); a server that keeps failing is marked `fatal`.
+- **Checks health.** Sends MCP `ping` requests at a configurable interval and reports each server as Healthy, Degraded or Failed.
+- **Introspects servers.** Lists each server's tools, resources and prompts over the MCP protocol.
+- **Streams logs.** `mcp-hub logs --follow` interleaves the stderr of all servers (or one, with `--server`).
+- **Serves a local web UI.** Status, a tools browser and live logs at `http://127.0.0.1:3456`, plus a `/health` JSON endpoint that returns HTTP 503 when a server has failed.
+- **Generates client config.** `mcp-hub gen-config --format claude|cursor|codex|gemini` prints the config document on stdout (notes go to stderr). `${VAR}` and `${VAR:-default}` are expanded in `env` and `args`, and `env_file` is supported.
+- **Runs as a daemon.** `start --daemon` waits until the servers and sockets are up and reports startup errors; its output goes to `daemon.log` next to the control socket (or `--log-file`). `mcp-hub reload` applies config changes and reports how many servers were added, removed and changed.
+
+## What it does not do
+
+- **It is not an MCP proxy or gateway.** It does not sit between your client and your servers and does not forward MCP traffic. `gen-config` writes each server's own `command`, `args` and `env` into the client config, so the client starts its own copy of the server. mcp-hub's copy is separate: it is the one that is supervised, health-checked, logged and shown in the web UI. If you want a single endpoint that aggregates many servers, use an MCP proxy or gateway instead.
+- **It does not install MCP servers.** `command` is whatever you would type in a terminal (`npx ...`, `uvx ...`, a local binary).
+- **It does not manage remote machines.** Everything runs on the local host, and the control socket is local.
+- **The web UI has no authentication.** It only binds to `127.0.0.1`; do not expose that port to other machines.
+- **One daemon per user.** The control socket lives in a single per-user location (`~/.config/mcp-hub/` on Linux), so you cannot run several independent daemons for different projects ([#21](https://github.com/UnityInFlow/mcp-hub/issues/21)).
+- **No Windows support yet.** Linux and macOS only ([#30](https://github.com/UnityInFlow/mcp-hub/issues/30)).
+- **No Homebrew formula yet** ([#7](https://github.com/UnityInFlow/mcp-hub/issues/7)); use `cargo binstall` or `cargo install`.
+
+## Naming
+
+The crate on crates.io is **`mcp-server-hub`** (the name `mcp-hub` belongs to an unrelated project). The repository and the installed binary are both **`mcp-hub`**. Install with `mcp-server-hub`, run `mcp-hub`.
 
 ## Installation
-
-> The crate is published as **`mcp-server-hub`**; it installs a binary named **`mcp-hub`**.
-> (Crate name ≠ binary name — use `mcp-server-hub` to install, `mcp-hub` to run.)
 
 **Prebuilt binary (fastest) — `cargo binstall`:**
 
@@ -37,7 +63,7 @@ Grab `mcp-server-hub-<target>-v<version>.tgz` (Linux or macOS) from
 [GitHub Releases](https://github.com/UnityInFlow/mcp-hub/releases), extract the
 `mcp-hub` binary, and put it on your `PATH`.
 
-Prebuilt targets that ship:
+Prebuilt targets built by the release workflow (v0.1.1 shipped Linux only; macOS archives start with the next release):
 
 | Platform | Target triple | Asset |
 |----------|---------------|-------|
@@ -48,11 +74,8 @@ Prebuilt targets that ship:
 | macOS Apple Silicon (aarch64) | `aarch64-apple-darwin` | `mcp-server-hub-aarch64-apple-darwin-v<version>.tgz` |
 | macOS Intel (x86_64) | `x86_64-apple-darwin` | `mcp-server-hub-x86_64-apple-darwin-v<version>.tgz` |
 
-> **Windows** (HUB-V2-02) prebuilt binaries are **deferred to v2**. Windows
-> additionally needs the `cfg(unix)`-gated features (daemon, Unix-socket IPC,
-> web UI, signal handling, colored tables) refactored before it can
-> cross-compile. On Windows, install from source with
-> `cargo install mcp-server-hub`.
+> **Windows** is not supported yet ([#30](https://github.com/UnityInFlow/mcp-hub/issues/30)).
+> The daemon, Unix-socket control channel, web UI and signal handling are Unix-only.
 
 After installing, verify with:
 
@@ -137,15 +160,15 @@ restart_delay = 1        # Base restart backoff delay in seconds (default: 1)
 
 `command`, `cwd` and `env_file` are not expanded, and values read from `env_file` are always literal; `env_file` remains the alternative for secrets you would rather keep in a separate file. `mcp-hub gen-config` writes the expanded values (that is what ends up in `.mcp.json`), and prints a warning on stderr when one of them came from a variable whose name contains `TOKEN`, `SECRET`, `KEY` or `PASSWORD`.
 
-> **Note:** `max_retries` and `restart_delay` are currently parsed but not applied by the supervisor, which always uses its built-in defaults (tracked in [#15](https://github.com/UnityInFlow/mcp-hub/issues/15)). Setting them has no effect until that lands.
-
 ## Web UI
 
-The web UI is served at `http://localhost:3456` by default (configurable via `[hub] web_port`). It shows:
+The web UI is served at `http://127.0.0.1:3456` by default (configurable via `[hub] web_port`). It listens on the loopback interface only and has no authentication. It shows:
 
 - Live server status cards with health state
 - MCP tool browser with per-server tool listings
 - Real-time log viewer with SSE streaming and per-server filtering
+
+It also serves `GET /health`, a JSON summary that returns HTTP 503 when a server has failed.
 
 ## License
 
