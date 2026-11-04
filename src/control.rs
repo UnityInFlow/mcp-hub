@@ -507,6 +507,7 @@ where
     }
 
     // Subscribe before taking the snapshot so no line falls in the gap.
+    let subscribed_at = std::time::SystemTime::now();
     let mut rx = state.log_agg.subscribe();
 
     let mut backlog = match &server {
@@ -540,6 +541,16 @@ where
             return Ok(());
         }
     }
+
+    // Only lines captured around the moment we subscribed can arrive both in
+    // the snapshot and on the broadcast; keep just those for de-duplication so
+    // a large `--lines` replay doesn't cost a scan per live line forever. The
+    // 1 s margin covers a line timestamped just before `subscribe()` but
+    // broadcast just after it.
+    let dedup_floor = subscribed_at
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or(subscribed_at);
+    backlog.retain(|l| l.timestamp >= dedup_floor);
 
     let mut scratch = [0u8; 256];
     loop {
