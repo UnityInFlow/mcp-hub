@@ -5,7 +5,7 @@ use anyhow::Context as _;
 
 use crate::cli::{GenConfigArgs, GenConfigFormat, LogsArgs, RestartArgs};
 use crate::control::{self, DaemonRequest, DaemonResponse};
-use crate::{config, daemon, gen_config};
+use crate::{config, daemon, gen_config, output};
 
 /// Send `request` to the daemon and turn a failure response into an error.
 ///
@@ -52,11 +52,16 @@ pub async fn restart(args: RestartArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `mcp-hub status`: print the daemon's status JSON.
-pub async fn status() -> anyhow::Result<()> {
+/// `mcp-hub status`: print the daemon's status as a table, or as JSON with `--json`.
+pub async fn status(json: bool, color: bool) -> anyhow::Result<()> {
     let response = send_checked(&DaemonRequest::Status, 5, Some("Status failed")).await?;
-    if let Some(data) = response.data {
+    let Some(data) = response.data else {
+        return Ok(());
+    };
+    if json {
         println!("{}", serde_json::to_string_pretty(&data)?);
+    } else {
+        println!("{}", output::format_status_json(&data, color)?);
     }
     Ok(())
 }

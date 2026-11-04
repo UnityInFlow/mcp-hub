@@ -209,7 +209,7 @@ pub async fn shutdown_process(mut child: tokio::process::Child, pid: u32) -> any
 /// The attempt counter is capped at 10 before the pow to prevent integer overflow (PITFALL #3).
 /// The result is floored at 100 ms.
 pub fn compute_backoff_delay(attempt: u32, config: &BackoffConfig) -> Duration {
-    use rand::Rng as _;
+    use rand::RngExt as _;
 
     // Cap attempt to prevent u32 overflow in 2^attempt.
     let capped_attempt = attempt.min(10);

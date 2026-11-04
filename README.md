@@ -115,7 +115,7 @@ mcp-hub start
 | `mcp-hub start --daemon` | Start all servers as a background daemon |
 | `mcp-hub stop` | Stop the running daemon |
 | `mcp-hub restart <name>` | Restart a specific server |
-| `mcp-hub status` | Show status of all servers (daemon mode) |
+| `mcp-hub status` | Show status of all servers as a table (daemon mode); `--json` for raw JSON |
 | `mcp-hub logs` | Show recent logs from all servers |
 | `mcp-hub logs --server <name>` | Show logs for a specific server |
 | `mcp-hub logs --follow` | Stream live logs from all servers (recent lines first; Ctrl+C to stop) |
