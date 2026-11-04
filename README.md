@@ -95,6 +95,8 @@ mcp-hub start
 | `mcp-hub status` | Show status of all servers (daemon mode) |
 | `mcp-hub logs` | Show recent logs from all servers |
 | `mcp-hub logs --server <name>` | Show logs for a specific server |
+| `mcp-hub logs --follow` | Stream live logs from all servers (recent lines first; Ctrl+C to stop) |
+| `mcp-hub logs --follow --server <name>` | Stream live logs for one server |
 | `mcp-hub reload` | Reload config and apply changes without restart |
 | `mcp-hub init` | Interactive wizard to add a new server |
 | `mcp-hub gen-config --format claude` | Generate Claude Code mcpServers JSON block |

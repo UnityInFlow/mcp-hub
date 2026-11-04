@@ -51,7 +51,7 @@ Read these before making architectural or scope decisions.
 - [x] Process lifecycle: start, stop, restart, status for all servers
 - [x] Health monitoring: heartbeat checks with configurable interval
 - [x] Auto-restart on crash with exponential backoff (1s -> 2s -> 4s -> max 60s)
-- [ ] Unified log view: `mcp-hub logs --follow` streams all servers interleaved
+- [x] Unified log view: `mcp-hub logs --follow` streams all servers interleaved
 - [x] Web UI: lists all running servers and available tools from MCP introspection
 - [x] Claude Code config generator: outputs correct settings.json mcpServers block
 - [x] Cursor config generator: outputs Cursor MCP config snippet

@@ -63,6 +63,9 @@ pub async fn status() -> anyhow::Result<()> {
 
 /// `mcp-hub logs`: print recent log lines from the daemon.
 pub async fn logs(args: LogsArgs) -> anyhow::Result<()> {
+    if args.follow {
+        return logs_follow(args).await;
+    }
     let request = DaemonRequest::Logs {
         server: args.server,
         lines: args.lines,
@@ -76,6 +79,37 @@ pub async fn logs(args: LogsArgs) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// `mcp-hub logs --follow`: print the recent lines, then stream live ones until
+/// the daemon closes the connection or the user presses Ctrl+C.
+async fn logs_follow(args: LogsArgs) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    let sock = daemon::socket_path()?;
+    let request = DaemonRequest::LogsFollow {
+        server: args.server,
+        lines: args.lines,
+    };
+    let mut stream = control::open_daemon_stream(&sock, &request, 5)
+        .await
+        .map_err(|e| anyhow::anyhow!("Logs failed: {e}"))?;
+
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => return Ok(()),
+            event = stream.next_event() => match event? {
+                Some(event) => {
+                    let mut out = std::io::stdout().lock();
+                    // A closed pipe (e.g. `| head`) ends the follow quietly.
+                    if writeln!(out, "{}", event.render()).and_then(|()| out.flush()).is_err() {
+                        return Ok(());
+                    }
+                }
+                None => return Ok(()),
+            },
+        }
+    }
 }
 
 /// `mcp-hub reload`: ask the daemon to re-read its config and apply the diff.

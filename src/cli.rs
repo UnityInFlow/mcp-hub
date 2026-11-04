@@ -88,7 +88,7 @@ pub struct RestartArgs {
 /// Arguments for the `logs` subcommand.
 #[derive(Debug, clap::Args)]
 pub struct LogsArgs {
-    /// Follow log output (streams new lines). Requires daemon mode (Phase 3).
+    /// Follow log output: print recent lines, then stream new ones (requires a running daemon).
     #[arg(short = 'f', long)]
     pub follow: bool,
 
