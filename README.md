@@ -92,7 +92,7 @@ mcp-hub start
 | `mcp-hub start --daemon` | Start all servers as a background daemon |
 | `mcp-hub stop` | Stop the running daemon |
 | `mcp-hub restart <name>` | Restart a specific server |
-| `mcp-hub status` | Show status of all servers (daemon mode) |
+| `mcp-hub status` | Show status of all servers as a table (daemon mode); `--json` for raw JSON |
 | `mcp-hub logs` | Show recent logs from all servers |
 | `mcp-hub logs --server <name>` | Show logs for a specific server |
 | `mcp-hub logs --follow` | Stream live logs from all servers (recent lines first; Ctrl+C to stop) |
@@ -101,6 +101,10 @@ mcp-hub start
 | `mcp-hub init` | Interactive wizard to add a new server |
 | `mcp-hub gen-config --format claude` | Generate Claude Code mcpServers JSON block |
 | `mcp-hub gen-config --format cursor` | Generate Cursor MCP config snippet |
+| `mcp-hub gen-config --format codex` | Generate Codex CLI `[mcp_servers.<name>]` TOML |
+| `mcp-hub gen-config --format gemini` | Generate Gemini CLI `mcpServers` JSON block |
+
+**Codex CLI / Gemini CLI.** `--format codex` prints TOML to append to `~/.codex/config.toml` (or `.codex/config.toml` in a trusted project); `--format gemini` prints JSON to merge into `~/.gemini/settings.json` (user) or `.gemini/settings.json` (project). As with the other formats, stdout holds only the config document and the destination hint and warnings go to stderr, so `mcp-hub gen-config -f codex >> ~/.codex/config.toml` works. `cwd` is emitted for these two formats when a server sets one. `transport = "http"` servers are skipped with a warning.
 
 ## Configuration
 
