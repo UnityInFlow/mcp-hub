@@ -43,6 +43,46 @@ pub enum DaemonRequest {
     },
     /// Reload the config file and apply changes without restarting the daemon.
     Reload,
+    /// Stream log lines until the client disconnects or the daemon shuts down.
+    ///
+    /// The daemon answers with one ordinary [`DaemonResponse`] line (ok, or an
+    /// error such as an unknown server) and, on success, keeps the connection
+    /// open and writes one [`FollowEvent`] JSON object per line: the last
+    /// `lines` buffered lines first, then live lines.
+    LogsFollow {
+        /// Limit output to this server; `None` means all servers.
+        server: Option<String>,
+        /// Number of buffered lines to send before switching to live lines.
+        lines: usize,
+    },
+}
+
+/// One event on a `LogsFollow` stream (after the initial [`DaemonResponse`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum FollowEvent {
+    /// A formatted log line, identical to what `logs` prints.
+    Line {
+        /// The formatted line (`server | timestamp message`).
+        text: String,
+    },
+    /// The client fell behind and the daemon dropped log lines.
+    Lagged {
+        /// How many lines were dropped.
+        dropped: u64,
+    },
+}
+
+impl FollowEvent {
+    /// Text the client prints for this event.
+    pub fn render(&self) -> String {
+        match self {
+            FollowEvent::Line { text } => text.clone(),
+            FollowEvent::Lagged { dropped } => {
+                format!("[mcp-hub] \u{2026} {dropped} log lines dropped (client too slow)")
+            }
+        }
+    }
 }
 
 /// A response returned by the daemon for a single `DaemonRequest`.
@@ -422,6 +462,12 @@ async fn handle_connection(
     let request: DaemonRequest =
         serde_json::from_slice(&buf).map_err(|e| anyhow::anyhow!("Invalid request JSON: {e}"))?;
 
+    if let DaemonRequest::LogsFollow { server, lines } = request {
+        // The read timeout and size cap above only guard the request line; the
+        // stream below is deliberately unbounded in time.
+        return follow_logs(reader, writer, &state, server, lines).await;
+    }
+
     let response = dispatch_request(request, &state).await;
 
     let mut response_json = serde_json::to_string(&response)?;
@@ -430,6 +476,116 @@ async fn handle_connection(
     writer.flush().await?;
 
     Ok(())
+}
+
+#[cfg(unix)]
+/// Serve a `LogsFollow` request: ack, replay the tail, then stream live lines.
+///
+/// Returns when the client disconnects, a write fails, or the daemon shuts down.
+async fn follow_logs<R>(
+    mut reader: R,
+    mut writer: tokio::net::unix::OwnedWriteHalf,
+    state: &DaemonState,
+    server: Option<String>,
+    lines: usize,
+) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::broadcast::error::RecvError;
+
+    async fn send_json<T: Serialize>(
+        w: &mut tokio::net::unix::OwnedWriteHalf,
+        value: &T,
+    ) -> anyhow::Result<()> {
+        let mut json = serde_json::to_string(value)?;
+        json.push('\n');
+        w.write_all(json.as_bytes()).await?;
+        w.flush().await?;
+        Ok(())
+    }
+
+    // Subscribe before taking the snapshot so no line falls in the gap.
+    let subscribed_at = std::time::SystemTime::now();
+    let mut rx = state.log_agg.subscribe();
+
+    let mut backlog = match &server {
+        Some(name) => match state.log_agg.get_buffer(name) {
+            Some(buf) => buf.snapshot_last(lines).await,
+            None => {
+                let resp = DaemonResponse::err(format!("Unknown server: '{name}'"));
+                send_json(&mut writer, &resp).await?;
+                return Ok(());
+            }
+        },
+        None => {
+            let all = state.log_agg.snapshot_all().await;
+            let start = all.len().saturating_sub(lines);
+            all[start..].to_vec()
+        }
+    };
+
+    // A client that vanished mid-stream is a normal end, not an error.
+    if send_json(&mut writer, &DaemonResponse::ok_empty())
+        .await
+        .is_err()
+    {
+        return Ok(());
+    }
+    for line in &backlog {
+        let event = FollowEvent::Line {
+            text: crate::logs::format_log_line(line, false),
+        };
+        if send_json(&mut writer, &event).await.is_err() {
+            return Ok(());
+        }
+    }
+
+    // Only lines captured around the moment we subscribed can arrive both in
+    // the snapshot and on the broadcast; keep just those for de-duplication so
+    // a large `--lines` replay doesn't cost a scan per live line forever. The
+    // 1 s margin covers a line timestamped just before `subscribe()` but
+    // broadcast just after it.
+    let dedup_floor = subscribed_at
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or(subscribed_at);
+    backlog.retain(|l| l.timestamp >= dedup_floor);
+
+    let mut scratch = [0u8; 256];
+    loop {
+        let event = tokio::select! {
+            () = state.shutdown.cancelled() => return Ok(()),
+            // Any EOF or error on the read half means the client went away.
+            read = reader.read(&mut scratch) => match read {
+                Ok(0) | Err(_) => return Ok(()),
+                Ok(_) => continue, // stray client bytes are ignored
+            },
+            received = rx.recv() => match received {
+                Ok(line) => {
+                    if server.as_deref().is_some_and(|name| line.server != name) {
+                        continue;
+                    }
+                    // Drop lines already replayed from the snapshot (they were
+                    // pushed between subscribing and snapshotting).
+                    if let Some(pos) = backlog.iter().position(|b| {
+                        b.server == line.server
+                            && b.timestamp == line.timestamp
+                            && b.message == line.message
+                    }) {
+                        backlog.swap_remove(pos);
+                        continue;
+                    }
+                    FollowEvent::Line { text: crate::logs::format_log_line(&line, false) }
+                }
+                Err(RecvError::Lagged(n)) => FollowEvent::Lagged { dropped: n },
+                Err(RecvError::Closed) => return Ok(()),
+            },
+        };
+        if send_json(&mut writer, &event).await.is_err() {
+            return Ok(());
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -506,6 +662,11 @@ async fn dispatch_request(request: DaemonRequest, state: &DaemonState) -> Daemon
             }
         },
 
+        // Handled by `handle_connection` (needs the connection); never routed here.
+        DaemonRequest::LogsFollow { .. } => {
+            DaemonResponse::err("logs_follow is a streaming request".to_string())
+        }
+
         DaemonRequest::Reload => match reload_config(state).await {
             Ok(summary) => match serde_json::to_value(summary) {
                 Ok(data) => DaemonResponse::success(data),
@@ -568,6 +729,107 @@ pub async fn send_daemon_command(
     Ok(response)
 }
 
+#[cfg(unix)]
+/// Open a streaming request: send `request`, read the initial response, and
+/// return the still-open line reader for the follow-up events.
+///
+/// Only the connect and the first response are bounded by `timeout_secs`; the
+/// stream itself is not. A failure response becomes an error.
+pub async fn open_daemon_stream(
+    sock_path: &Path,
+    request: &DaemonRequest,
+    timeout_secs: u64,
+) -> anyhow::Result<DaemonStream> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    let stream = tokio::time::timeout(
+        Duration::from_secs(timeout_secs),
+        UnixStream::connect(sock_path),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Connection to daemon timed out after {timeout_secs}s"))?
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "Cannot connect to daemon socket ({}): {e}\nIs the daemon running? Start with: mcp-hub start --daemon",
+            sock_path.display()
+        )
+    })?;
+
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+
+    let mut json = serde_json::to_string(request)?;
+    json.push('\n');
+    writer.write_all(json.as_bytes()).await?;
+    writer.flush().await?;
+
+    let first = tokio::time::timeout(Duration::from_secs(timeout_secs), lines.next_line())
+        .await
+        .map_err(|_| anyhow::anyhow!("Daemon response timed out after {timeout_secs}s"))?
+        .map_err(|e| anyhow::anyhow!("Error reading daemon response: {e}"))?
+        .ok_or_else(|| anyhow::anyhow!("Daemon closed connection without responding"))?;
+    let response: DaemonResponse = serde_json::from_str(&first)
+        .map_err(|e| anyhow::anyhow!("Invalid daemon response JSON: {e}"))?;
+    if !response.ok {
+        anyhow::bail!(
+            "{}",
+            response
+                .error
+                .unwrap_or_else(|| "unknown error".to_string())
+        );
+    }
+    Ok(DaemonStream {
+        lines,
+        _writer: writer,
+    })
+}
+
+#[cfg(unix)]
+/// An open streaming connection to the daemon (see [`open_daemon_stream`]).
+pub struct DaemonStream {
+    lines: tokio::io::Lines<tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>>,
+    /// Held open: closing the write half would look like a disconnect to the daemon.
+    _writer: tokio::net::unix::OwnedWriteHalf,
+}
+
+#[cfg(unix)]
+impl DaemonStream {
+    /// Next event from the daemon; `None` at end of stream.
+    pub async fn next_event(&mut self) -> anyhow::Result<Option<FollowEvent>> {
+        match self.lines.next_line().await? {
+            Some(line) => {
+                Ok(Some(serde_json::from_str(&line).map_err(|e| {
+                    anyhow::anyhow!("Invalid daemon stream event JSON: {e}")
+                })?))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+/// Stub: streaming is not supported on non-Unix platforms.
+pub async fn open_daemon_stream(
+    _sock_path: &Path,
+    _request: &DaemonRequest,
+    _timeout_secs: u64,
+) -> anyhow::Result<DaemonStream> {
+    anyhow::bail!("Unix domain socket IPC is not supported on this platform. Use foreground mode.")
+}
+
+#[cfg(not(unix))]
+/// Placeholder: streaming is not available on this platform.
+pub struct DaemonStream;
+
+#[cfg(not(unix))]
+impl DaemonStream {
+    /// Never reached: [`open_daemon_stream`] always fails on this platform.
+    pub async fn next_event(&mut self) -> anyhow::Result<Option<FollowEvent>> {
+        Ok(None)
+    }
+}
+
 #[cfg(not(unix))]
 /// Stub: Unix domain socket IPC is not supported on non-Unix platforms.
 pub async fn send_daemon_command(
@@ -576,4 +838,39 @@ pub async fn send_daemon_command(
     _timeout_secs: u64,
 ) -> anyhow::Result<DaemonResponse> {
     anyhow::bail!("Unix domain socket IPC is not supported on this platform. Use foreground mode.")
+}
+
+#[cfg(test)]
+mod follow_event_tests {
+    use super::*;
+
+    #[test]
+    fn lagged_marker_is_visible_and_counts_lines() {
+        let text = FollowEvent::Lagged { dropped: 42 }.render();
+        assert!(text.starts_with("[mcp-hub]"), "{text}");
+        assert!(
+            text.contains("42 log lines dropped (client too slow)"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn follow_events_round_trip_as_one_json_line() {
+        for ev in [
+            FollowEvent::Line {
+                text: "a | t m".into(),
+            },
+            FollowEvent::Lagged { dropped: 3 },
+        ] {
+            let json = serde_json::to_string(&ev).expect("serialise");
+            assert!(!json.contains('\n'));
+            let back: FollowEvent = serde_json::from_str(&json).expect("parse");
+            assert_eq!(back, ev);
+        }
+    }
+
+    #[test]
+    fn line_event_renders_text_unchanged() {
+        assert_eq!(FollowEvent::Line { text: "x".into() }.render(), "x");
+    }
 }
