@@ -5,8 +5,8 @@
      hx-get="/logs" hx-target="#main" hx-push-url="true"
      class="filter-pill {% if active_filter.is_none() %}active{% endif %}">All</a>
   {% for server in servers %}
-  <a href="/logs?server={{ server.name }}"
-     hx-get="/logs?server={{ server.name }}" hx-target="#main" hx-push-url="true"
+  <a href="{{ server.href }}"
+     hx-get="{{ server.href }}" hx-target="#main" hx-push-url="true"
      class="filter-pill {% if server.active %}active{% endif %}">{{ server.name }}</a>
   {% endfor %}
 </div>
