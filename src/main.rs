@@ -1,22 +1,10 @@
-mod cli;
-mod config;
-mod control;
-mod daemon;
-mod gen_config;
-mod init;
-mod logs;
-mod mcp;
-mod output;
-mod supervisor;
-mod types;
-mod web;
-
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
 use clap::Parser;
-use cli::{Cli, Commands};
+use mcp_hub::cli::{Cli, Commands};
+use mcp_hub::{config, control, daemon, gen_config, init, logs, output, supervisor, web};
 use tokio_util::sync::CancellationToken;
 
 /// State handed from the pre-fork phase of `main` to the daemon.
