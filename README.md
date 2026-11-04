@@ -27,7 +27,8 @@ mcp-hub gen-config --format claude   # paste into .mcp.json
 - **Streams logs.** `mcp-hub logs --follow` interleaves the stderr of all servers (or one, with `--server`).
 - **Serves a local web UI.** Status, a tools browser and live logs at `http://127.0.0.1:3456`, plus a `/health` JSON endpoint that returns HTTP 503 when a server has failed.
 - **Generates client config.** `mcp-hub gen-config --format claude|cursor|codex|gemini` prints the config document on stdout (notes go to stderr). `${VAR}` and `${VAR:-default}` are expanded in `env` and `args`, and `env_file` is supported.
-- **Runs as a daemon.** `start --daemon` waits until the servers and sockets are up and reports startup errors; its output goes to `daemon.log` next to the control socket (or `--log-file`). `mcp-hub reload` applies config changes and reports how many servers were added, removed and changed.
+- **One daemon per project.** Each config file gets its own daemon, so several projects can run side by side (see [Several projects](#several-projects)).
+- **Runs as a daemon.** `start --daemon` waits until the servers and sockets are up and reports startup errors; its output goes to `daemon-<key>.log` in the state directory (or `--log-file`). `mcp-hub reload` applies config changes and reports how many servers were added, removed and changed.
 
 ## What it does not do
 
@@ -35,7 +36,6 @@ mcp-hub gen-config --format claude   # paste into .mcp.json
 - **It does not install MCP servers.** `command` is whatever you would type in a terminal (`npx ...`, `uvx ...`, a local binary).
 - **It does not manage remote machines.** Everything runs on the local host, and the control socket is local.
 - **The web UI has no authentication.** It only binds to `127.0.0.1`; do not expose that port to other machines.
-- **One daemon per user.** The control socket lives in a single per-user location (`~/.config/mcp-hub/` on Linux), so you cannot run several independent daemons for different projects ([#21](https://github.com/UnityInFlow/mcp-hub/issues/21)).
 - **Linux and macOS only (Unix-like systems); Windows is not supported** ([#30](https://github.com/UnityInFlow/mcp-hub/issues/30)).
 - **No Homebrew formula yet** ([#7](https://github.com/UnityInFlow/mcp-hub/issues/7)); use `cargo binstall` or `cargo install`.
 
@@ -121,6 +121,7 @@ mcp-hub start
 | `mcp-hub logs --follow` | Stream live logs from all servers (recent lines first; Ctrl+C to stop) |
 | `mcp-hub logs --follow --server <name>` | Stream live logs for one server |
 | `mcp-hub reload` | Reload config and apply changes without restart |
+| `-c <config>` (any command) | Target the daemon of that config file, from any directory |
 | `mcp-hub init` | Interactive wizard to add a new server |
 | `mcp-hub gen-config --format claude` | Generate Claude Code mcpServers JSON block |
 | `mcp-hub gen-config --format cursor` | Generate Cursor MCP config snippet |
@@ -161,6 +162,19 @@ restart_delay = 1        # Base restart backoff delay in seconds (default: 1)
 - A lone `$` or `$NAME` without braces is left as written. `NAME` must match `[A-Za-z_][A-Za-z0-9_]*`, and an unterminated `${` is an error.
 
 `command`, `cwd` and `env_file` are not expanded, and values read from `env_file` are always literal; `env_file` remains the alternative for secrets you would rather keep in a separate file. `mcp-hub gen-config` writes the expanded values (that is what ends up in `.mcp.json`), and prints a warning on stderr when one of them came from a variable whose name contains `TOKEN`, `SECRET`, `KEY` or `PASSWORD`.
+
+## Several projects
+
+mcp-hub runs **one daemon per config file**. A daemon is identified by the canonical path of its config (`-c <path>`, else `./mcp-hub.toml`, else `~/.config/mcp-hub/mcp-hub.toml`), so `mcp-hub start --daemon` in two project directories starts two independent daemons.
+
+- **Every command targets one project.** `stop`, `restart`, `status`, `logs`, `reload` and `gen-config --live` resolve the config exactly like `start` does, then talk to that project's daemon. Use `-c path/to/mcp-hub.toml` to target a project from anywhere.
+- **Without a config in sight** (for example `mcp-hub stop` in a directory without `mcp-hub.toml`): if exactly one daemon is running it is used (its config is printed on stderr); if several are running, the error lists their configs and asks for `-c`.
+- **Give each project its own `web_port`.** Each daemon binds its `[hub] web_port` (default 3456); a second project with the same port fails to start and the error names the config to change.
+- **`mcp-hub status`** starts with `Daemon for <config> (pid N, web UI http://127.0.0.1:PORT)`. `--json` is unchanged.
+
+State lives in the state directory (`~/.config/mcp-hub/` on Linux, `~/Library/Application Support/mcp-hub/` on macOS; override with `MCP_HUB_STATE_DIR`), as `mcp-hub-<key>.sock`, `.pid`, `.json` (config path, pid, web port) and `daemon-<key>.log`, where `<key>` is 12 hex characters derived from the config path.
+
+If you upgrade while an older (single-socket) daemon is still running, commands keep talking to it and print a note; `start --daemon` refuses until you `mcp-hub stop` it.
 
 ## Web UI
 

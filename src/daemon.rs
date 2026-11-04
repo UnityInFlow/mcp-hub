@@ -54,44 +54,321 @@ pub fn ensure_private_dir(dir: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Resolve the daemon Unix socket path: `~/.config/mcp-hub/mcp-hub.sock`
-///
-/// The path can be overridden with the `MCP_HUB_SOCKET` environment variable.
-/// This override is used by integration tests to isolate daemon instances.
-///
-/// Creates the parent directory if it does not already exist, with mode `0700`.
-/// The default state directory is additionally tightened to `0700` if it
-/// already exists with looser permissions. A pre-existing parent of an
-/// `MCP_HUB_SOCKET` override is never modified (it may be e.g. `/tmp`).
-pub fn socket_path() -> anyhow::Result<PathBuf> {
-    if let Ok(override_path) = std::env::var("MCP_HUB_SOCKET") {
-        let p = PathBuf::from(override_path);
-        if let Some(parent) = p.parent() {
-            create_dir_all_private(parent)?;
-        }
-        return Ok(p);
+/// Longest socket path we accept. macOS limits `sun_path` to 104 bytes
+/// (Linux: 108); stay safely below both.
+const MAX_SOCKET_PATH_BYTES: usize = 100;
+
+/// The per-user state directory holding every project's socket, PID file, meta
+/// file and log: `$MCP_HUB_STATE_DIR` if set, else `<config_dir>/mcp-hub`
+/// (`~/.config/mcp-hub` on Linux, `~/Library/Application Support/mcp-hub` on
+/// macOS). Created with mode `0700`; the default directory is tightened to
+/// `0700` if it already exists with looser permissions, while a pre-existing
+/// `MCP_HUB_STATE_DIR` is never modified.
+pub fn state_dir() -> anyhow::Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("MCP_HUB_STATE_DIR").filter(|d| !d.is_empty()) {
+        let dir = PathBuf::from(dir);
+        create_dir_all_private(&dir)?;
+        return Ok(dir);
     }
     let config_dir =
         dirs::config_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine config directory"))?;
     let dir = config_dir.join("mcp-hub");
     ensure_private_dir(&dir)?;
-    Ok(dir.join("mcp-hub.sock"))
+    Ok(dir)
+}
+
+/// 64-bit FNV-1a. Unlike `DefaultHasher` it is specified, so a project's key
+/// (and therefore its socket name) is the same across Rust versions and builds.
+pub fn fnv1a_64(bytes: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    bytes.iter().fold(OFFSET_BASIS, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(PRIME)
+    })
+}
+
+/// The key identifying a project's daemon: 12 hex characters of the FNV-1a hash
+/// of the canonical config path. Symlinks and relative paths that point at the
+/// same file give the same key.
+pub fn project_key(config_path: &std::path::Path) -> anyhow::Result<String> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let canonical = std::fs::canonicalize(config_path)
+        .map_err(|e| anyhow::anyhow!("Cannot resolve config {}: {e}", config_path.display()))?;
+    let hash = fnv1a_64(canonical.as_os_str().as_bytes());
+    Ok(format!("{hash:016x}")[..12].to_string())
+}
+
+fn check_socket_len(sock: PathBuf) -> anyhow::Result<PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let len = sock.as_os_str().as_bytes().len();
+    if len > MAX_SOCKET_PATH_BYTES {
+        anyhow::bail!(
+            "Control socket path is too long ({len} bytes, limit {MAX_SOCKET_PATH_BYTES}): {}. \
+             Set MCP_HUB_STATE_DIR to a shorter directory.",
+            sock.display()
+        );
+    }
+    Ok(sock)
+}
+
+/// Resolve the daemon Unix socket path for the project `key`:
+/// `<state dir>/mcp-hub-<key>.sock`.
+///
+/// `MCP_HUB_SOCKET` overrides the path entirely (used by integration tests to
+/// isolate daemons); its missing parent directory is created with mode `0700`
+/// but a pre-existing parent (e.g. `/tmp`) is never modified.
+pub fn socket_path(key: &str) -> anyhow::Result<PathBuf> {
+    if let Some(p) = override_socket_path()? {
+        return Ok(p);
+    }
+    check_socket_len(state_dir()?.join(format!("mcp-hub-{key}.sock")))
+}
+
+/// The `MCP_HUB_SOCKET` override, with its parent directory created.
+pub fn override_socket_path() -> anyhow::Result<Option<PathBuf>> {
+    let Some(raw) = std::env::var_os("MCP_HUB_SOCKET") else {
+        return Ok(None);
+    };
+    let p = PathBuf::from(raw);
+    if let Some(parent) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
+        create_dir_all_private(parent)?;
+    }
+    Ok(Some(p))
+}
+
+/// The pre-per-project socket (`<state dir>/mcp-hub.sock`) of a daemon started
+/// by an older mcp-hub.
+pub fn legacy_socket_path() -> anyhow::Result<PathBuf> {
+    Ok(state_dir()?.join("mcp-hub.sock"))
+}
+
+/// Whether something accepts connections on the Unix socket at `sock`.
+pub fn socket_is_live(sock: &std::path::Path) -> bool {
+    std::os::unix::net::UnixStream::connect(sock).is_ok()
+}
+
+/// Everything `start --daemon` needs to know about the project it starts.
+#[derive(Debug, Clone)]
+pub struct StartPaths {
+    /// Canonical path of the config file that identifies the project.
+    pub config_path: PathBuf,
+    pub sock: PathBuf,
+    pub pid: PathBuf,
+    pub meta: PathBuf,
+    pub log: PathBuf,
+}
+
+/// Resolve the project (config file) and derive its daemon paths.
+///
+/// With a `MCP_HUB_SOCKET` / `MCP_HUB_PID` override those win individually.
+pub fn start_paths(
+    config_flag: Option<&std::path::Path>,
+    log_file: Option<&std::path::Path>,
+) -> anyhow::Result<StartPaths> {
+    let config = crate::config::locate_config(config_flag)?.ok_or_else(|| {
+        anyhow::anyhow!("No mcp-hub.toml found. Create one or run `mcp-hub init`.")
+    })?;
+    let config_path = std::fs::canonicalize(&config).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to load config {}: cannot resolve path: {e}",
+            config.display()
+        )
+    })?;
+    let key = project_key(&config_path)?;
+    let sock = socket_path(&key)?;
+    Ok(StartPaths {
+        config_path,
+        pid: pid_path(&key)?,
+        meta: meta_path_for(&sock),
+        log: log_path(log_file, &key)?,
+        sock,
+    })
+}
+
+/// Refuse to start next to a live daemon from before per-project daemons.
+///
+/// Such a daemon owns `<state dir>/mcp-hub.sock` and may serve this very
+/// config; there is no way to tell, so the user must stop it first. Skipped
+/// when `MCP_HUB_SOCKET` is overridden (the legacy socket is then irrelevant).
+pub fn check_legacy_daemon() -> anyhow::Result<()> {
+    if std::env::var_os("MCP_HUB_SOCKET").is_some() {
+        return Ok(());
+    }
+    let legacy = legacy_socket_path()?;
+    if socket_is_live(&legacy) {
+        anyhow::bail!(
+            "A pre-upgrade mcp-hub daemon is already running (socket: {}). \
+             Run `mcp-hub stop` to stop it first, then start again.",
+            legacy.display()
+        );
+    }
+    Ok(())
+}
+
+/// The daemon a client command talks to.
+#[derive(Debug, Clone)]
+pub struct Target {
+    pub sock: PathBuf,
+    /// What the daemon recorded about itself (absent for pre-upgrade daemons).
+    pub meta: Option<DaemonMeta>,
+}
+
+/// Find the daemon a client command (`stop`, `status`, ...) should talk to.
+///
+/// 1. `MCP_HUB_SOCKET` set: that socket.
+/// 2. A config resolves (`-c`, `./mcp-hub.toml`, global): the daemon of that
+///    config; if it has no socket but a pre-upgrade daemon is live, that one.
+/// 3. No config: the only live daemon in the state dir; several is an error
+///    listing their configs, none the usual "no daemon" error.
+pub fn resolve_target(config_flag: Option<&std::path::Path>) -> anyhow::Result<Target> {
+    if let Some(sock) = override_socket_path()? {
+        let meta = read_meta(&meta_path_for(&sock));
+        return Ok(Target { sock, meta });
+    }
+
+    if let Some(config) = crate::config::locate_config(config_flag)? {
+        let key = project_key(&config)?;
+        let sock = socket_path(&key)?;
+        if !sock.exists() {
+            if let Some(target) = legacy_target()? {
+                return Ok(target);
+            }
+        }
+        let meta = read_meta(&meta_path_for(&sock));
+        return Ok(Target { sock, meta });
+    }
+
+    let mut live = list_live_daemons()?;
+    match live.len() {
+        0 => {
+            if let Some(target) = legacy_target()? {
+                return Ok(target);
+            }
+            anyhow::bail!(
+                "No mcp-hub daemon is running (and no mcp-hub.toml was found here).\n\
+                 Start one with: mcp-hub start --daemon -c <config>"
+            )
+        }
+        1 => {
+            let (sock, meta) = live.remove(0);
+            eprintln!("Using the daemon for {}", meta.config_path);
+            Ok(Target {
+                sock,
+                meta: Some(meta),
+            })
+        }
+        _ => {
+            let list: String = live
+                .iter()
+                .map(|(_, m)| format!("  {} (pid {})\n", m.config_path, m.pid))
+                .collect();
+            anyhow::bail!(
+                "Several mcp-hub daemons are running:\n{list}Pass -c <config> to choose one."
+            )
+        }
+    }
+}
+
+/// The pre-upgrade daemon as a target, if one is live.
+fn legacy_target() -> anyhow::Result<Option<Target>> {
+    let legacy = legacy_socket_path()?;
+    if !socket_is_live(&legacy) {
+        return Ok(None);
+    }
+    eprintln!(
+        "note: talking to a pre-upgrade mcp-hub daemon ({}); \
+         run `mcp-hub stop` and start again to move it to a per-project daemon",
+        legacy.display()
+    );
+    Ok(Some(Target {
+        sock: legacy,
+        meta: None,
+    }))
 }
 
 /// Resolve the daemon log file path.
 ///
-/// `explicit` (from `--log-file` / `MCP_HUB_LOG_FILE`) wins; otherwise the log
-/// lives next to the control socket as `daemon.log`, so a `MCP_HUB_SOCKET`
-/// override keeps test daemons isolated.
-pub fn log_path(explicit: Option<&std::path::Path>) -> anyhow::Result<PathBuf> {
+/// `explicit` (from `--log-file` / `MCP_HUB_LOG_FILE`) wins. Otherwise, with a
+/// `MCP_HUB_SOCKET` override the log lives next to that socket as `daemon.log`
+/// (keeping test daemons isolated); by default it is `daemon-<key>.log` in the
+/// state directory.
+pub fn log_path(explicit: Option<&std::path::Path>, key: &str) -> anyhow::Result<PathBuf> {
     if let Some(p) = explicit {
         return Ok(p.to_path_buf());
     }
-    let sock = socket_path()?;
-    let dir = sock
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Socket path {} has no parent", sock.display()))?;
-    Ok(dir.join("daemon.log"))
+    if let Some(sock) = override_socket_path()? {
+        let dir = sock
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Socket path {} has no parent", sock.display()))?;
+        return Ok(dir.join("daemon.log"));
+    }
+    Ok(state_dir()?.join(format!("daemon-{key}.log")))
+}
+
+/// The meta file that sits next to a daemon's socket (`mcp-hub-<key>.json`).
+pub fn meta_path_for(sock: &std::path::Path) -> PathBuf {
+    sock.with_extension("json")
+}
+
+/// What a running daemon records about itself in its meta file.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DaemonMeta {
+    pub config_path: String,
+    pub pid: u32,
+    pub web_port: u16,
+    pub started_at: String,
+}
+
+/// Write `meta` to `path` with mode `0600`.
+pub fn write_meta(path: &std::path::Path, meta: &DaemonMeta) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+    let json = serde_json::to_string_pretty(meta)?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| anyhow::anyhow!("Failed to write {}: {e}", path.display()))?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.write_all(json.as_bytes())?;
+    Ok(())
+}
+
+/// Read a meta file; `None` if it is missing or malformed.
+pub fn read_meta(path: &std::path::Path) -> Option<DaemonMeta> {
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
+/// Live daemons in the state directory, found through their meta files and
+/// sorted by config path. A meta file whose socket no longer accepts
+/// connections belongs to a dead daemon and is skipped.
+pub fn list_live_daemons() -> anyhow::Result<Vec<(PathBuf, DaemonMeta)>> {
+    let dir = state_dir()?;
+    let mut found = Vec::new();
+    let entries = std::fs::read_dir(&dir)
+        .map_err(|e| anyhow::anyhow!("Failed to read {}: {e}", dir.display()))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_meta = path.extension().is_some_and(|e| e == "json")
+            && path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("mcp-hub-"));
+        if !is_meta {
+            continue;
+        }
+        let sock = path.with_extension("sock");
+        if let Some(meta) = read_meta(&path).filter(|_| socket_is_live(&sock)) {
+            found.push((sock, meta));
+        }
+    }
+    found.sort_by(|a, b| a.1.config_path.cmp(&b.1.config_path));
+    Ok(found)
 }
 
 /// Open (creating if needed) the daemon log file for appending, mode 0600.
@@ -116,17 +393,14 @@ pub fn open_log_file(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
     Ok(file)
 }
 
-/// Resolve the daemon PID file path: `~/.config/mcp-hub/mcp-hub.pid`
+/// Resolve the daemon PID file path: `<state dir>/mcp-hub-<key>.pid`.
 ///
-/// The path can be overridden with the `MCP_HUB_PID` environment variable.
-/// This override is used by integration tests to isolate daemon instances.
-pub fn pid_path() -> anyhow::Result<PathBuf> {
-    if let Ok(override_path) = std::env::var("MCP_HUB_PID") {
+/// `MCP_HUB_PID` overrides it (used by integration tests).
+pub fn pid_path(key: &str) -> anyhow::Result<PathBuf> {
+    if let Some(override_path) = std::env::var_os("MCP_HUB_PID") {
         return Ok(PathBuf::from(override_path));
     }
-    let config_dir =
-        dirs::config_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine config directory"))?;
-    Ok(config_dir.join("mcp-hub").join("mcp-hub.pid"))
+    Ok(state_dir()?.join(format!("mcp-hub-{key}.pid")))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -640,4 +914,85 @@ fn redirect_stdio(log_file: &std::fs::File) -> anyhow::Result<()> {
     // `devnull` and `log_file` are dropped (closed) by their owners; fds 0-2
     // keep the duplicated descriptions open.
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fnv1a_known_vectors() {
+        assert_eq!(fnv1a_64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a_64(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a_64(b"foobar"), 0x8594_4171_f739_67e8);
+    }
+
+    #[test]
+    fn project_key_is_stable_twelve_hex_and_distinguishes_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = dir.path().join("a.toml");
+        let b = dir.path().join("b.toml");
+        std::fs::write(&a, "").expect("write a");
+        std::fs::write(&b, "").expect("write b");
+
+        let ka = project_key(&a).expect("key a");
+        assert_eq!(ka.len(), 12);
+        assert!(ka.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(ka, project_key(&a).expect("key a again"));
+        assert_ne!(ka, project_key(&b).expect("key b"));
+    }
+
+    #[test]
+    fn project_key_matches_for_symlinks_and_non_canonical_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real.toml");
+        std::fs::write(&real, "").expect("write");
+        let link = dir.path().join("link.toml");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        std::fs::create_dir(dir.path().join("sub")).expect("mkdir");
+        let dotted = dir.path().join("sub").join("..").join("real.toml");
+
+        let key = project_key(&real).expect("key");
+        assert_eq!(key, project_key(&link).expect("link key"));
+        assert_eq!(key, project_key(&dotted).expect("dotted key"));
+    }
+
+    #[test]
+    fn project_key_of_missing_file_is_an_error() {
+        assert!(project_key(std::path::Path::new("/nonexistent/mcp-hub.toml")).is_err());
+    }
+
+    #[test]
+    fn macos_style_default_socket_path_fits_sun_path() {
+        let sock = format!(
+            "/Users/{}/Library/Application Support/mcp-hub/mcp-hub-0123456789ab.sock",
+            "a-reasonably-long-user-name"
+        );
+        assert!(sock.len() <= MAX_SOCKET_PATH_BYTES, "{}", sock.len());
+        assert!(check_socket_len(PathBuf::from(&sock)).is_ok());
+        let too_long = PathBuf::from(format!("/{}/mcp-hub-0123456789ab.sock", "x".repeat(100)));
+        assert!(check_socket_len(too_long).is_err());
+    }
+
+    #[test]
+    fn meta_round_trips_with_mode_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = meta_path_for(&dir.path().join("mcp-hub-0123456789ab.sock"));
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("mcp-hub-0123456789ab.json")
+        );
+        let meta = DaemonMeta {
+            config_path: "/p/mcp-hub.toml".into(),
+            pid: 42,
+            web_port: 3456,
+            started_at: "2026-01-01T00:00:00+00:00".into(),
+        };
+        write_meta(&path, &meta).expect("write");
+        assert_eq!(read_meta(&path), Some(meta));
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
 }

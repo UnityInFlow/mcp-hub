@@ -25,20 +25,20 @@ fn main() -> anyhow::Result<()> {
         } else {
             None
         };
-        let log_path = daemon::log_path(log_file.as_deref())?;
-        let sock = daemon::socket_path()?;
-        let pid = daemon::pid_path()?;
+        // Resolve the project's config first: it decides every daemon path.
+        let paths = daemon::start_paths(cli.config.as_deref(), log_file.as_deref())?;
         // If a live daemon is already running, bail out here (before fork).
-        daemon::check_existing_daemon(&sock, &pid)?;
+        daemon::check_existing_daemon(&paths.sock, &paths.pid)?;
+        daemon::check_legacy_daemon()?;
         // Load and validate the config while we still have a terminal, so a bad
         // config fails the command instead of vanishing into the background.
         let config = start::load_start_config(cli.config.as_deref())?;
         // Fork into background — the original process waits for readiness and
         // exits inside this call; only the daemon returns.
-        let notifier = daemon::daemonize_process(&log_path)?;
+        let notifier = daemon::daemonize_process(&paths.log)?;
         // We are now the daemon child. Write our PID and lock the file; losing
         // the lock means another daemon started in the meantime.
-        let pid_lock = match daemon::write_pid_file(&pid) {
+        let pid_lock = match daemon::write_pid_file(&paths.pid) {
             Ok(lock) => lock,
             Err(e) => {
                 notifier.fail(&format!("{e:#}"));
@@ -48,8 +48,10 @@ fn main() -> anyhow::Result<()> {
         startup = Some(DaemonStartup {
             config,
             notifier,
-            sock,
-            pid,
+            sock: paths.sock,
+            pid: paths.pid,
+            meta: paths.meta,
+            config_path: paths.config_path,
             pid_lock,
         });
     }
@@ -94,11 +96,11 @@ async fn async_main(cli: Cli, startup: Option<DaemonStartup>) -> anyhow::Result<
             }
             start::run_foreground(cli.config.as_deref(), color).await
         }
-        Commands::Stop => client::stop().await,
-        Commands::Restart(args) => client::restart(args).await,
-        Commands::Status { json } => client::status(json, color).await,
-        Commands::Logs(args) => client::logs(args).await,
-        Commands::Reload => client::reload().await,
+        Commands::Stop => client::stop(cli.config.as_deref()).await,
+        Commands::Restart(args) => client::restart(cli.config.as_deref(), args).await,
+        Commands::Status { json } => client::status(cli.config.as_deref(), json, color).await,
+        Commands::Logs(args) => client::logs(cli.config.as_deref(), args).await,
+        Commands::Reload => client::reload(cli.config.as_deref()).await,
         Commands::Init => init::run_init_wizard(),
         Commands::GenConfig(args) => client::gen_config(cli.config.as_deref(), args).await,
     }

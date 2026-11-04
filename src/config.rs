@@ -399,6 +399,29 @@ pub fn resolve_env(server: &ServerConfig) -> anyhow::Result<HashMap<String, Stri
     Ok(resolved)
 }
 
+/// The config file that identifies the current project: `explicit_path` if
+/// given, else `./mcp-hub.toml` if it exists, else the global
+/// `~/.config/mcp-hub/mcp-hub.toml` if it exists. `None` when nothing is found.
+///
+/// This is the file whose canonical path keys the project's daemon. (When both
+/// the local and the global file exist, [`find_and_load_config`] merges them,
+/// but the project is still the local one.)
+pub fn locate_config(
+    explicit_path: Option<&std::path::Path>,
+) -> anyhow::Result<Option<std::path::PathBuf>> {
+    if let Some(path) = explicit_path {
+        return Ok(Some(path.to_path_buf()));
+    }
+    let local = std::env::current_dir()
+        .context("Cannot determine current directory")?
+        .join("mcp-hub.toml");
+    if local.exists() {
+        return Ok(Some(local));
+    }
+    let global = dirs::config_dir().map(|d| d.join("mcp-hub").join("mcp-hub.toml"));
+    Ok(global.filter(|p| p.exists()))
+}
+
 /// Find and load config from the default locations, or from `explicit_path` if given.
 ///
 /// Search order:

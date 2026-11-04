@@ -12,12 +12,12 @@ use crate::{config, daemon, gen_config, output};
 /// `failure_prefix` is prepended to the daemon's error message (`None` uses the
 /// message as is). The error flows to `main`, which prints it and exits 1.
 async fn send_checked(
+    target: &daemon::Target,
     request: &DaemonRequest,
     timeout_secs: u64,
     failure_prefix: Option<&str>,
 ) -> anyhow::Result<DaemonResponse> {
-    let sock = daemon::socket_path()?;
-    let response = control::send_daemon_command(&sock, request, timeout_secs).await?;
+    let response = control::send_daemon_command(&target.sock, request, timeout_secs).await?;
     if response.ok {
         return Ok(response);
     }
@@ -31,16 +31,19 @@ async fn send_checked(
 }
 
 /// `mcp-hub stop`: ask the daemon to shut down.
-pub async fn stop() -> anyhow::Result<()> {
-    send_checked(&DaemonRequest::Stop, 5, None).await?;
+pub async fn stop(config: Option<&std::path::Path>) -> anyhow::Result<()> {
+    let target = daemon::resolve_target(config)?;
+    send_checked(&target, &DaemonRequest::Stop, 5, None).await?;
     println!("Daemon stop command sent. Shutting down...");
     Ok(())
 }
 
 /// `mcp-hub restart <name>`: restart one managed server.
-pub async fn restart(args: RestartArgs) -> anyhow::Result<()> {
+pub async fn restart(config: Option<&std::path::Path>, args: RestartArgs) -> anyhow::Result<()> {
+    let target = daemon::resolve_target(config)?;
     let server_name = args.name;
     send_checked(
+        &target,
         &DaemonRequest::Restart {
             name: server_name.clone(),
         },
@@ -53,29 +56,43 @@ pub async fn restart(args: RestartArgs) -> anyhow::Result<()> {
 }
 
 /// `mcp-hub status`: print the daemon's status as a table, or as JSON with `--json`.
-pub async fn status(json: bool, color: bool) -> anyhow::Result<()> {
-    let response = send_checked(&DaemonRequest::Status, 5, Some("Status failed")).await?;
+pub async fn status(
+    config: Option<&std::path::Path>,
+    json: bool,
+    color: bool,
+) -> anyhow::Result<()> {
+    let target = daemon::resolve_target(config)?;
+    let response = send_checked(&target, &DaemonRequest::Status, 5, Some("Status failed")).await?;
     let Some(data) = response.data else {
         return Ok(());
     };
     if json {
         println!("{}", serde_json::to_string_pretty(&data)?);
     } else {
+        // The JSON stays the daemon's raw response (`gen-config --live` and
+        // scripts parse it); the human view gets a header naming the daemon.
+        if let Some(meta) = &target.meta {
+            println!(
+                "Daemon for {} (pid {}, web UI http://127.0.0.1:{})",
+                meta.config_path, meta.pid, meta.web_port
+            );
+        }
         println!("{}", output::format_status_json(&data, color)?);
     }
     Ok(())
 }
 
 /// `mcp-hub logs`: print recent log lines from the daemon.
-pub async fn logs(args: LogsArgs) -> anyhow::Result<()> {
+pub async fn logs(config: Option<&std::path::Path>, args: LogsArgs) -> anyhow::Result<()> {
+    let target = daemon::resolve_target(config)?;
     if args.follow {
-        return logs_follow(args).await;
+        return logs_follow(&target, args).await;
     }
     let request = DaemonRequest::Logs {
         server: args.server,
         lines: args.lines,
     };
-    let response = send_checked(&request, 5, Some("Logs failed")).await?;
+    let response = send_checked(&target, &request, 5, Some("Logs failed")).await?;
     if let Some(lines) = response.data.as_ref().and_then(|d| d.as_array()) {
         for line in lines {
             if let Some(s) = line.as_str() {
@@ -88,15 +105,14 @@ pub async fn logs(args: LogsArgs) -> anyhow::Result<()> {
 
 /// `mcp-hub logs --follow`: print the recent lines, then stream live ones until
 /// the daemon closes the connection or the user presses Ctrl+C.
-async fn logs_follow(args: LogsArgs) -> anyhow::Result<()> {
+async fn logs_follow(target: &daemon::Target, args: LogsArgs) -> anyhow::Result<()> {
     use std::io::Write as _;
 
-    let sock = daemon::socket_path()?;
     let request = DaemonRequest::LogsFollow {
         server: args.server,
         lines: args.lines,
     };
-    let mut stream = control::open_daemon_stream(&sock, &request, 5)
+    let mut stream = control::open_daemon_stream(&target.sock, &request, 5)
         .await
         .map_err(|e| anyhow::anyhow!("Logs failed: {e}"))?;
 
@@ -118,9 +134,10 @@ async fn logs_follow(args: LogsArgs) -> anyhow::Result<()> {
 }
 
 /// `mcp-hub reload`: ask the daemon to re-read its config and apply the diff.
-pub async fn reload() -> anyhow::Result<()> {
+pub async fn reload(config: Option<&std::path::Path>) -> anyhow::Result<()> {
+    let target = daemon::resolve_target(config)?;
     // Replacing servers can take up to 5 s each to shut down.
-    let response = send_checked(&DaemonRequest::Reload, 30, Some("Reload failed")).await?;
+    let response = send_checked(&target, &DaemonRequest::Reload, 30, Some("Reload failed")).await?;
     match response.data {
         Some(data) => {
             let summary: control::ReloadSummary = serde_json::from_value(data)
@@ -153,8 +170,9 @@ pub async fn gen_config(
     }
 
     let live_info: Option<Vec<gen_config::ServerLiveInfo>> = if args.live {
-        let sock = daemon::socket_path()?;
-        let response = control::send_daemon_command(&sock, &DaemonRequest::Status, 5).await?;
+        let target = daemon::resolve_target(config_path)?;
+        let response =
+            control::send_daemon_command(&target.sock, &DaemonRequest::Status, 5).await?;
         Some(gen_config::parse_live_info(&response)?)
     } else {
         None
