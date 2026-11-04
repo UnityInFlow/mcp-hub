@@ -29,6 +29,8 @@ struct DaemonStartup {
     sock: std::path::PathBuf,
     /// PID file path (written before the runtime starts, removed on every exit).
     pid: std::path::PathBuf,
+    /// Exclusive lock on the PID file; held until the daemon has removed it.
+    pid_lock: daemon::PidFileLock,
 }
 
 /// Load the config for `start` and reject an empty server list.
@@ -78,16 +80,21 @@ fn main() -> anyhow::Result<()> {
         // Fork into background — the original process waits for readiness and
         // exits inside this call; only the daemon returns.
         let notifier = daemon::daemonize_process(&log_path)?;
-        // We are now the daemon child. Write our PID.
-        if let Err(e) = daemon::write_pid_file(&pid) {
-            notifier.fail(&format!("{e:#}"));
-            return Err(e);
-        }
+        // We are now the daemon child. Write our PID and lock the file; losing
+        // the lock means another daemon started in the meantime.
+        let pid_lock = match daemon::write_pid_file(&pid) {
+            Ok(lock) => lock,
+            Err(e) => {
+                notifier.fail(&format!("{e:#}"));
+                return Err(e);
+            }
+        };
         startup = Some(DaemonStartup {
             config,
             notifier,
             sock,
             pid,
+            pid_lock,
         });
     }
 
@@ -128,6 +135,7 @@ async fn run_daemon(
         notifier,
         sock,
         pid,
+        pid_lock,
     } = startup;
     let mut notifier = Some(notifier);
 
@@ -138,8 +146,11 @@ async fn run_daemon(
             n.fail(&format!("{e:#}"));
         }
     }
-    // Success or failure, the daemon is gone after this point.
+    // Success or failure, the daemon is gone after this point. We hold the PID
+    // file lock, so no other daemon owns these files; unlink before releasing.
+    let _ = std::fs::remove_file(&sock);
     daemon::remove_pid_file(&pid);
+    drop(pid_lock);
     result
 }
 
@@ -286,15 +297,13 @@ async fn run_daemon_inner(
     // Wait for the control socket to finish serving in-flight requests.
     socket_task.await.ok();
     web_task.abort(); // Stop web server
-    let _ = web_task.await; // Wait for task to release its Arc clone before try_unwrap.
+    let _ = web_task.await;
 
-    // Stop all managed servers.
-    // Clone the handles Arc so we can try_unwrap it once daemon_state is dropped.
-    let handles_arc = Arc::clone(&daemon_state.handles);
-    drop(daemon_state);
-    let final_handles = Arc::try_unwrap(handles_arc)
-        .map_err(|_| anyhow::anyhow!("Cannot unwrap daemon handles — Arc still shared"))?
-        .into_inner();
+    // Stop all managed servers. Take the handles out from under the lock rather
+    // than unwrapping the Arc: a connection handler (e.g. a client that never
+    // sent a request) may still hold a `DaemonState` clone, and that must not
+    // stop us from stopping the servers.
+    let final_handles = std::mem::take(&mut *daemon_state.handles.lock().await);
     supervisor::stop_all_servers(final_handles).await;
 
     tracing::info!("Daemon stopped.");
