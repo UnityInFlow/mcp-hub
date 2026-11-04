@@ -1,8 +1,14 @@
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
 
 use mcp_hub::config::ServerConfig;
-use mcp_hub::supervisor::{compute_backoff_delay, shutdown_process, spawn_server};
-use mcp_hub::types::BackoffConfig;
+use mcp_hub::logs::LogAggregator;
+use mcp_hub::supervisor::{
+    compute_backoff_delay, shutdown_process, spawn_server, start_single_server,
+};
+use mcp_hub::types::{BackoffConfig, ProcessState};
+use tokio_util::sync::CancellationToken;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper: build a minimal ServerConfig for testing
@@ -202,4 +208,44 @@ async fn test_shutdown_process_terminates_child() {
             "process with PID {pid} should no longer be alive after shutdown_process"
         );
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-server max_retries / restart_delay overrides
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_max_retries_override_goes_fatal() {
+    let mut config = make_server_config("sh", &["-c", "exit 1"]);
+    config.max_retries = Some(1);
+    config.restart_delay = Some(0);
+
+    let shutdown = CancellationToken::new();
+    let log_agg = Arc::new(LogAggregator::new(&["crasher".to_string()], 100));
+    let mut handle = start_single_server("crasher", &config, &shutdown, &log_agg).await;
+
+    // With the default of 10 attempts this would still be restarting after 10 s.
+    let fatal = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let snapshot = handle.state_rx.borrow_and_update().clone();
+            if matches!(snapshot.process_state, ProcessState::Fatal) {
+                return snapshot;
+            }
+            if handle.state_rx.changed().await.is_err() {
+                return handle.state_rx.borrow().clone();
+            }
+        }
+    })
+    .await
+    .expect("server with max_retries = 1 should reach Fatal within 10s");
+
+    assert!(
+        matches!(fatal.process_state, ProcessState::Fatal),
+        "expected Fatal, got {}",
+        fatal.process_state
+    );
+    assert_eq!(fatal.restart_count, 1, "Fatal after exactly 1 failure");
+
+    shutdown.cancel();
+    let _ = handle.task.await;
 }
