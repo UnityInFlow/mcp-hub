@@ -101,6 +101,10 @@ pub enum HealthStatus {
     /// No ping has been attempted yet (initial state and after restart).
     #[default]
     Unknown,
+    /// Health is deliberately not probed: `transport = "http"` servers do not
+    /// speak JSON-RPC on stdio, so the stdio ping loop does not apply. The
+    /// process is still supervised; this never counts as degraded or failed.
+    NotChecked,
     /// The server responded to the most recent ping.
     Healthy {
         latency_ms: u64,
@@ -119,6 +123,7 @@ impl fmt::Display for HealthStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             HealthStatus::Unknown => write!(f, "unknown"),
+            HealthStatus::NotChecked => write!(f, "not checked"),
             HealthStatus::Healthy { .. } => write!(f, "healthy"),
             HealthStatus::Degraded {
                 consecutive_misses, ..
@@ -217,6 +222,8 @@ pub fn compute_health_status(consecutive_misses: u32, current: &HealthStatus) ->
             consecutive_misses,
             last_success: None,
         },
+        // Never pinged, so no miss can be recorded against it; keep it as is.
+        HealthStatus::NotChecked => HealthStatus::NotChecked,
     }
 }
 

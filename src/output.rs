@@ -51,7 +51,7 @@ impl StatusRow {
             HealthStatus::Healthy { .. } => Color::Green,
             HealthStatus::Degraded { .. } => Color::Yellow,
             HealthStatus::Failed { .. } => Color::Red,
-            HealthStatus::Unknown => Color::DarkGrey,
+            HealthStatus::Unknown | HealthStatus::NotChecked => Color::DarkGrey,
         };
         let caps = &snapshot.capabilities;
         Self {
