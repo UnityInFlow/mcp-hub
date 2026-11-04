@@ -470,7 +470,11 @@ mod tests {
             100,
         ));
         let servers = super::super::new_server_views(&[]);
-        Arc::new(super::super::WebState { servers, log_agg })
+        Arc::new(super::super::WebState {
+            servers,
+            log_agg,
+            port: 3456,
+        })
     }
 
     #[tokio::test]
@@ -618,6 +622,7 @@ mod tests {
             Arc::new(super::super::WebState {
                 servers: views,
                 log_agg,
+                port: 3456,
             }),
             handles,
             senders,

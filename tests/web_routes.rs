@@ -44,7 +44,11 @@ fn fixture(servers: Vec<(&str, McpCapabilities)>) -> Fixture {
     }
     let servers = new_server_views(&handles);
     Fixture {
-        state: Arc::new(WebState { servers, log_agg }),
+        state: Arc::new(WebState {
+            servers,
+            log_agg,
+            port: 3456,
+        }),
         _senders: senders,
     }
 }
@@ -152,6 +156,75 @@ async fn tools_partial_known_server_is_200_and_unknown_is_404() {
 
     let (status, _) = get(&fx.state, "/partials/tools/unknown").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Host-header allowlist (DNS-rebinding protection)
+// ─────────────────────────────────────────────────────────────────────────────
+
+async fn status_with_host(state: &Arc<WebState>, uri: &str, host: Option<&str>) -> StatusCode {
+    let mut req = Request::builder().uri(uri);
+    if let Some(h) = host {
+        req = req.header("host", h);
+    }
+    build_router(Arc::clone(state))
+        .oneshot(req.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn loopback_hosts_are_allowed() {
+    let fx = fixture(vec![]);
+    for host in [
+        "localhost:3456",
+        "localhost",
+        "LocalHost:3456",
+        "127.0.0.1:3456",
+        "127.0.0.1",
+        "[::1]:3456",
+        "[::1]",
+    ] {
+        assert_eq!(
+            status_with_host(&fx.state, "/", Some(host)).await,
+            StatusCode::OK,
+            "{host}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn foreign_hosts_are_rejected_with_403() {
+    let fx = fixture(vec![]);
+    for host in [
+        "evil.example",
+        "evil.example:3456",
+        "localhost.evil.example",
+        "localhost.evil.example:3456",
+        "127.0.0.1.evil.example",
+        "localhost:9999",
+        "127.0.0.1:80",
+        "[::1]:9999",
+        "localhost:",
+        "localhost:3456:1",
+        "",
+    ] {
+        for uri in ["/", "/health", "/logs/stream", "/static/style.css"] {
+            assert_eq!(
+                status_with_host(&fx.state, uri, Some(host)).await,
+                StatusCode::FORBIDDEN,
+                "{host} {uri}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn missing_host_header_is_allowed() {
+    // HTTP/1.0 clients may omit Host; browsers (the rebinding threat) never do.
+    let fx = fixture(vec![]);
+    assert_eq!(status_with_host(&fx.state, "/", None).await, StatusCode::OK);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

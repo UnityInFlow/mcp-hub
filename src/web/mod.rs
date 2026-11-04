@@ -63,6 +63,8 @@ pub struct WebState {
     pub servers: SharedServerViews,
     /// Log aggregator for SSE streaming and log history.
     pub log_agg: Arc<LogAggregator>,
+    /// The port the web UI is bound to; the `Host` header check requires it.
+    pub port: u16,
 }
 
 /// Build the Axum router with all web UI routes.
@@ -81,10 +83,72 @@ pub fn build_router(state: Arc<WebState>) -> Router {
         .route("/static/htmx.min.js", get(assets::serve_htmx))
         .route("/static/htmx-sse.js", get(assets::serve_htmx_sse))
         .route("/static/style.css", get(assets::serve_css))
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            host_guard,
+        ))
         .with_state(state)
 }
 
-/// Start the web UI server on the given port.
+/// Reject requests whose `Host` is not a loopback name on the web UI port.
+///
+/// Binding to 127.0.0.1 does not stop a DNS-rebinding page from reaching the
+/// UI (the browser connects to loopback but sends the attacker's `Host`), so
+/// the allowlist is `localhost`, `127.0.0.1` and `[::1]`, with or without
+/// `:<web_port>`. A missing `Host` (HTTP/1.0 tools) is allowed: browsers
+/// always send one, and a rebinding attack runs in a browser.
+async fn host_guard(
+    axum::extract::State(state): axum::extract::State<Arc<WebState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let allowed = match req.headers().get(axum::http::header::HOST) {
+        None => true,
+        Some(value) => value
+            .to_str()
+            .map(|h| host_allowed(h, state.port))
+            .unwrap_or(false),
+    };
+    if allowed {
+        next.run(req).await
+    } else {
+        (
+            axum::http::StatusCode::FORBIDDEN,
+            "403 Forbidden: unexpected Host header (mcp-hub web UI only answers on localhost)\n",
+        )
+            .into_response()
+    }
+}
+
+/// Whether a `Host` header value names a loopback host on `port` (or no port).
+fn host_allowed(host: &str, port: u16) -> bool {
+    let host = host.to_ascii_lowercase();
+    // Split "name[:port]" -- an IPv6 literal keeps its colons inside brackets.
+    let (name, port_part) = match host.strip_prefix('[') {
+        Some(rest) => match rest.split_once(']') {
+            Some((inner, tail)) => (format!("[{inner}]"), tail.strip_prefix(':')),
+            None => return false,
+        },
+        None => match host.split_once(':') {
+            Some((n, p)) => (n.to_string(), Some(p)),
+            None => (host.clone(), None),
+        },
+    };
+    // Anything after a bracketed literal that is not ":port" is malformed.
+    if host.starts_with('[') && !host.ends_with(']') && port_part.is_none() {
+        return false;
+    }
+    if !matches!(name.as_str(), "localhost" | "127.0.0.1" | "[::1]") {
+        return false;
+    }
+    match port_part {
+        None => true,
+        Some(p) => p.parse::<u16>().is_ok_and(|p| p == port),
+    }
+}
+
 ///
 /// Spawns an Axum server that listens on 127.0.0.1:{port} and shuts down
 /// gracefully when the `shutdown` token is cancelled.
@@ -123,4 +187,19 @@ pub async fn serve_web(
         .with_graceful_shutdown(async move { shutdown.cancelled().await })
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::host_allowed;
+
+    #[test]
+    fn host_allowed_parses_forms() {
+        assert!(host_allowed("localhost", 80));
+        assert!(host_allowed("[::1]:80", 80));
+        assert!(!host_allowed("[::1]x", 80));
+        assert!(!host_allowed("[::1", 80));
+        assert!(!host_allowed("localhost:80:80", 80));
+        assert!(!host_allowed("localhost:+80", 81));
+    }
 }
