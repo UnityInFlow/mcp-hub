@@ -127,9 +127,10 @@ async fn spawn_responder_with_dispatcher() -> (tokio::process::Child, SharedStdi
     let pending: PendingMap = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
     // Spawn the reader task that owns stdout.
+    let stdin_for_reader = Arc::clone(&stdin_shared);
     let pending_clone = Arc::clone(&pending);
     tokio::spawn(async move {
-        reader_task(stdout, pending_clone).await;
+        reader_task(stdout, pending_clone, stdin_for_reader).await;
     });
 
     (child, stdin_shared, pending)
@@ -187,9 +188,10 @@ async fn ping_server_fails_for_response_without_result() {
     let stdout = child.stdout.take().expect("stdout should be piped");
     let stdin_shared: SharedStdin = Arc::new(Mutex::new(stdin));
     let pending: PendingMap = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let stdin_for_reader = Arc::clone(&stdin_shared);
     let pending_clone = Arc::clone(&pending);
     tokio::spawn(async move {
-        reader_task(stdout, pending_clone).await;
+        reader_task(stdout, pending_clone, stdin_for_reader).await;
     });
 
     let result = ping_server(&stdin_shared, &pending, 1).await;
@@ -224,9 +226,10 @@ async fn ping_timeout() {
     let pending: PendingMap = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
     // Spawn reader_task (will block until stdout closes, which never happens here).
+    let stdin_for_reader = Arc::clone(&stdin_shared);
     let pending_clone = Arc::clone(&pending);
     tokio::spawn(async move {
-        reader_task(stdout, pending_clone).await;
+        reader_task(stdout, pending_clone, stdin_for_reader).await;
     });
 
     let start = std::time::Instant::now();
