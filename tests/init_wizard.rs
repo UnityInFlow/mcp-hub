@@ -228,3 +228,120 @@ fn test_format_block_windows_path_full_roundtrip() {
     assert_eq!(srv["command"].as_str().unwrap(), command);
     assert_eq!(srv["args"][0].as_str().unwrap(), args[0]);
 }
+
+// ── control characters, commas, atomic append, malformed files (#31) ─────────
+
+fn roundtrip_args(args: &[String]) -> Vec<String> {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("mcp-hub.toml");
+    let block = format_toml_block("ctl", "echo", args, "stdio");
+    write_server_entry_to(&path, &block).expect("write");
+    let cfg = mcp_hub::config::load_config(&path).expect("config.rs must parse the written file");
+    cfg.servers["ctl"].args.clone()
+}
+
+#[test]
+fn test_control_chars_in_arg_roundtrip_via_load_config() {
+    let args = vec!["a\tb\nc\"d\\e".to_string(), "cr\rlf".to_string()];
+    assert_eq!(roundtrip_args(&args), args);
+}
+
+#[test]
+fn test_esc_and_del_in_arg_roundtrip_via_load_config() {
+    let args = vec!["x\u{1b}[0my\u{7f}z\u{0}w".to_string()];
+    assert_eq!(roundtrip_args(&args), args);
+}
+
+#[test]
+fn test_comma_in_arg_roundtrip_via_parse_args() {
+    let args = mcp_hub::init::parse_args(r#""--filter=a,b" x"#).expect("parse");
+    assert_eq!(args, vec!["--filter=a,b".to_string(), "x".to_string()]);
+    assert_eq!(roundtrip_args(&args), args);
+}
+
+#[test]
+fn test_append_without_trailing_newline_single_blank_line() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("mcp-hub.toml");
+    std::fs::write(&path, "[servers.one]\ncommand = \"echo\"").expect("write");
+
+    let block = format_toml_block("two", "python", &[], "stdio");
+    write_server_entry_to(&path, &block).expect("append");
+
+    let content = std::fs::read_to_string(&path).expect("read");
+    assert_eq!(
+        content,
+        "[servers.one]\ncommand = \"echo\"\n\n[servers.two]\ncommand = \"python\"\n"
+    );
+    let cfg = mcp_hub::config::load_config(&path).expect("load");
+    assert_eq!(cfg.servers.len(), 2);
+}
+
+#[test]
+fn test_append_with_trailing_newline_single_blank_line() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("mcp-hub.toml");
+    std::fs::write(&path, "[servers.one]\ncommand = \"echo\"\n").expect("write");
+
+    let block = format_toml_block("two", "python", &[], "stdio");
+    write_server_entry_to(&path, &block).expect("append");
+
+    let content = std::fs::read_to_string(&path).expect("read");
+    assert_eq!(
+        content,
+        "[servers.one]\ncommand = \"echo\"\n\n[servers.two]\ncommand = \"python\"\n"
+    );
+}
+
+#[test]
+fn test_malformed_existing_file_errors_and_is_unchanged() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("mcp-hub.toml");
+    let original = b"this is [[ not valid toml {{";
+    std::fs::write(&path, original).expect("write");
+
+    let block = format_toml_block("two", "python", &[], "stdio");
+    let err = write_server_entry_to(&path, &block).expect_err("must refuse malformed file");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("TOML"), "error should mention TOML: {msg}");
+
+    assert_eq!(std::fs::read(&path).expect("read"), original);
+    assert!(
+        !dir.path().join("mcp-hub.toml.tmp").exists(),
+        "no temp file left behind"
+    );
+}
+
+#[test]
+fn test_no_temp_file_left_after_success() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("mcp-hub.toml");
+    let block = format_toml_block("one", "echo", &[], "stdio");
+    write_server_entry_to(&path, &block).expect("write");
+    assert!(!dir.path().join("mcp-hub.toml.tmp").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn test_append_preserves_existing_file_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("mcp-hub.toml");
+    std::fs::write(&path, "[servers.one]\ncommand = \"echo\"\n").expect("write");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+
+    let block = format_toml_block("two", "echo", &[], "stdio");
+    write_server_entry_to(&path, &block).expect("append");
+
+    let mode = std::fs::metadata(&path)
+        .expect("metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "permissions were not preserved across the atomic write"
+    );
+    let names = existing_server_names_from(&path);
+    assert!(names.contains(&"two".to_string()));
+}
