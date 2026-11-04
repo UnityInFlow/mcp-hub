@@ -35,7 +35,7 @@ pub enum Commands {
         daemon: bool,
 
         /// Where the daemon writes its log (stdout/stderr and managed servers'
-        /// stderr). Defaults to `daemon.log` next to the control socket.
+        /// stderr). Defaults to `daemon-<key>.log` in the state directory.
         /// Only used with --daemon.
         #[arg(long, value_name = "PATH", env = "MCP_HUB_LOG_FILE")]
         log_file: Option<PathBuf>,

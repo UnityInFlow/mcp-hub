@@ -20,6 +20,10 @@ pub struct DaemonStartup {
     pub sock: std::path::PathBuf,
     /// PID file path (written before the runtime starts, removed on every exit).
     pub pid: std::path::PathBuf,
+    /// Meta file (config path, pid, web port); written once ready, removed on exit.
+    pub meta: std::path::PathBuf,
+    /// Canonical path of the config file this daemon serves.
+    pub config_path: std::path::PathBuf,
     /// Exclusive lock on the PID file; held until the daemon has removed it.
     pub pid_lock: daemon::PidFileLock,
 }
@@ -122,11 +126,21 @@ pub async fn run_daemon(
         notifier,
         sock,
         pid,
+        meta,
+        config_path: project_config,
         pid_lock,
     } = startup;
     let mut notifier = Some(notifier);
 
-    let result = run_daemon_inner(config_path, config, &sock, &mut notifier).await;
+    let result = run_daemon_inner(
+        config_path,
+        config,
+        &sock,
+        &meta,
+        &project_config,
+        &mut notifier,
+    )
+    .await;
 
     if let Err(e) = &result {
         if let Some(n) = notifier.take() {
@@ -136,6 +150,7 @@ pub async fn run_daemon(
     // Success or failure, the daemon is gone after this point. We hold the PID
     // file lock, so no other daemon owns these files; unlink before releasing.
     let _ = std::fs::remove_file(&sock);
+    let _ = std::fs::remove_file(&meta);
     daemon::remove_pid_file(&pid);
     drop(pid_lock);
     result
@@ -146,8 +161,15 @@ pub async fn run_daemon(
 async fn bind_daemon_listeners(
     sock: &std::path::Path,
     web_port: u16,
+    project_config: &std::path::Path,
 ) -> anyhow::Result<(tokio::net::TcpListener, control::ControlListener)> {
-    let web_listener = web::bind_web_listener(web_port).await?;
+    let web_listener = web::bind_web_listener(web_port).await.with_context(|| {
+        format!(
+            "Web UI port {web_port} is unavailable. Each project's daemon needs its own \
+             [hub] web_port: change `web_port` in {}",
+            project_config.display()
+        )
+    })?;
     let control_listener = control::bind_control_socket(sock).await?;
     Ok((web_listener, control_listener))
 }
@@ -156,6 +178,8 @@ async fn run_daemon_inner(
     config_path: Option<&std::path::Path>,
     config: config::HubConfig,
     sock: &std::path::Path,
+    meta: &std::path::Path,
+    project_config: &std::path::Path,
     notifier: &mut Option<daemon::ReadyNotifier>,
 ) -> anyhow::Result<()> {
     let shutdown = CancellationToken::new();
@@ -182,14 +206,15 @@ async fn run_daemon_inner(
     // Bind everything that can fail *before* declaring the daemon ready; on
     // failure stop the servers we just started.
     let web_port = config.hub.web_port;
-    let (web_listener, control_listener) = match bind_daemon_listeners(sock, web_port).await {
-        Ok(listeners) => listeners,
-        Err(e) => {
-            shutdown.cancel();
-            supervisor::stop_all_servers(handles).await;
-            return Err(e);
-        }
-    };
+    let (web_listener, control_listener) =
+        match bind_daemon_listeners(sock, web_port, project_config).await {
+            Ok(listeners) => listeners,
+            Err(e) => {
+                shutdown.cancel();
+                supervisor::stop_all_servers(handles).await;
+                return Err(e);
+            }
+        };
 
     // Web UI reads its own snapshot views so it never contends on
     // the handles mutex that config reload holds across shutdowns.
@@ -230,6 +255,19 @@ async fn run_daemon_inner(
             }
         })
     };
+
+    // Record who we are before releasing the parent, so a `status` issued right
+    // after `start --daemon` already finds the meta file. Not fatal: the daemon
+    // works without it, only the status header and config-less lookup suffer.
+    let daemon_meta = daemon::DaemonMeta {
+        config_path: project_config.display().to_string(),
+        pid: std::process::id(),
+        web_port,
+        started_at: chrono::Utc::now().to_rfc3339(),
+    };
+    if let Err(e) = daemon::write_meta(meta, &daemon_meta) {
+        tracing::warn!("{e:#}");
+    }
 
     // Everything that can fail at startup has succeeded: release the parent.
     if let Some(n) = notifier.take() {

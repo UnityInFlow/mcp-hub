@@ -14,13 +14,27 @@ use tokio_util::sync::CancellationToken;
 // Path resolution tests
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Point the state dir at a temp dir so these tests never touch the real
+/// config dir. Only the path tests read the variable, and both set the same
+/// value for the whole test process.
+fn isolated_state_dir() -> &'static std::path::Path {
+    use std::sync::OnceLock;
+    static DIR: OnceLock<TempDir> = OnceLock::new();
+    let dir = DIR.get_or_init(|| {
+        let dir = TempDir::new().expect("temp dir");
+        std::env::set_var("MCP_HUB_STATE_DIR", dir.path());
+        std::env::remove_var("MCP_HUB_SOCKET");
+        std::env::remove_var("MCP_HUB_PID");
+        dir
+    });
+    dir.path()
+}
+
 #[test]
 fn socket_path_returns_valid() {
-    let path = socket_path().expect("socket_path should succeed");
-    assert!(
-        path.to_string_lossy().ends_with("mcp-hub.sock"),
-        "socket path should end with mcp-hub.sock, got: {path:?}"
-    );
+    let state = isolated_state_dir();
+    let path = socket_path("0123456789ab").expect("socket_path should succeed");
+    assert_eq!(path, state.join("mcp-hub-0123456789ab.sock"));
     // The parent directory must exist (socket_path creates it).
     assert!(
         path.parent().expect("socket path has a parent").exists(),
@@ -30,11 +44,9 @@ fn socket_path_returns_valid() {
 
 #[test]
 fn pid_path_returns_valid() {
-    let path = pid_path().expect("pid_path should succeed");
-    assert!(
-        path.to_string_lossy().ends_with("mcp-hub.pid"),
-        "PID path should end with mcp-hub.pid, got: {path:?}"
-    );
+    let state = isolated_state_dir();
+    let path = pid_path("0123456789ab").expect("pid_path should succeed");
+    assert_eq!(path, state.join("mcp-hub-0123456789ab.pid"));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
