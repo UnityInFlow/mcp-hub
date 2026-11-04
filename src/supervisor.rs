@@ -61,7 +61,6 @@ pub fn spawn_server(
         .kill_on_drop(false); // explicit cleanup only
 
     // Isolate from terminal process group (PROC-08, PITFALL #5).
-    #[cfg(unix)]
     cmd.process_group(0);
 
     if let Some(cwd) = &config.cwd {
@@ -179,7 +178,6 @@ where
 /// Children are spawned with `process_group(0)`, so their PGID equals their PID.
 /// `ESRCH` (no such group — everything already exited) is benign and ignored;
 /// any other failure is logged.
-#[cfg(unix)]
 fn kill_group(pid: u32, signal: nix::sys::signal::Signal) {
     use nix::errno::Errno;
     use nix::sys::signal::killpg;
@@ -199,7 +197,6 @@ fn kill_group(pid: u32, signal: nix::sys::signal::Signal) {
 /// Always calls `child.wait()` after any kill to reap zombies (PROC-09).
 pub async fn shutdown_process(mut child: tokio::process::Child, pid: u32) -> anyhow::Result<()> {
     // Send SIGTERM to the entire process group (D-08).
-    #[cfg(unix)]
     kill_group(pid, nix::sys::signal::Signal::SIGTERM);
 
     // Race child.wait() against a 5-second timeout (D-07).
@@ -214,10 +211,7 @@ pub async fn shutdown_process(mut child: tokio::process::Child, pid: u32) -> any
             // Wait error or timeout (`Elapsed`) — escalate to SIGKILL.
             tracing::warn!(pid, "Grace period elapsed; sending SIGKILL");
             // SIGKILL the whole group: members that ignored SIGTERM must not survive.
-            #[cfg(unix)]
             kill_group(pid, nix::sys::signal::Signal::SIGKILL);
-            #[cfg(not(unix))]
-            child.kill().await.ok();
             child.wait().await.ok(); // reap zombie (PROC-09)
             Ok(())
         }
@@ -502,7 +496,6 @@ pub async fn run_server_supervisor(
                 // have left group members behind that hold the stdout pipe open
                 // and would collide with the respawn. Kill the whole group, then
                 // stop the reader so a lingering pipe cannot keep it alive.
-                #[cfg(unix)]
                 kill_group(pid, nix::sys::signal::Signal::SIGKILL);
                 if let Some(handle) = reader_handle.take() {
                     handle.abort();

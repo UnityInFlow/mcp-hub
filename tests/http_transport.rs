@@ -1,8 +1,6 @@
 //! `transport = "http"` servers (issue #59): the process is supervised, but the
 //! stdio JSON-RPC health loop and introspection must not run against it.
 
-#![cfg(unix)]
-
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;

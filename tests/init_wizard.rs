@@ -321,7 +321,6 @@ fn test_no_temp_file_left_after_success() {
     assert!(!dir.path().join("mcp-hub.toml.tmp").exists());
 }
 
-#[cfg(unix)]
 #[test]
 fn test_append_preserves_existing_file_permissions() {
     use std::os::unix::fs::PermissionsExt;

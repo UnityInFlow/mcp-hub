@@ -1,5 +1,4 @@
 //! `mcp-hub logs --follow` streaming tests (issue #16). Unix only.
-#![cfg(unix)]
 
 use std::io::{BufRead, BufReader, Write as _};
 use std::path::PathBuf;

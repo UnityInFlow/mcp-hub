@@ -195,7 +195,6 @@ async fn test_shutdown_process_terminates_child() {
         .expect("shutdown_process should return Ok");
 
     // Verify the process is no longer running (on Unix).
-    #[cfg(unix)]
     {
         use nix::sys::signal::kill;
         use nix::unistd::Pid;
@@ -254,7 +253,6 @@ async fn test_max_retries_override_goes_fatal() {
 // Process-group kill tests (issue #23, unix only)
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[cfg(unix)]
 mod process_group {
     use std::collections::HashMap;
     use std::path::Path;
@@ -430,7 +428,6 @@ mod process_group {
 // override, so a faithful test would need a 60 s wall-clock wait.
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[cfg(unix)]
 mod supervisor_e2e {
     use std::sync::Arc;
     use std::time::{Duration, Instant};

@@ -3,8 +3,6 @@
 //!
 //! Complements `health_monitor.rs`, which covers a single healthy ping.
 
-#![cfg(unix)]
-
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

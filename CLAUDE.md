@@ -37,7 +37,7 @@ Read these before making architectural or scope decisions.
 - `anyhow` for error handling in binaries, `thiserror` for libraries
 - Format: `cargo fmt` before every commit
 - Lint: `cargo clippy -- -D warnings` must pass
-- Distribution: pre-built binaries for macOS (arm64/x86_64), Linux (x86_64/aarch64), Windows
+- Distribution: pre-built binaries for macOS (arm64/x86_64), Linux (x86_64/aarch64)
 - No `unwrap()` in production code — use `?` or handle the error
 - Pattern match exhaustively — no catch-all `_` unless truly needed
 
@@ -56,7 +56,7 @@ Read these before making architectural or scope decisions.
 - [x] Claude Code config generator: outputs correct settings.json mcpServers block
 - [x] Cursor config generator: outputs Cursor MCP config snippet
 - [x] `mcp-hub init`: interactive wizard to add a new server
-- [ ] Pre-built binaries for macOS, Linux, Windows
+- [ ] Pre-built binaries for macOS and Linux
 - [ ] Homebrew formula
 
 ## Development Workflow

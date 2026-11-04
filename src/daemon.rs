@@ -15,7 +15,6 @@ use std::path::PathBuf;
 /// Directories that already exist are left untouched; only newly created
 /// directories get the restrictive mode (subject to the process umask, which
 /// can only make it stricter).
-#[cfg(unix)]
 fn create_dir_all_private(dir: &std::path::Path) -> anyhow::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
 
@@ -23,12 +22,6 @@ fn create_dir_all_private(dir: &std::path::Path) -> anyhow::Result<()> {
         .recursive(true)
         .mode(0o700)
         .create(dir)
-        .map_err(|e| anyhow::anyhow!("Failed to create {}: {e}", dir.display()))
-}
-
-#[cfg(not(unix))]
-fn create_dir_all_private(dir: &std::path::Path) -> anyhow::Result<()> {
-    std::fs::create_dir_all(dir)
         .map_err(|e| anyhow::anyhow!("Failed to create {}: {e}", dir.display()))
 }
 
@@ -40,7 +33,6 @@ fn create_dir_all_private(dir: &std::path::Path) -> anyhow::Result<()> {
 pub fn ensure_private_dir(dir: &std::path::Path) -> anyhow::Result<()> {
     create_dir_all_private(dir)?;
 
-    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
 
@@ -106,7 +98,6 @@ pub fn log_path(explicit: Option<&std::path::Path>) -> anyhow::Result<PathBuf> {
 ///
 /// The mode is enforced on pre-existing files too, since the log can contain
 /// MCP server output.
-#[cfg(unix)]
 pub fn open_log_file(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
@@ -147,21 +138,14 @@ pub fn pid_path() -> anyhow::Result<PathBuf> {
 /// The lock lives on the open file description, so it is released when this
 /// guard is dropped or the process dies (even via `SIGKILL`). The descriptor is
 /// `O_CLOEXEC`, so managed servers never inherit it.
-#[cfg(unix)]
 #[derive(Debug)]
 pub struct PidFileLock {
     _file: nix::fcntl::Flock<std::fs::File>,
 }
 
-/// Non-Unix stub: there is no daemon mode, hence nothing to lock.
-#[cfg(not(unix))]
-#[derive(Debug)]
-pub struct PidFileLock;
-
 /// Take an exclusive, non-blocking `flock` on `file`.
 ///
 /// `Ok(None)` means another process holds the lock.
-#[cfg(unix)]
 fn try_lock_exclusive(
     file: std::fs::File,
 ) -> std::io::Result<Option<nix::fcntl::Flock<std::fs::File>>> {
@@ -181,7 +165,6 @@ fn try_lock_exclusive(
 /// what makes a second daemon (and `check_existing_daemon`) see this one as
 /// running. Fails if another process already holds the lock; the existing
 /// file's contents are left untouched in that case.
-#[cfg(unix)]
 pub fn write_pid_file(path: &std::path::Path) -> anyhow::Result<PidFileLock> {
     use std::io::Write as _;
     use std::os::unix::fs::MetadataExt as _;
@@ -230,14 +213,6 @@ pub fn write_pid_file(path: &std::path::Path) -> anyhow::Result<PidFileLock> {
     )
 }
 
-/// Non-Unix stub: write the PID without locking.
-#[cfg(not(unix))]
-pub fn write_pid_file(path: &std::path::Path) -> anyhow::Result<PidFileLock> {
-    std::fs::write(path, std::process::id().to_string())
-        .map_err(|e| anyhow::anyhow!("Failed to write PID file {}: {e}", path.display()))?;
-    Ok(PidFileLock)
-}
-
 /// Remove the PID file at `path`, silently ignoring errors.
 pub fn remove_pid_file(path: &std::path::Path) {
     let _ = std::fs::remove_file(path);
@@ -269,7 +244,6 @@ pub fn remove_pid_file(path: &std::path::Path) {
 /// This must be called *before* `daemonize_process()` and *before* the Tokio
 /// runtime is created. The daemon itself closes the remaining race by locking
 /// the PID file in [`write_pid_file`], which fails if another daemon won.
-#[cfg(unix)]
 pub fn check_existing_daemon(
     sock_path: &std::path::Path,
     pid_path: &std::path::Path,
@@ -333,7 +307,6 @@ pub fn check_existing_daemon(
 }
 
 /// The PID recorded in `pid_path`, if the file exists and holds a valid PID.
-#[cfg(unix)]
 fn read_recorded_pid(pid_path: &std::path::Path) -> Option<i32> {
     std::fs::read_to_string(pid_path)
         .ok()?
@@ -345,7 +318,6 @@ fn read_recorded_pid(pid_path: &std::path::Path) -> Option<i32> {
 }
 
 /// Human-readable form of the PID recorded in `pid_path`, for error messages.
-#[cfg(unix)]
 fn describe_recorded_pid(pid_path: &std::path::Path) -> String {
     match read_recorded_pid(pid_path) {
         Some(pid) => format!("PID {pid}"),
@@ -357,7 +329,6 @@ fn describe_recorded_pid(pid_path: &std::path::Path) -> String {
 ///
 /// A socket or PID file planted by another user must never be trusted or
 /// unlinked on their behalf. A missing file is fine.
-#[cfg(unix)]
 fn ensure_owned_by_current_user(path: &std::path::Path) -> anyhow::Result<()> {
     use std::os::unix::fs::MetadataExt;
 
@@ -381,7 +352,6 @@ fn ensure_owned_by_current_user(path: &std::path::Path) -> anyhow::Result<()> {
 ///
 /// On Linux a zombie (killed but not yet reaped, e.g. by a slow init) counts as
 /// dead: it holds no sockets or locks any more.
-#[cfg(unix)]
 fn pid_is_alive(pid: i32) -> bool {
     use nix::errno::Errno;
     use nix::sys::signal::kill;
@@ -400,14 +370,12 @@ fn pid_is_alive(pid: i32) -> bool {
 ///
 /// `None` when that cannot be determined (not Linux, or the entry is
 /// unreadable); callers should then err on the side of "running".
-#[cfg(unix)]
 fn looks_like_mcp_hub(pid: i32) -> Option<bool> {
     let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
     Some(comm.trim_end().starts_with("mcp-hub"))
 }
 
 /// True if `/proc/<pid>/stat` reports state `Z` (always false off Linux).
-#[cfg(unix)]
 fn is_zombie(pid: i32) -> bool {
     // Format: `pid (comm) S ...`; `comm` may contain spaces and parentheses,
     // so the state follows the *last* `)`.
@@ -423,7 +391,6 @@ fn is_zombie(pid: i32) -> bool {
 /// Remove the socket and PID file left behind by a dead daemon.
 ///
 /// Callers must have established that no live daemon owns them.
-#[cfg(unix)]
 fn cleanup_stale_files(sock_path: &std::path::Path, pid_path: &std::path::Path) {
     let _ = std::fs::remove_file(sock_path);
     let _ = std::fs::remove_file(pid_path);
@@ -445,16 +412,10 @@ pub const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15
 /// it finished starting (`ready`) or why it could not (`fail`). Dropping the
 /// notifier without calling either closes the pipe, which the parent reports
 /// as "daemon exited before becoming ready".
-#[cfg(unix)]
 pub struct ReadyNotifier {
     pipe: std::fs::File,
 }
 
-/// Non-Unix stub: daemon mode is unavailable, so there is nothing to notify.
-#[cfg(not(unix))]
-pub struct ReadyNotifier;
-
-#[cfg(unix)]
 impl ReadyNotifier {
     /// Tell the parent the daemon is up (control socket bound, web UI listening).
     ///
@@ -480,16 +441,7 @@ impl ReadyNotifier {
     }
 }
 
-#[cfg(not(unix))]
-impl ReadyNotifier {
-    /// No-op on platforms without daemon support.
-    pub fn ready(self) {}
-    /// No-op on platforms without daemon support.
-    pub fn fail(self, _message: &str) {}
-}
-
 /// Outcome of waiting on the readiness pipe, as seen by the foreground parent.
-#[cfg(unix)]
 #[derive(Debug, PartialEq, Eq)]
 enum ReadyOutcome {
     Ready { pid: String },
@@ -499,7 +451,6 @@ enum ReadyOutcome {
 }
 
 /// Interpret the bytes a daemon wrote to the readiness pipe.
-#[cfg(unix)]
 fn parse_ready_message(bytes: &[u8]) -> ReadyOutcome {
     match bytes.split_first() {
         None => ReadyOutcome::ExitedEarly,
@@ -515,7 +466,6 @@ fn parse_ready_message(bytes: &[u8]) -> ReadyOutcome {
 }
 
 /// Read the daemon's readiness message from `pipe`, giving up after `timeout`.
-#[cfg(unix)]
 fn wait_for_ready(pipe: &mut std::fs::File, timeout: std::time::Duration) -> ReadyOutcome {
     use std::io::Read as _;
     use std::os::unix::io::AsRawFd as _;
@@ -578,7 +528,6 @@ fn wait_for_ready(pipe: &mut std::fs::File, timeout: std::time::Duration) -> Rea
 ///
 /// Note: `nix::unistd::daemon()` is only available on Linux/FreeBSD/Solaris;
 /// this implementation works on any Unix including macOS.
-#[cfg(unix)]
 pub fn daemonize_process(log_path: &std::path::Path) -> anyhow::Result<ReadyNotifier> {
     use nix::fcntl::OFlag;
     use nix::unistd::{fork, pipe2, ForkResult};
@@ -641,7 +590,6 @@ pub fn daemonize_process(log_path: &std::path::Path) -> anyhow::Result<ReadyNoti
 
 /// `setsid`, second fork, and stdio redirection — the daemon-side half of
 /// [`daemonize_process`].
-#[cfg(unix)]
 fn detach_from_terminal(log_file: &std::fs::File) -> anyhow::Result<()> {
     use nix::unistd::{fork, setsid, ForkResult};
 
@@ -663,7 +611,6 @@ fn detach_from_terminal(log_file: &std::fs::File) -> anyhow::Result<()> {
 }
 
 /// Point stdin at `/dev/null` and stdout/stderr at `log_file`.
-#[cfg(unix)]
 fn redirect_stdio(log_file: &std::fs::File) -> anyhow::Result<()> {
     use std::fs::OpenOptions;
     use std::os::unix::io::AsRawFd as _;
@@ -693,10 +640,4 @@ fn redirect_stdio(log_file: &std::fs::File) -> anyhow::Result<()> {
     // `devnull` and `log_file` are dropped (closed) by their owners; fds 0-2
     // keep the duplicated descriptions open.
     Ok(())
-}
-
-/// Daemon mode is not supported on Windows.
-#[cfg(not(unix))]
-pub fn daemonize_process(_log_path: &std::path::Path) -> anyhow::Result<ReadyNotifier> {
-    anyhow::bail!("Daemon mode is not supported on Windows. Use foreground mode instead.")
 }

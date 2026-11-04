@@ -74,7 +74,6 @@ fn single_server_config_with_health(
 // Test: log lines from stderr are captured in the LogAggregator
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[cfg(unix)]
 #[tokio::test]
 async fn test_log_aggregation_from_stderr() {
     let server_name = "log-test-server";
@@ -141,7 +140,6 @@ async fn test_log_aggregation_from_stderr() {
 // Test: health check transitions server to Healthy when it responds to pings
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[cfg(unix)]
 #[tokio::test]
 async fn test_health_transitions_to_healthy() {
     // Use the ping-responder.sh fixture — it responds to JSON-RPC pings on stdin.
@@ -183,7 +181,6 @@ async fn test_health_transitions_to_healthy() {
 // Test: health degrades when server is unresponsive to pings
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[cfg(unix)]
 #[tokio::test]
 async fn test_health_degrades_on_unresponsive_server() {
     // A server that reads stdin but never writes to stdout — pings time out.

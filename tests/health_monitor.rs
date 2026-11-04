@@ -100,7 +100,6 @@ fn default_health_check_interval_is_reasonable() {
 ///
 /// For each line read, it extracts the `id` field and replies with
 /// `{"jsonrpc":"2.0","result":{},"id":<id>}`.
-#[cfg(unix)]
 const PING_RESPONDER_SCRIPT: &str = r#"
 while IFS= read -r line; do
     id=$(echo "$line" | sed 's/.*"id":\([0-9]*\).*/\1/')
@@ -109,7 +108,6 @@ done
 "#;
 
 /// Spawn the ping responder and return (SharedStdin, PendingMap) with reader_task running.
-#[cfg(unix)]
 async fn spawn_responder_with_dispatcher() -> (tokio::process::Child, SharedStdin, PendingMap) {
     let mut child = tokio::process::Command::new("bash")
         .arg("-c")
@@ -136,7 +134,6 @@ async fn spawn_responder_with_dispatcher() -> (tokio::process::Child, SharedStdi
     (child, stdin_shared, pending)
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn ping_server_returns_latency_for_valid_responder() {
     use mcp_hub::mcp::health::ping_server;
@@ -162,7 +159,6 @@ async fn ping_server_returns_latency_for_valid_responder() {
 }
 
 /// Answers every request with a message that has no `result` and no `error`.
-#[cfg(unix)]
 const NO_RESULT_RESPONDER_SCRIPT: &str = r#"
 while IFS= read -r line; do
     id=$(echo "$line" | sed 's/.*"id":\([0-9]*\).*/\1/')
@@ -170,7 +166,6 @@ while IFS= read -r line; do
 done
 "#;
 
-#[cfg(unix)]
 #[tokio::test]
 async fn ping_server_fails_for_response_without_result() {
     use mcp_hub::mcp::health::ping_server;
@@ -204,7 +199,6 @@ async fn ping_server_fails_for_response_without_result() {
     );
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn ping_timeout() {
     use mcp_hub::mcp::health::ping_server;
@@ -255,7 +249,6 @@ async fn ping_timeout() {
 // Health check loop integration — verifies watch channel gets Healthy
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[cfg(unix)]
 #[tokio::test]
 async fn run_health_check_loop_sets_healthy_on_first_ping() {
     let (mut child, stdin_shared, pending) = spawn_responder_with_dispatcher().await;
@@ -309,7 +302,6 @@ async fn run_health_check_loop_sets_healthy_on_first_ping() {
     );
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn run_health_check_loop_exits_on_cancel() {
     let (mut child, stdin_shared, pending) = spawn_responder_with_dispatcher().await;
@@ -346,16 +338,4 @@ async fn run_health_check_loop_exits_on_cancel() {
         result.is_ok(),
         "health check loop should exit cleanly after cancellation"
     );
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Non-unix stubs
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[cfg(not(unix))]
-#[test]
-fn ping_server_tests_require_unix() {
-    // bash-based integration tests are Unix-only.
-    // On Windows, these would need a PowerShell or cmd equivalent.
-    // For now, we skip them with a passing stub.
 }

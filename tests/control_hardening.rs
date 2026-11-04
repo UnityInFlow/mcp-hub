@@ -1,7 +1,6 @@
 /// Control socket hardening tests (issue #13): owner-only permissions, private
 /// state directory, idle-connection timeout, request size cap, and refusal to
 /// touch socket/PID files owned by another user.
-#[cfg(unix)]
 mod hardening {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::Path;

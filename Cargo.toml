@@ -33,13 +33,10 @@ include = [
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }-v{ version }{ archive-suffix }"
 bin-dir = "{ bin }{ binary-ext }"
 pkg-fmt = "tgz"
-# Windows binstall override removed: Windows prebuilt binaries are deferred to v2
-# (HUB-V2-02 — the CLI's cfg(unix) deps don't cross-compile). Re-add the
-# overrides.x86_64-pc-windows-gnu pkg-fmt="zip" block when Windows ships.
 
 # docs.rs build config (HUB-03). The crate has no build.rs and no build-time network
-# need; default-target pins the full unix feature set on docs.rs's Linux build host so
-# the daemon/web-UI deps (gated under cfg(unix)) compile and document.
+# need; default-target pins docs.rs to its Linux host (the crate is Unix-only and
+# fails to compile elsewhere, see src/lib.rs).
 [package.metadata.docs.rs]
 default-target = "x86_64-unknown-linux-gnu"
 all-features = false
@@ -63,8 +60,6 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio-util = { version = "0.7", features = ["codec", "io"] }
-
-[target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["signal", "process", "user", "fs"] }
 dirs = "7"
 comfy-table = "8"

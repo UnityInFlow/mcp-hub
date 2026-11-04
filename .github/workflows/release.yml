@@ -102,11 +102,7 @@ jobs:
   # (name = crate = mcp-server-hub) resolves them (D-02 / HUB-04).
   #
   # macOS targets are built in the separate build-macos job (macos-14).
-  # Windows is a REDUCED non-unix CLI: nix/axum/dirs/comfy-table/owo-colors/
-  # dialoguer/tower-http/askama are [target.'cfg(unix)'.dependencies], so the
-  # Windows binary has no daemon/web-UI/signal handling -- documented in the
-  # release notes + README, smoke-tested by build success + presence of the
-  # .exe in the archive (it is not runnable on the Linux build host).
+  # Windows is not supported (Unix-only crate; see issue #30).
   # ──────────────────────────────────────────────────────────────────────────
   build-binaries:
     name: Build ${{ matrix.target }}
@@ -127,10 +123,6 @@ jobs:
             ext: tgz
           - target: aarch64-unknown-linux-musl
             ext: tgz
-          # x86_64-pc-windows-gnu DEFERRED to v2 (HUB-V2-02): the CLI's unix-gated
-          # deps (chrono/rand/owo_colors/comfy_table/dialoguer/dirs are pulled under
-          # cfg(unix) and used unguarded) don't cross-compile to Windows. Re-add with
-          # proper cfg gating in a later release (alongside macOS, HUB-V2-01).
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -166,44 +158,28 @@ jobs:
       - name: Package (crate-named, binstall-compatible; flat archive)
         run: |
           VERSION="${GITHUB_REF##refs/tags/v}"
-          BIN="mcp-hub${{ matrix.binext }}"
+          BIN="mcp-hub"
           OUT="mcp-server-hub-${{ matrix.target }}-v${VERSION}.${{ matrix.ext }}"
           SRC="target/${{ matrix.target }}/release"
-          if [ "${{ matrix.ext }}" = "zip" ]; then
-            # Windows: flat .zip containing just mcp-hub.exe (reduced non-unix CLI)
-            (cd "$SRC" && zip "$OLDPWD/$OUT" "$BIN")
-          else
-            # Linux: flat .tgz containing just the mcp-hub binary (no wrapping dir)
-            tar czf "$OUT" -C "$SRC" "$BIN"
-          fi
+          # Flat .tgz containing just the mcp-hub binary (no wrapping dir)
+          tar czf "$OUT" -C "$SRC" "$BIN"
           sha256sum "$OUT" > "$OUT.sha256"
           echo "Packaged: $OUT"
 
-      - name: 'Smoke test (Linux: --version; Windows: build+presence only)'
+      - name: 'Smoke test (--version)'
         run: |
-          if [ "${{ matrix.target }}" = "x86_64-pc-windows-gnu" ]; then
-            # Windows binary is a reduced non-unix CLI cross-built on Linux -- it is
-            # not runnable on this host. Rely on a successful build + the .exe being
-            # present in the archive (Pitfall 2). Do NOT attempt to execute it.
-            test -f "target/${{ matrix.target }}/release/mcp-hub.exe" || {
-              echo "ERROR: mcp-hub.exe missing from the Windows build"
-              exit 1
-            }
-            echo "Windows reduced-CLI build present (not executed on Linux host)."
+          # A cross-compiled binary can only be EXECUTED when its arch matches the
+          # runner's arch. Decide host-vs-target arch at runtime rather than
+          # hardcoding a triple (running a foreign-arch binary fails with
+          # "Exec format error").
+          BIN_PATH="target/${{ matrix.target }}/release/mcp-hub"
+          test -f "$BIN_PATH" || { echo "ERROR: $BIN_PATH missing"; exit 1; }
+          TARGET_ARCH="${{ matrix.target }}"; TARGET_ARCH="${TARGET_ARCH%%-*}"   # x86_64 | aarch64
+          HOST_ARCH="$(uname -m)"; [ "$HOST_ARCH" = "arm64" ] && HOST_ARCH=aarch64
+          if [ "$TARGET_ARCH" = "$HOST_ARCH" ]; then
+            "$BIN_PATH" --version
           else
-            # A cross-compiled binary can only be EXECUTED when its arch matches the
-            # runner's arch. Decide host-vs-target arch at runtime rather than
-            # hardcoding a triple (running a foreign-arch binary fails with
-            # "Exec format error").
-            BIN_PATH="target/${{ matrix.target }}/release/mcp-hub"
-            test -f "$BIN_PATH" || { echo "ERROR: $BIN_PATH missing"; exit 1; }
-            TARGET_ARCH="${{ matrix.target }}"; TARGET_ARCH="${TARGET_ARCH%%-*}"   # x86_64 | aarch64
-            HOST_ARCH="$(uname -m)"; [ "$HOST_ARCH" = "arm64" ] && HOST_ARCH=aarch64
-            if [ "$TARGET_ARCH" = "$HOST_ARCH" ]; then
-              "$BIN_PATH" --version
-            else
-              echo "Cross-built $TARGET_ARCH on $HOST_ARCH host -- presence-only (not natively executable)."
-            fi
+            echo "Cross-built $TARGET_ARCH on $HOST_ARCH host -- presence-only (not natively executable)."
           fi
 
       - name: Upload artifact
@@ -308,7 +284,7 @@ jobs:
               exit 1
             fi
           done
-          echo "All 6 release artifacts validated (Windows deferred to v2)."
+          echo "All 6 release artifacts validated."
 
       - name: Generate SHA256SUMS.txt
         run: |
@@ -358,8 +334,7 @@ jobs:
             | macOS Apple Silicon (aarch64) | `mcp-server-hub-aarch64-apple-darwin-v<version>.tgz` |
             | macOS Intel (x86_64) | `mcp-server-hub-x86_64-apple-darwin-v<version>.tgz` |
 
-            > **Windows** prebuilt binaries are **deferred to v2** (HUB-V2-02).
-            > On Windows install from source with `cargo install mcp-server-hub`.
+            > Linux and macOS only; Windows is not supported.
 
             ## Checksums
             See `SHA256SUMS.txt` for verification.

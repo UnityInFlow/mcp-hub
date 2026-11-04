@@ -1,11 +1,10 @@
 /// Daemon lifecycle integration tests.
 ///
-/// All tests are Unix-only (`#[cfg(unix)]`) because daemon mode requires
+/// All tests are Unix-only because daemon mode requires
 /// `fork(2)`. Each test uses a unique socket and PID file path via a temp
 /// directory, injected via `MCP_HUB_SOCKET` and `MCP_HUB_PID` environment
 /// variables, to avoid interference with other tests or a running production
 /// daemon.
-#[cfg(unix)]
 mod daemon_tests {
     use std::io::Write as _;
     use std::path::PathBuf;

@@ -33,7 +33,6 @@ pub async fn run_foreground_loop_shared(
 
     // Run separate implementations per platform so that `tokio::select!` branches
     // are uniform (cfg attributes are not supported inside select! arms).
-    #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
 
@@ -82,41 +81,6 @@ pub async fn run_foreground_loop_shared(
                     // requires access to handles and config path which are not
                     // available here; use `mcp-hub reload` against a daemon instead.
                     tracing::info!("SIGHUP received in foreground mode (use daemon mode for config reload)");
-                }
-            }
-        }
-    }
-
-    #[cfg(not(unix))]
-    {
-        loop {
-            tokio::select! {
-                line = lines.next_line() => {
-                    match line {
-                        Ok(Some(input)) => {
-                            let trimmed = input.trim();
-                            if trimmed.is_empty() {
-                                continue;
-                            }
-                            let h = handles.lock().await;
-                            handle_stdin_command(trimmed, &h, color, &log_agg).await;
-                        }
-                        Ok(None) => {
-                            tracing::debug!("stdin closed; waiting for shutdown signal");
-                            wait_for_shutdown_signal().await?;
-                            break;
-                        }
-                        Err(err) => {
-                            tracing::warn!("Error reading stdin: {err}");
-                            wait_for_shutdown_signal().await?;
-                            break;
-                        }
-                    }
-                }
-                result = tokio::signal::ctrl_c() => {
-                    result.context("Failed to listen for Ctrl+C")?;
-                    tracing::info!("Ctrl+C received");
-                    break;
                 }
             }
         }
@@ -205,7 +169,6 @@ async fn handle_stdin_command(
 ///
 /// Used as a fallback when stdin is closed or encounters an error.
 async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
-    #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
 
@@ -221,14 +184,6 @@ async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
                 tracing::info!("SIGTERM received");
             }
         }
-    }
-
-    #[cfg(not(unix))]
-    {
-        tokio::signal::ctrl_c()
-            .await
-            .context("Failed to install Ctrl+C handler")?;
-        tracing::info!("Ctrl+C received");
     }
 
     Ok(())
