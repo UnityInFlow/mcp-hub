@@ -3,8 +3,8 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: milestone-complete
-stopped_at: v0.1.0 released
-last_updated: "2026-06-12T00:00:00.000Z"
+stopped_at: v0.1.1 released 2026-06-23 on crates.io as mcp-server-hub with Linux binaries
+last_updated: "2026-11-01T00:00:00.000Z"
 progress:
   total_phases: 7
   completed_phases: 7
@@ -18,14 +18,14 @@ progress:
 ## Current Phase
 
 Milestone v1.0 complete — all 7 phases (20/20 plans) done.
-v0.1.0 released 2026-04-09: GitHub Release with Linux x86_64/aarch64 binaries shipped.
-Known gap: crates.io publish failed (CARGO_REGISTRY_TOKEN lacks publish scope) — token rotation pending, owner action.
+v0.1.1 released 2026-06-23 on crates.io as `mcp-server-hub` (binary `mcp-hub`) with Linux x86_64/aarch64 binaries (v0.1.0 GitHub Release: 2026-04-09).
+Current focus: the v0.2.0 revive tracked in GitHub issue #2 (launch plan) and the code-review tracker #11.
 
 ## Project Reference
 
 See: .planning/PROJECT.md (updated 2026-04-04)
 **Core value:** Developers running 5+ MCP servers can manage them all from one place — one config file, one command, one log stream.
-**Current focus:** Milestone complete — maintenance and hygiene only
+**Current focus:** v0.2.0 revive (GitHub issue #2) and code-review fixes (tracker #11)
 
 ## Phase History
 
@@ -71,5 +71,5 @@ See: .planning/PROJECT.md (updated 2026-04-04)
 
 ## Last Session
 
-**Stopped at:** v0.1.0 released (2026-04-09) — milestone v1.0 complete
-**Timestamp:** 2026-06-12T00:00:00Z
+**Stopped at:** v0.1.1 released (2026-06-23) on crates.io as `mcp-server-hub` with Linux binaries — milestone v1.0 complete; v0.2.0 revive in progress (issues #2, #11)
+**Timestamp:** 2026-11-01T00:00:00Z

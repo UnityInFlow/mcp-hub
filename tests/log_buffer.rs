@@ -262,3 +262,60 @@ async fn snapshot_last_more_than_available() {
         "snapshot_last(100) should return all 3 available lines"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Servers unknown at construction time (e.g. added via `mcp-hub reload`)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn aggregator_retains_lines_for_server_not_given_to_new() {
+    let agg = LogAggregator::new(&["a".to_string()], 10);
+
+    agg.push("late", "first".to_string()).await;
+    agg.push("late", "second".to_string()).await;
+
+    let buf = agg
+        .get_buffer("late")
+        .expect("push for an unknown server must create its buffer");
+    let snap = buf.snapshot().await;
+    assert_eq!(snap.len(), 2, "both lines must be retained");
+    assert_eq!(snap[0].message, "first");
+    assert_eq!(snap[1].message, "second");
+
+    let all = agg.snapshot_all().await;
+    assert!(
+        all.iter().any(|l| l.server == "late"),
+        "snapshot_all must include lines for the late-registered server"
+    );
+    assert!(agg.server_names().iter().any(|n| n.as_str() == "late"));
+}
+
+#[tokio::test]
+async fn aggregator_late_server_uses_configured_capacity() {
+    let agg = LogAggregator::new(&[], 3);
+    for i in 0..10 {
+        agg.push("late", format!("line {i}")).await;
+    }
+    let snap = agg.get_buffer("late").expect("buffer").snapshot().await;
+    assert_eq!(snap.len(), 3, "late buffer must honour the capacity");
+    assert_eq!(snap[0].message, "line 7");
+}
+
+#[tokio::test]
+async fn aggregator_remove_server_drops_buffer() {
+    let agg = LogAggregator::new(&["a".to_string()], 10);
+    agg.push("a", "x".to_string()).await;
+    agg.push("b", "y".to_string()).await;
+
+    agg.remove_server("b");
+
+    assert!(agg.get_buffer("b").is_none(), "removed buffer must be gone");
+    assert!(
+        !agg.server_names().iter().any(|n| n.as_str() == "b"),
+        "removed server must not be listed"
+    );
+    assert!(
+        agg.get_buffer("a").is_some(),
+        "other servers must be untouched"
+    );
+}

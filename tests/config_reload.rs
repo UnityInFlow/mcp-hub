@@ -251,3 +251,75 @@ async fn mixed_config_diff() {
     shutdown.cancel();
     mcp_hub::supervisor::stop_all_servers(handles).await;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Log buffers follow reloads
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A server that writes one line to stderr and then stays alive.
+fn chatty_server() -> ServerConfig {
+    make_server_config("bash", &["-c", "echo hello-from-new >&2; sleep 9999"])
+}
+
+#[tokio::test]
+async fn reload_added_server_logs_are_buffered() {
+    let shutdown = CancellationToken::new();
+    let old_cfg = make_hub_config(&[("a", sleep_server())]);
+    let new_cfg = make_hub_config(&[("a", sleep_server()), ("new", chatty_server())]);
+    // "new" is deliberately not pre-registered, as in the daemon after a reload.
+    let log_agg = Arc::new(LogAggregator::new(&["a".to_string()], 100));
+
+    let mut handles = start_all_servers(&old_cfg, shutdown.clone(), Arc::clone(&log_agg)).await;
+    let (added, _, _) =
+        apply_config_diff(&mut handles, &old_cfg, &new_cfg, &shutdown, &log_agg).await;
+    assert_eq!(added, 1);
+
+    let mut found = false;
+    for _ in 0..50 {
+        if let Some(buf) = log_agg.get_buffer("new") {
+            if buf
+                .snapshot()
+                .await
+                .iter()
+                .any(|l| l.message == "hello-from-new")
+            {
+                found = true;
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        found,
+        "log line from the reload-added server must be buffered"
+    );
+
+    shutdown.cancel();
+    mcp_hub::supervisor::stop_all_servers(handles).await;
+}
+
+#[tokio::test]
+async fn reload_removed_server_drops_log_buffer() {
+    let shutdown = CancellationToken::new();
+    let with_b = make_hub_config(&[("a", sleep_server()), ("b", sleep_server())]);
+    let without_b = make_hub_config(&[("a", sleep_server())]);
+    let log_agg = Arc::new(LogAggregator::new(&["a".to_string()], 100));
+
+    let mut handles = start_all_servers(&with_b, shutdown.clone(), Arc::clone(&log_agg)).await;
+    log_agg.push("b", "old line".to_string()).await;
+    assert!(log_agg.get_buffer("b").is_some());
+
+    let (_, removed, _) =
+        apply_config_diff(&mut handles, &with_b, &without_b, &shutdown, &log_agg).await;
+    assert_eq!(removed, 1);
+
+    assert!(
+        log_agg.get_buffer("b").is_none(),
+        "buffer for a server removed by reload must be dropped"
+    );
+    assert!(!log_agg.server_names().iter().any(|n| n.as_str() == "b"));
+    assert!(log_agg.get_buffer("a").is_some());
+
+    shutdown.cancel();
+    mcp_hub::supervisor::stop_all_servers(handles).await;
+}

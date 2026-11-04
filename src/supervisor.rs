@@ -4,14 +4,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::BufReader;
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{resolve_env, HubConfig, ServerConfig};
 use crate::logs::LogAggregator;
-use crate::mcp::dispatcher::{IdAllocator, PendingMap, SharedStdin};
+use crate::mcp::dispatcher::{
+    read_bounded_line, BoundedLine, IdAllocator, PendingMap, SharedStdin, MAX_LINE_BYTES,
+};
 use crate::types::{BackoffConfig, HealthStatus, ProcessState, ServerSnapshot};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -81,8 +83,8 @@ pub fn spawn_server(
         let server_name = name.to_string();
         if let Some(agg) = log_agg {
             tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
+                let mut reader = BufReader::new(stderr);
+                while let Some(line) = next_stderr_line(&mut reader, &server_name).await {
                     // Push to the ring buffer and broadcast.
                     agg.push(&server_name, line.clone()).await;
                     // Also format and print to terminal stderr.
@@ -97,8 +99,8 @@ pub fn spawn_server(
         } else {
             // Backward-compatible drain for tests and cases without a LogAggregator.
             tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
+                let mut reader = BufReader::new(stderr);
+                while let Some(line) = next_stderr_line(&mut reader, &server_name).await {
                     tracing::debug!(server = %server_name, "{}", line);
                 }
             });
@@ -111,6 +113,33 @@ pub fn spawn_server(
         stdout,
         stdin,
     })
+}
+
+/// Read the next stderr line, skipping over-long lines and decoding lossily.
+///
+/// Returns `None` only at EOF or on a genuine read error, so a huge or
+/// non-UTF-8 line cannot stop stderr draining (which would let the pipe fill
+/// and block the server) or grow memory without bound.
+async fn next_stderr_line(
+    reader: &mut BufReader<tokio::process::ChildStderr>,
+    server_name: &str,
+) -> Option<String> {
+    loop {
+        match read_bounded_line(reader, MAX_LINE_BYTES).await {
+            Ok(Some(BoundedLine::Line(line))) => return Some(line),
+            Ok(Some(BoundedLine::Oversized)) => {
+                tracing::warn!(
+                    server = %server_name,
+                    "Skipped stderr line longer than {MAX_LINE_BYTES} bytes"
+                );
+            }
+            Ok(None) => return None,
+            Err(err) => {
+                tracing::debug!(server = %server_name, "stderr read error: {err}");
+                return None;
+            }
+        }
+    }
 }
 
 /// Send `signal` to the whole process group led by `pid`.
@@ -222,7 +251,7 @@ pub async fn run_server_supervisor(
     state_tx: tokio::sync::watch::Sender<ServerSnapshot>,
     log_agg: Arc<LogAggregator>,
 ) {
-    let backoff_cfg = BackoffConfig::default();
+    let backoff_cfg = BackoffConfig::from_server_config(&config);
     let mut consecutive_failures: u32 = 0;
     let mut total_restarts: u32 = 0;
 
@@ -330,8 +359,9 @@ pub async fn run_server_supervisor(
 
             // Spawn the reader task that owns stdout and routes responses by ID.
             let pending_clone = Arc::clone(&pending);
+            let stdin_reader = Arc::clone(&stdin_shared);
             reader_handle = Some(tokio::spawn(async move {
-                crate::mcp::dispatcher::reader_task(stdout, pending_clone).await;
+                crate::mcp::dispatcher::reader_task(stdout, pending_clone, stdin_reader).await;
             }));
 
             // Spawn the health check loop using shared stdin + pending map.
@@ -378,22 +408,31 @@ pub async fn run_server_supervisor(
                             let snapshot = health_rx.borrow().clone();
                             if matches!(snapshot.health, crate::types::HealthStatus::Healthy { .. }) {
                                 // First Healthy — run introspection once for this process spawn.
-                                match crate::mcp::introspect::run_introspection(
+                                // Dropped (not just ignored) on cancel, so a respawn can
+                                // never see capabilities from the previous process.
+                                match crate::mcp::introspect::run_introspection_until_cancelled(
                                     &introspect_name,
                                     &stdin_introspect,
                                     &pending_introspect,
                                     &id_introspect,
                                     &snapshot_introspect,
+                                    &introspect_cancel,
                                 )
                                 .await
                                 {
-                                    Ok(_caps) => {
+                                    None => {
+                                        tracing::debug!(
+                                            server = %introspect_name,
+                                            "MCP introspection cancelled"
+                                        );
+                                    }
+                                    Some(Ok(_caps)) => {
                                         tracing::info!(
                                             server = %introspect_name,
                                             "MCP introspection succeeded"
                                         );
                                     }
-                                    Err(err) => {
+                                    Some(Err(err)) => {
                                         tracing::warn!(
                                             server = %introspect_name,
                                             "MCP introspection failed: {err}"
@@ -578,6 +617,10 @@ pub async fn start_single_server(
     let cfg = config.clone();
     let agg = Arc::clone(log_agg);
 
+    // Register the log buffer up front so `logs --server <name>` works even
+    // before the server has emitted anything (e.g. servers added via reload).
+    agg.ensure_buffer(name);
+
     let task = tokio::spawn(async move {
         run_server_supervisor(name_owned, cfg, token, cmd_rx, state_tx, agg).await;
     });
@@ -655,6 +698,8 @@ pub async fn apply_config_diff(
         .collect();
     for name in &to_remove {
         stop_named_server(handles, name).await;
+        // Drop the log buffer so repeated add/remove cycles don't leak memory.
+        log_agg.remove_server(name);
         removed += 1;
     }
 
