@@ -3,7 +3,7 @@
 
 use anyhow::Context as _;
 
-use crate::cli::{GenConfigArgs, LogsArgs, RestartArgs};
+use crate::cli::{GenConfigArgs, GenConfigFormat, LogsArgs, RestartArgs};
 use crate::control::{self, DaemonRequest, DaemonResponse};
 use crate::{config, daemon, gen_config};
 
@@ -127,7 +127,7 @@ pub async fn reload() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `mcp-hub gen-config`: render a Claude Code / Cursor MCP config to stdout.
+/// `mcp-hub gen-config`: render a Claude Code / Cursor / Codex / Gemini MCP config to stdout.
 pub async fn gen_config(
     config_path: Option<&std::path::Path>,
     args: GenConfigArgs,
@@ -155,16 +155,15 @@ pub async fn gen_config(
         None
     };
 
-    let rendered = match args.format.as_str() {
-        "claude" => gen_config::render_claude_config(&config, live_info.as_deref())?,
-        "cursor" => gen_config::render_cursor_config(&config, live_info.as_deref())?,
-        other => {
-            anyhow::bail!("Unknown format '{other}'. Use --format claude or --format cursor.")
-        }
+    let rendered = match args.format {
+        GenConfigFormat::Claude => gen_config::render_claude_config(&config, live_info.as_deref())?,
+        GenConfigFormat::Cursor => gen_config::render_cursor_config(&config, live_info.as_deref())?,
+        GenConfigFormat::Codex => gen_config::render_codex_config(&config, live_info.as_deref())?,
+        GenConfigFormat::Gemini => gen_config::render_gemini_config(&config, live_info.as_deref())?,
     };
 
-    // Annotations go to stderr; stdout is the bare JSON document so it
-    // can be redirected straight into .mcp.json / Cursor's config.
+    // Annotations go to stderr; stdout is the bare config document (JSON,
+    // or TOML for Codex) so it can be redirected straight into the client's config.
     for note in &rendered.notes {
         eprintln!("{note}");
     }
