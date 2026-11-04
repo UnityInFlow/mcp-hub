@@ -57,7 +57,7 @@ tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
+toml = "1"
 anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
@@ -65,19 +65,19 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio-util = { version = "0.7", features = ["codec", "io"] }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.29", features = ["signal", "process", "user", "fs"] }
-dirs = "5"
-comfy-table = "7"
+nix = { version = "0.31", features = ["signal", "process", "user", "fs"] }
+dirs = "7"
+comfy-table = "8"
 owo-colors = { version = "4", features = ["supports-colors"] }
-rand = "0.9"
+rand = "0.10"
 axum = "0.8"
-askama = "0.15"
-askama_web = { version = "0.15", features = ["axum-0.8"] }
-tower-http = { version = "0.6", features = ["timeout", "cors"] }
+askama = "0.16"
+askama_web = { version = "0.16", features = ["axum-0.8"] }
+tower-http = { version = "0.7", features = ["timeout", "cors"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-dialoguer = "0.11"
+dialoguer = "0.12"
 
 [dev-dependencies]
 assert_cmd = "2"
@@ -86,7 +86,6 @@ tempfile = "3"
 tokio-test = "0.4"
 # `start_paused` virtual time for the slow Degraded -> Failed health test.
 tokio = { version = "1", features = ["test-util"] }
-portpicker = "0.1"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 
