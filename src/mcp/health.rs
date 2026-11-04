@@ -31,11 +31,14 @@ pub async fn ping_server(
 
     let response = crate::mcp::dispatcher::send_request(stdin, pending, id, &request, 5).await?;
 
-    if response.error.is_some() {
-        anyhow::bail!(
-            "Server returned error response to ping id={id}: {:?}",
-            response.error
-        );
+    match (&response.result, &response.error) {
+        (Some(_), None) => {}
+        (_, Some(error)) => {
+            anyhow::bail!("Server returned error response to ping id={id}: {error:?}");
+        }
+        (None, None) => {
+            anyhow::bail!("Ping response id={id} carried neither result nor error");
+        }
     }
 
     Ok(start.elapsed().as_millis() as u64)
@@ -64,7 +67,7 @@ pub async fn run_health_check_loop(
 
     let mut consecutive_misses: u32 = 0;
 
-    let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+    let mut interval = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {

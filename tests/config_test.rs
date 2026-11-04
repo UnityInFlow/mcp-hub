@@ -18,7 +18,7 @@ fn test_parse_valid_config() {
         .servers
         .get("mcp-filesystem")
         .expect("mcp-filesystem server should exist");
-    assert_eq!(fs.cwd, Some("/home/user".to_string()));
+    assert_eq!(fs.cwd, Some("/tmp".to_string()));
     assert_eq!(fs.max_retries, Some(5));
 }
 

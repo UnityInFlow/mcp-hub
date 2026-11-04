@@ -55,14 +55,78 @@ mod unix_tests {
         let stdin_shared: SharedStdin = Arc::new(Mutex::new(stdin));
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
 
+        let stdin_for_reader = Arc::clone(&stdin_shared);
         let pending_clone = Arc::clone(&pending);
         tokio::spawn(async move {
-            reader_task(stdout, pending_clone).await;
+            reader_task(stdout, pending_clone, stdin_for_reader).await;
         });
 
         let id_alloc = Arc::new(IdAllocator::new());
 
         (child, stdin_shared, pending, id_alloc)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Cancellation drops an in-flight introspection (issue #28)
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn introspection_is_dropped_promptly_on_cancel() {
+        use mcp_hub::mcp::introspect::run_introspection_until_cancelled;
+        use tokio_util::sync::CancellationToken;
+
+        // Reads stdin but never answers, so `initialize` waits for its 10 s timeout.
+        let mut child = tokio::process::Command::new("bash")
+            .arg("-c")
+            .arg("cat > /dev/null")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("bash should be available");
+        let stdin = child.stdin.take().expect("stdin should be piped");
+        let stdout = child.stdout.take().expect("stdout should be piped");
+        let stdin_shared: SharedStdin = Arc::new(Mutex::new(stdin));
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let (p, s) = (Arc::clone(&pending), Arc::clone(&stdin_shared));
+        tokio::spawn(async move { reader_task(stdout, p, s).await });
+
+        let id_alloc = Arc::new(IdAllocator::new());
+        let (tx, rx) = tokio::sync::watch::channel(ServerSnapshot::default());
+        let cancel = CancellationToken::new();
+
+        let canceller = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            canceller.cancel();
+        });
+
+        let start = std::time::Instant::now();
+        let result = run_introspection_until_cancelled(
+            "slow",
+            &stdin_shared,
+            &pending,
+            &id_alloc,
+            &tx,
+            &cancel,
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        child.kill().await.ok();
+
+        assert!(result.is_none(), "cancelled introspection must yield None");
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "cancel must not wait for the request timeout, took {elapsed:?}"
+        );
+        assert!(
+            rx.borrow().capabilities.introspected_at.is_none(),
+            "no capabilities may be written after cancel"
+        );
+        // The dropped request must not leave its pending entry behind.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(pending.lock().await.is_empty());
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
@@ -301,9 +365,10 @@ exit 0
         let stdin_shared: SharedStdin = Arc::new(Mutex::new(stdin));
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
 
+        let stdin_for_reader = Arc::clone(&stdin_shared);
         let pending_clone = Arc::clone(&pending);
         tokio::spawn(async move {
-            reader_task(stdout, pending_clone).await;
+            reader_task(stdout, pending_clone, stdin_for_reader).await;
         });
 
         let id_alloc = Arc::new(IdAllocator::new());

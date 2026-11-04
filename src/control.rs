@@ -10,8 +10,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
+use crate::config::HubConfig;
 use crate::logs::LogAggregator;
 use crate::supervisor::ServerHandle;
+use crate::web::SharedServerViews;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // IPC message types
@@ -101,29 +103,208 @@ pub struct DaemonState {
     /// Reserved for future use when log output is colorized in the daemon.
     #[allow(dead_code)]
     pub color: bool,
+    /// Explicit `--config` path used by reloads (`None` = default search).
+    pub config_path: Option<std::path::PathBuf>,
+    /// The config the running servers were started from; reloads diff against it.
+    ///
+    /// Holding this lock serialises reloads (SIGHUP and `Reload` requests).
+    pub current_config: tokio::sync::Mutex<HubConfig>,
+    /// Snapshot views published to the web UI; refreshed after every reload.
+    pub views: SharedServerViews,
+}
+
+/// What a successful config reload changed (server counts).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReloadSummary {
+    /// Servers newly started.
+    pub added: usize,
+    /// Servers stopped because they left the config.
+    pub removed: usize,
+    /// Servers restarted because their config changed.
+    pub changed: usize,
+    /// Servers left running untouched.
+    pub unchanged: usize,
+}
+
+impl std::fmt::Display for ReloadSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} added, {} removed, {} changed, {} unchanged",
+            self.added, self.removed, self.changed, self.unchanged
+        )
+    }
+}
+
+/// Reload the config from disk and apply the difference to the running servers.
+///
+/// Used by both the `Reload` control request and the SIGHUP handler. On error
+/// (unreadable or invalid config) nothing is touched: the servers keep running
+/// from the previous config.
+pub async fn reload_config(state: &DaemonState) -> anyhow::Result<ReloadSummary> {
+    // Held for the whole reload so concurrent reloads cannot interleave.
+    let mut current = state.current_config.lock().await;
+
+    let new_config = crate::config::find_and_load_config(state.config_path.as_deref())?;
+
+    let (added, removed, changed) = crate::supervisor::apply_config_diff(
+        &state.handles,
+        &current,
+        &new_config,
+        &state.shutdown,
+        &state.log_agg,
+    )
+    .await;
+
+    // Publish the new handle set to the web UI only now, with a brief lock;
+    // until here it kept serving the previous snapshots.
+    {
+        let handles = state.handles.lock().await;
+        crate::web::publish_server_views(&state.views, &handles).await;
+    }
+
+    let summary = ReloadSummary {
+        added,
+        removed,
+        changed,
+        unchanged: new_config.servers.len().saturating_sub(added + changed),
+    };
+    *current = new_config;
+    tracing::info!(
+        added = summary.added,
+        removed = summary.removed,
+        changed = summary.changed,
+        unchanged = summary.unchanged,
+        "Config reload complete"
+    );
+    Ok(summary)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Server-side socket listener (Unix only)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Default time a client may take to deliver its request line.
+pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default maximum length (in bytes) of a request line, excluding the newline.
+pub const DEFAULT_MAX_REQUEST_BYTES: usize = 64 * 1024;
+
+/// After rejecting an oversized request, discard at most this many further bytes...
+#[cfg(unix)]
+const OVERSIZE_DRAIN_BYTES: u64 = 1024 * 1024;
+
+/// ...and for at most this long, so the error response reaches the client.
+#[cfg(unix)]
+const OVERSIZE_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Per-connection limits enforced by the control socket.
+#[derive(Debug, Clone, Copy)]
+pub struct ControlLimits {
+    /// Maximum time to wait for a complete request line.
+    pub read_timeout: Duration,
+    /// Maximum length of a request line in bytes.
+    pub max_request_bytes: usize,
+}
+
+impl Default for ControlLimits {
+    fn default() -> Self {
+        Self {
+            read_timeout: DEFAULT_READ_TIMEOUT,
+            max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
+        }
+    }
+}
+
+/// A bound control socket listener, ready to be served.
+#[cfg(unix)]
+pub type ControlListener = tokio::net::UnixListener;
+
+/// Placeholder: Unix domain sockets are not available on this platform.
+#[cfg(not(unix))]
+pub struct ControlListener;
+
+#[cfg(unix)]
+/// Bind a Unix domain socket at `sock_path`, replacing any leftover socket file.
+///
+/// Split from [`serve_control_socket`] so the daemon can tell its parent
+/// "ready" only after the bind has actually succeeded.
+pub async fn bind_control_socket(sock_path: &Path) -> anyhow::Result<ControlListener> {
+    // Remove any leftover socket from a previous run.
+    let _ = tokio::fs::remove_file(sock_path).await;
+
+    let listener = ControlListener::bind(sock_path)
+        .map_err(|e| anyhow::anyhow!("Failed to bind socket {}: {e}", sock_path.display()))?;
+
+    // Restrict the socket to the owner. The state directory is already 0700,
+    // so there is no window in which another user can reach the socket.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(sock_path, std::fs::Permissions::from_mode(0o600)).map_err(
+            |e| {
+                anyhow::anyhow!(
+                    "Failed to set permissions 0600 on socket {}: {e}",
+                    sock_path.display()
+                )
+            },
+        )?;
+    }
+
+    tracing::info!("Control socket listening on {}", sock_path.display());
+    Ok(listener)
+}
+
+#[cfg(not(unix))]
+/// Stub: Unix domain socket IPC is not supported on non-Unix platforms.
+pub async fn bind_control_socket(_sock_path: &Path) -> anyhow::Result<ControlListener> {
+    anyhow::bail!("Unix domain socket IPC is not supported on this platform. Use foreground mode.")
+}
+
 #[cfg(unix)]
 /// Bind a Unix domain socket at `sock_path` and accept control connections.
+///
+/// Convenience wrapper over [`bind_control_socket`] + [`serve_control_socket`].
+/// The daemon binary binds and serves separately; this is the library entry point.
+#[allow(dead_code)]
+pub async fn run_control_socket(sock_path: &Path, state: Arc<DaemonState>) -> anyhow::Result<()> {
+    run_control_socket_with_limits(sock_path, state, ControlLimits::default()).await
+}
+
+#[cfg(unix)]
+/// Like [`run_control_socket`], but with explicit per-connection limits.
+pub async fn run_control_socket_with_limits(
+    sock_path: &Path,
+    state: Arc<DaemonState>,
+    limits: ControlLimits,
+) -> anyhow::Result<()> {
+    let listener = bind_control_socket(sock_path).await?;
+    serve_control_socket_with_limits(listener, sock_path, state, limits).await
+}
+
+#[cfg(unix)]
+/// Accept control connections on an already-bound `listener`.
 ///
 /// Each connection receives exactly one request and sends exactly one response
 /// (newline-delimited JSON). The listener shuts down when `state.shutdown` is
 /// cancelled and removes the socket file on exit.
-pub async fn run_control_socket(sock_path: &Path, state: Arc<DaemonState>) -> anyhow::Result<()> {
-    use tokio::net::UnixListener;
+pub async fn serve_control_socket(
+    listener: ControlListener,
+    sock_path: &Path,
+    state: Arc<DaemonState>,
+) -> anyhow::Result<()> {
+    serve_control_socket_with_limits(listener, sock_path, state, ControlLimits::default()).await
+}
 
-    // Remove any leftover socket from a previous run.
-    let _ = tokio::fs::remove_file(sock_path).await;
-
-    let listener = UnixListener::bind(sock_path)
-        .map_err(|e| anyhow::anyhow!("Failed to bind socket {}: {e}", sock_path.display()))?;
-
-    tracing::info!("Control socket listening on {}", sock_path.display());
-
+#[cfg(unix)]
+/// Like [`serve_control_socket`], but with explicit per-connection limits:
+/// idle clients are dropped after `limits.read_timeout` and request lines are
+/// capped at `limits.max_request_bytes`.
+pub async fn serve_control_socket_with_limits(
+    listener: ControlListener,
+    sock_path: &Path,
+    state: Arc<DaemonState>,
+    limits: ControlLimits,
+) -> anyhow::Result<()> {
     loop {
         tokio::select! {
             accept = listener.accept() => {
@@ -131,7 +312,7 @@ pub async fn run_control_socket(sock_path: &Path, state: Arc<DaemonState>) -> an
                     Ok((stream, _addr)) => {
                         let state = Arc::clone(&state);
                         tokio::spawn(async move {
-                            if let Err(e) = handle_connection(stream, state).await {
+                            if let Err(e) = handle_connection(stream, state, limits).await {
                                 tracing::warn!("Control socket connection error: {e}");
                             }
                         });
@@ -159,28 +340,92 @@ pub async fn run_control_socket(_sock_path: &Path, _state: Arc<DaemonState>) -> 
     anyhow::bail!("Unix domain socket IPC is not supported on this platform. Use foreground mode.")
 }
 
+#[cfg(not(unix))]
+/// Stub: Unix domain socket IPC is not supported on non-Unix platforms.
+pub async fn serve_control_socket(
+    _listener: ControlListener,
+    _sock_path: &Path,
+    _state: Arc<DaemonState>,
+) -> anyhow::Result<()> {
+    anyhow::bail!("Unix domain socket IPC is not supported on this platform. Use foreground mode.")
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Per-connection handler (Unix only)
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(unix)]
 /// Read one request line, dispatch it, and write one response line.
+///
+/// The request must arrive within `limits.read_timeout` and be at most
+/// `limits.max_request_bytes` long; idle clients are dropped silently and
+/// oversized requests get an error response before the connection is closed.
 async fn handle_connection(
     stream: tokio::net::UnixStream,
     state: Arc<DaemonState>,
+    limits: ControlLimits,
 ) -> anyhow::Result<()> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
     let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+    // Allow one byte more than the cap so an over-long line is detectable
+    // without ever buffering more than `max_request_bytes + 1` bytes.
+    let cap = u64::try_from(limits.max_request_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut reader = BufReader::new(reader.take(cap));
 
-    let request_line = lines
-        .next_line()
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("Client disconnected without sending request"))?;
+    let mut buf = Vec::new();
+    let read = tokio::time::timeout(limits.read_timeout, reader.read_until(b'\n', &mut buf)).await;
+    let n = match read {
+        Ok(result) => result?,
+        Err(_elapsed) => {
+            tracing::debug!(
+                "Control socket client sent no complete request within {:?}; dropping",
+                limits.read_timeout
+            );
+            return Ok(());
+        }
+    };
 
-    let request: DaemonRequest = serde_json::from_str(&request_line)
-        .map_err(|e| anyhow::anyhow!("Invalid request JSON: {e}"))?;
+    if n == 0 {
+        anyhow::bail!("Client disconnected without sending request");
+    }
+
+    let has_newline = buf.last() == Some(&b'\n');
+    let line_len = if has_newline {
+        buf.len() - 1
+    } else {
+        buf.len()
+    };
+    if line_len > limits.max_request_bytes {
+        let response = DaemonResponse::err(format!(
+            "Request too large (limit {} bytes)",
+            limits.max_request_bytes
+        ));
+        let mut response_json = serde_json::to_string(&response)?;
+        response_json.push('\n');
+        // The client may already be gone; the error is still reported below.
+        writer.write_all(response_json.as_bytes()).await?;
+        writer.flush().await?;
+        // Closing a socket with unread input makes the kernel send RST, which
+        // can destroy the error response before the client reads it. Briefly
+        // drain (bounded in both bytes and time) so the client sees the reply.
+        let rest = reader.into_inner().into_inner();
+        let mut bounded = rest.take(OVERSIZE_DRAIN_BYTES);
+        let _ = tokio::time::timeout(
+            OVERSIZE_DRAIN_TIMEOUT,
+            tokio::io::copy(&mut bounded, &mut tokio::io::sink()),
+        )
+        .await;
+        anyhow::bail!(
+            "Request exceeded {} bytes; connection closed",
+            limits.max_request_bytes
+        );
+    }
+
+    let request: DaemonRequest =
+        serde_json::from_slice(&buf).map_err(|e| anyhow::anyhow!("Invalid request JSON: {e}"))?;
 
     let response = dispatch_request(request, &state).await;
 
@@ -266,19 +511,16 @@ async fn dispatch_request(request: DaemonRequest, state: &DaemonState) -> Daemon
             }
         },
 
-        DaemonRequest::Reload => {
-            // Send SIGHUP to self so the main event loop's sighup handler triggers
-            // the config reload without requiring a separate reload channel.
-            {
-                use nix::sys::signal::{kill, Signal};
-                use nix::unistd::Pid;
-                let pid = Pid::from_raw(std::process::id() as i32);
-                match kill(pid, Signal::SIGHUP) {
-                    Ok(()) => DaemonResponse::ok_empty(),
-                    Err(e) => DaemonResponse::err(format!("Failed to send SIGHUP: {e}")),
-                }
+        DaemonRequest::Reload => match reload_config(state).await {
+            Ok(summary) => match serde_json::to_value(summary) {
+                Ok(data) => DaemonResponse::success(data),
+                Err(e) => DaemonResponse::err(format!("Failed to encode reload summary: {e}")),
+            },
+            Err(e) => {
+                tracing::error!("Config reload failed: {e:#}");
+                DaemonResponse::err(format!("{e:#}"))
             }
-        }
+        },
     }
 }
 

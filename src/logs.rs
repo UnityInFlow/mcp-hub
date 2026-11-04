@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 use std::time::SystemTime;
 
 use owo_colors::AnsiColors;
@@ -89,12 +89,20 @@ impl LogBuffer {
 /// Each server gets its own `LogBuffer` ring buffer (LOG-03). A broadcast
 /// channel carries every line to any live subscriber (LOG-04, LOG-05).
 pub struct LogAggregator {
-    buffers: HashMap<String, Arc<LogBuffer>>,
+    /// Per-server buffers. Guarded by a std mutex that is never held across an
+    /// `.await`; buffers are created on demand so servers added via reload are
+    /// captured, and removed when a server is dropped.
+    buffers: StdMutex<HashMap<String, Arc<LogBuffer>>>,
+    capacity_per_server: usize,
     all_tx: broadcast::Sender<LogLine>,
 }
 
 impl LogAggregator {
-    /// Create a new `LogAggregator` with one `LogBuffer` per server name.
+    /// Create a new `LogAggregator`, pre-registering one `LogBuffer` per server name.
+    ///
+    /// Servers not listed here (for example those added later by a config
+    /// reload) get a buffer of the same capacity on their first `push` or via
+    /// [`LogAggregator::ensure_buffer`].
     pub fn new(server_names: &[String], capacity_per_server: usize) -> Self {
         let buffers = server_names
             .iter()
@@ -103,13 +111,42 @@ impl LogAggregator {
 
         let (all_tx, _) = broadcast::channel(1024);
 
-        Self { buffers, all_tx }
+        Self {
+            buffers: StdMutex::new(buffers),
+            capacity_per_server,
+            all_tx,
+        }
+    }
+
+    /// Lock the buffer map, recovering from poisoning (the map stays valid).
+    fn lock_buffers(&self) -> MutexGuard<'_, HashMap<String, Arc<LogBuffer>>> {
+        self.buffers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Return the buffer for `server`, creating it if it does not exist yet.
+    pub fn ensure_buffer(&self, server: &str) -> Arc<LogBuffer> {
+        let mut guard = self.lock_buffers();
+        Arc::clone(
+            guard
+                .entry(server.to_string())
+                .or_insert_with(|| Arc::new(LogBuffer::new(self.capacity_per_server))),
+        )
+    }
+
+    /// Drop the buffer for `server` (e.g. when a reload removes the server).
+    ///
+    /// Returns `true` if a buffer was present.
+    pub fn remove_server(&self, server: &str) -> bool {
+        self.lock_buffers().remove(server).is_some()
     }
 
     /// Push a log message for `server`, stamping it with the current time.
     ///
-    /// Also broadcasts the line to all active subscribers.
-    /// Lagged subscriber errors are silently ignored.
+    /// A buffer is created on demand for unknown server names. Also broadcasts
+    /// the line to all active subscribers. Lagged subscriber errors are
+    /// silently ignored.
     pub async fn push(&self, server: &str, message: String) {
         let line = LogLine {
             server: server.to_string(),
@@ -117,17 +154,16 @@ impl LogAggregator {
             message,
         };
 
-        if let Some(buf) = self.buffers.get(server) {
-            buf.push(line.clone()).await;
-        }
+        let buf = self.ensure_buffer(server);
+        buf.push(line.clone()).await;
 
         // Broadcast — ignore errors (no subscribers, or lagged).
         let _ = self.all_tx.send(line);
     }
 
-    /// Return a reference to the `LogBuffer` for the given server name.
-    pub fn get_buffer(&self, server: &str) -> Option<&Arc<LogBuffer>> {
-        self.buffers.get(server)
+    /// Return the `LogBuffer` for the given server name, if registered.
+    pub fn get_buffer(&self, server: &str) -> Option<Arc<LogBuffer>> {
+        self.lock_buffers().get(server).cloned()
     }
 
     /// Subscribe to the all-server broadcast stream.
@@ -137,8 +173,9 @@ impl LogAggregator {
 
     /// Merge all server buffers into a single `Vec<LogLine>` sorted by timestamp.
     pub async fn snapshot_all(&self) -> Vec<LogLine> {
+        let bufs: Vec<Arc<LogBuffer>> = self.lock_buffers().values().cloned().collect();
         let mut all: Vec<LogLine> = Vec::new();
-        for buf in self.buffers.values() {
+        for buf in bufs {
             all.extend(buf.snapshot().await);
         }
         all.sort_by_key(|l| l.timestamp);
@@ -146,8 +183,8 @@ impl LogAggregator {
     }
 
     /// Return the list of registered server names.
-    pub fn server_names(&self) -> Vec<&String> {
-        self.buffers.keys().collect()
+    pub fn server_names(&self) -> Vec<String> {
+        self.lock_buffers().keys().cloned().collect()
     }
 }
 

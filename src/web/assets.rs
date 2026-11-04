@@ -13,20 +13,39 @@ pub const HTMX_SSE_JS: &str = include_str!("../../static/htmx-sse.js");
 /// Application CSS stylesheet.
 pub const STYLE_CSS: &str = include_str!("../../static/style.css");
 
+/// Long-lived cache policy for the embedded assets. They are compiled into the
+/// binary, so their content only changes with a new release.
+const CACHE_CONTROL_IMMUTABLE: &str = "public, max-age=31536000, immutable";
+
 /// Serve the HTMX core library.
 pub async fn serve_htmx() -> impl IntoResponse {
-    ([(header::CONTENT_TYPE, "application/javascript")], HTMX_JS)
+    (
+        [
+            (header::CONTENT_TYPE, "application/javascript"),
+            (header::CACHE_CONTROL, CACHE_CONTROL_IMMUTABLE),
+        ],
+        HTMX_JS,
+    )
 }
 
 /// Serve the HTMX SSE extension.
 pub async fn serve_htmx_sse() -> impl IntoResponse {
     (
-        [(header::CONTENT_TYPE, "application/javascript")],
+        [
+            (header::CONTENT_TYPE, "application/javascript"),
+            (header::CACHE_CONTROL, CACHE_CONTROL_IMMUTABLE),
+        ],
         HTMX_SSE_JS,
     )
 }
 
 /// Serve the application CSS stylesheet.
 pub async fn serve_css() -> impl IntoResponse {
-    ([(header::CONTENT_TYPE, "text/css")], STYLE_CSS)
+    (
+        [
+            (header::CONTENT_TYPE, "text/css"),
+            (header::CACHE_CONTROL, CACHE_CONTROL_IMMUTABLE),
+        ],
+        STYLE_CSS,
+    )
 }

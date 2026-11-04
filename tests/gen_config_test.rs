@@ -62,37 +62,80 @@ args = ["server.js"]
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// `--format claude` produces valid JSON on stdout with both server names and
-/// the "mcpServers" key. Exit code must be 0.
+/// Parse stdout as JSON, panicking with the raw text if it is not valid.
+fn parse_stdout_json(stdout: &[u8]) -> serde_json::Value {
+    let text = String::from_utf8(stdout.to_vec()).expect("stdout is valid UTF-8");
+    serde_json::from_str::<serde_json::Value>(&text)
+        .unwrap_or_else(|e| panic!("stdout must be pure JSON ({e}), got:\n{text}"))
+}
+
+/// `--format claude` produces a parseable JSON document on stdout containing
+/// both servers under `mcpServers`. Exit code must be 0.
 #[test]
 fn claude_format_outputs_valid_json() {
     let fixture = write_fixture(two_servers_toml());
 
-    mcp_hub()
+    let assert = mcp_hub()
         .args(["gen-config", "--format", "claude", "-c"])
         .arg(fixture.path())
         .assert()
         .success()
-        .stdout(predicate::str::contains("\"mcpServers\""))
-        .stdout(predicate::str::contains("\"filesystem\""))
-        .stdout(predicate::str::contains("\"github\""))
-        .stdout(predicate::str::contains("\"command\": \"npx\""))
-        .stdout(predicate::str::contains(
-            "\"GITHUB_TOKEN\": \"ghp_test123\"",
-        ));
+        .stdout(predicate::str::contains("\"mcpServers\""));
+
+    let value = parse_stdout_json(&assert.get_output().stdout);
+    let servers = value["mcpServers"]
+        .as_object()
+        .expect("mcpServers must be an object");
+    assert!(servers.contains_key("filesystem"));
+    assert!(servers.contains_key("github"));
+    assert_eq!(servers["filesystem"]["command"], "npx");
+    assert_eq!(servers["github"]["env"]["GITHUB_TOKEN"], "ghp_test123");
 }
 
-/// `--format cursor` produces JSON on stdout with the Cursor-specific header.
+/// `--format cursor` produces a parseable JSON document on stdout; the
+/// Cursor destination hint goes to stderr.
 #[test]
-fn cursor_format_has_cursor_header() {
+fn cursor_format_outputs_valid_json() {
     let fixture = write_fixture(two_servers_toml());
 
-    mcp_hub()
+    let assert = mcp_hub()
         .args(["gen-config", "--format", "cursor", "-c"])
         .arg(fixture.path())
         .assert()
         .success()
-        .stdout(predicate::str::contains("~/.cursor/mcp.json"));
+        .stderr(predicate::str::contains("~/.cursor/mcp.json"))
+        .stdout(predicate::str::contains("//").not());
+
+    let value = parse_stdout_json(&assert.get_output().stdout);
+    let servers = value["mcpServers"]
+        .as_object()
+        .expect("mcpServers must be an object");
+    assert!(servers.contains_key("filesystem"));
+    assert!(servers.contains_key("github"));
+}
+
+/// A server with a non-empty env still yields pure JSON on stdout.
+#[test]
+fn env_config_stdout_parses_as_json() {
+    let fixture = write_fixture(two_servers_toml());
+
+    for format in ["claude", "cursor"] {
+        let assert = mcp_hub()
+            .args(["gen-config", "--format", format, "-c"])
+            .arg(fixture.path())
+            .assert()
+            .success();
+        let stdout = &assert.get_output().stdout;
+        let value = parse_stdout_json(stdout);
+        assert_eq!(
+            value["mcpServers"]["github"]["env"]["GITHUB_TOKEN"],
+            "ghp_test123"
+        );
+        assert!(
+            stdout.ends_with(b"}\n"),
+            "stdout must end with the JSON document and a newline"
+        );
+    }
 }
 
 /// Empty config prints a warning to stderr and an empty mcpServers block to
@@ -108,6 +151,17 @@ fn zero_servers_warning() {
         .success()
         .stderr(predicate::str::contains("No servers configured"))
         .stdout(predicate::str::contains("\"mcpServers\": {}"));
+
+    let assert = mcp_hub()
+        .args(["gen-config", "--format", "claude", "-c"])
+        .arg(fixture.path())
+        .assert()
+        .success();
+    let value = parse_stdout_json(&assert.get_output().stdout);
+    assert!(value["mcpServers"]
+        .as_object()
+        .expect("mcpServers must be an object")
+        .is_empty());
 }
 
 /// Unknown format value exits non-zero and error output mentions the valid
@@ -155,8 +209,8 @@ fn missing_format_flag() {
         .failure();
 }
 
-/// HTTP transport server appears in `// WARNING:` comment and is excluded from
-/// the mcpServers JSON block. The stdio server is included normally.
+/// HTTP transport server is reported in a `// WARNING:` line on stderr and
+/// excluded from the mcpServers JSON on stdout. The stdio server is included.
 #[test]
 fn http_transport_excluded() {
     let fixture = write_fixture(http_transport_toml());
@@ -166,25 +220,22 @@ fn http_transport_excluded() {
         .arg(fixture.path())
         .assert()
         .success()
-        .stdout(predicate::str::contains("// WARNING:"))
-        .stdout(predicate::str::contains("remote-api"))
-        .stdout(predicate::str::contains("\"local-stdio\""));
+        .stderr(predicate::str::contains("WARNING:"))
+        .stderr(predicate::str::contains("remote-api"))
+        .stdout(predicate::str::contains("WARNING").not());
 
-    // Verify "remote-api" does NOT appear as a JSON key inside mcpServers.
-    // It may appear in the WARNING comment line, but not as `"remote-api":`.
-    let output =
-        String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is valid UTF-8");
-
-    // Find the JSON block start (first `{`) and check inside it.
-    let json_start = output.find('{').expect("output must contain JSON block");
-    let json_part = &output[json_start..];
+    let value = parse_stdout_json(&assert.get_output().stdout);
+    let servers = value["mcpServers"]
+        .as_object()
+        .expect("mcpServers must be an object");
+    assert!(servers.contains_key("local-stdio"));
     assert!(
-        !json_part.contains("\"remote-api\""),
-        "http server must not appear as a JSON key in mcpServers, got:\n{json_part}"
+        !servers.contains_key("remote-api"),
+        "http server must not appear as a key in mcpServers"
     );
 }
 
-/// Output starts with `// Generated by mcp-hub v` version comment.
+/// The `// Generated by mcp-hub v` header goes to stderr; stdout stays pure JSON.
 #[test]
 fn version_in_header() {
     let fixture = write_fixture(two_servers_toml());
@@ -194,7 +245,9 @@ fn version_in_header() {
         .arg(fixture.path())
         .assert()
         .success()
-        .stdout(predicate::str::starts_with("// Generated by mcp-hub v"));
+        .stderr(predicate::str::contains("// Generated by mcp-hub v"))
+        .stdout(predicate::str::starts_with("{"))
+        .stdout(predicate::str::contains("Generated by").not());
 }
 
 /// `--live` without a running daemon exits non-zero with an error message
