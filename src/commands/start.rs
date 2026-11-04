@@ -73,6 +73,7 @@ pub async fn run_foreground(
         let web_state = Arc::new(web::WebState {
             servers: server_views,
             log_agg: Arc::clone(&log_agg),
+            port: config.hub.web_port,
         });
         let web_shutdown = shutdown.clone();
         let web_task = tokio::spawn(async move {
@@ -208,6 +209,7 @@ async fn run_daemon_inner(
     let web_state = Arc::new(web::WebState {
         servers: Arc::clone(&server_views),
         log_agg: Arc::clone(&log_agg),
+        port: web_port,
     });
     let web_shutdown = shutdown.clone();
     let web_task = tokio::spawn(async move {

@@ -221,6 +221,7 @@ async fn health(servers: Vec<(&str, HealthStatus)>) -> (StatusCode, serde_json::
     let state = Arc::new(WebState {
         servers: new_server_views(&handles),
         log_agg,
+        port: 3456,
     });
     let resp = build_router(state)
         .oneshot(

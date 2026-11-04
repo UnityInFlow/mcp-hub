@@ -44,7 +44,11 @@ fn fixture(servers: Vec<(&str, McpCapabilities)>) -> Fixture {
     }
     let servers = new_server_views(&handles);
     Fixture {
-        state: Arc::new(WebState { servers, log_agg }),
+        state: Arc::new(WebState {
+            servers,
+            log_agg,
+            port: 3456,
+        }),
         _senders: senders,
     }
 }
@@ -152,6 +156,172 @@ async fn tools_partial_known_server_is_200_and_unknown_is_404() {
 
     let (status, _) = get(&fx.state, "/partials/tools/unknown").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Host-header allowlist (DNS-rebinding protection)
+// ─────────────────────────────────────────────────────────────────────────────
+
+async fn status_with_host(state: &Arc<WebState>, uri: &str, host: Option<&str>) -> StatusCode {
+    let mut req = Request::builder().uri(uri);
+    if let Some(h) = host {
+        req = req.header("host", h);
+    }
+    build_router(Arc::clone(state))
+        .oneshot(req.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn loopback_hosts_are_allowed() {
+    let fx = fixture(vec![]);
+    for host in [
+        "localhost:3456",
+        "localhost",
+        "LocalHost:3456",
+        "127.0.0.1:3456",
+        "127.0.0.1",
+        "[::1]:3456",
+        "[::1]",
+    ] {
+        assert_eq!(
+            status_with_host(&fx.state, "/", Some(host)).await,
+            StatusCode::OK,
+            "{host}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn foreign_hosts_are_rejected_with_403() {
+    let fx = fixture(vec![]);
+    for host in [
+        "evil.example",
+        "evil.example:3456",
+        "localhost.evil.example",
+        "localhost.evil.example:3456",
+        "127.0.0.1.evil.example",
+        "localhost:9999",
+        "127.0.0.1:80",
+        "[::1]:9999",
+        "localhost:",
+        "localhost:3456:1",
+        "",
+    ] {
+        for uri in ["/", "/health", "/logs/stream", "/static/style.css"] {
+            assert_eq!(
+                status_with_host(&fx.state, uri, Some(host)).await,
+                StatusCode::FORBIDDEN,
+                "{host} {uri}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn missing_host_header_is_allowed() {
+    // HTTP/1.0 clients may omit Host; browsers (the rebinding threat) never do.
+    let fx = fixture(vec![]);
+    assert_eq!(status_with_host(&fx.state, "/", None).await, StatusCode::OK);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Percent-encoding of server names in generated URLs
+// ─────────────────────────────────────────────────────────────────────────────
+
+const AWKWARD: [&str; 4] = ["a&b", "a/b", "a b", "my.server"];
+
+fn awkward_fixture() -> Fixture {
+    fixture(AWKWARD.iter().map(|n| (*n, caps("does a thing"))).collect())
+}
+
+#[tokio::test]
+async fn logs_page_percent_encodes_server_names_in_links() {
+    let fx = awkward_fixture();
+    let (status, html) = get(&fx.state, "/logs").await;
+    assert_eq!(status, StatusCode::OK);
+    for enc in [
+        "/logs?server=a%26b",
+        "/logs?server=a%2Fb",
+        "/logs?server=a%20b",
+        "/logs?server=my.server",
+    ] {
+        assert!(html.contains(enc), "missing {enc} in: {html}");
+    }
+    assert!(!html.contains("server=a&amp;b"), "raw name leaked: {html}");
+}
+
+#[tokio::test]
+async fn logs_page_sse_url_is_encoded_for_active_filter() {
+    let fx = awkward_fixture();
+    let (status, html) = get(&fx.state, "/logs?server=a%26b").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("sse-connect=\"/logs/stream?server=a%26b\""),
+        "got: {html}"
+    );
+}
+
+#[tokio::test]
+async fn tools_page_percent_encodes_partial_urls() {
+    let fx = awkward_fixture();
+    let (status, html) = get(&fx.state, "/tools").await;
+    assert_eq!(status, StatusCode::OK);
+    for enc in [
+        "/partials/tools/a%26b",
+        "/partials/tools/a%2Fb",
+        "/partials/tools/a%20b",
+        "/partials/tools/my.server",
+    ] {
+        assert!(html.contains(enc), "missing {enc} in: {html}");
+    }
+}
+
+#[tokio::test]
+async fn tools_partial_accepts_encoded_names() {
+    let fx = awkward_fixture();
+    for enc in ["a%26b", "a%2Fb", "a%20b", "my.server"] {
+        let (status, html) = get(&fx.state, &format!("/partials/tools/{enc}")).await;
+        assert_eq!(status, StatusCode::OK, "{enc}");
+        assert!(html.contains("do-thing"), "{enc}: {html}");
+    }
+}
+
+#[tokio::test]
+async fn log_stream_filters_on_encoded_ampersand_name() {
+    let fx = awkward_fixture();
+    let resp = build_router(Arc::clone(&fx.state))
+        .oneshot(
+            Request::builder()
+                .uri("/logs/stream?server=a%26b")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mut body = resp.into_body();
+    fx.state.log_agg.push("a/b", "from-slash".to_string()).await;
+    fx.state.log_agg.push("a&b", "from-amp".to_string()).await;
+
+    let mut received = String::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        while !received.contains("from-amp") {
+            match body.frame().await {
+                Some(Ok(frame)) => {
+                    if let Some(data) = frame.data_ref() {
+                        received.push_str(&String::from_utf8_lossy(data));
+                    }
+                }
+                Some(Err(_)) | None => return,
+            }
+        }
+    })
+    .await;
+    assert!(received.contains("from-amp"), "got: {received}");
+    assert!(!received.contains("from-slash"), "leaked: {received}");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

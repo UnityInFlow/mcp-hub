@@ -170,6 +170,8 @@ The web UI is served at `http://127.0.0.1:3456` by default (configurable via `[h
 - MCP tool browser with per-server tool listings
 - Real-time log viewer with SSE streaming and per-server filtering
 
+Requests whose `Host` header is not `localhost`, `127.0.0.1` or `[::1]` (optionally with the web port) get a 403, which blocks DNS-rebinding attacks from web pages. If the browser falls behind the log stream, a `[mcp-hub] N log lines dropped` line marks the gap.
+
 It also serves `GET /health`, a JSON summary that returns HTTP 503 when a server has failed.
 
 ## License

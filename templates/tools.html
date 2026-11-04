@@ -11,7 +11,7 @@
   {% for server in servers %}
   <div class="accordion-item">
     <div class="accordion-header"
-         hx-get="/partials/tools/{{ server.name }}"
+         hx-get="{{ server.detail_url }}"
          hx-target="#tools-{{ loop.index }}"
          hx-swap="innerHTML"
          hx-trigger="click once">

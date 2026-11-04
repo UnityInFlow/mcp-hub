@@ -11,6 +11,25 @@ use serde::Serialize;
 use super::WebState;
 use crate::types::{format_uptime, HealthStatus, ProcessState};
 
+/// Percent-encode `input` for use as a single URL path segment or query value.
+///
+/// Everything except the RFC 3986 unreserved set (`A-Z a-z 0-9 - . _ ~`) is
+/// encoded, so `/`, `&`, `?`, `#`, `%` and spaces in server names cannot alter
+/// the URL structure. Axum's `Path`/`Query` extractors decode on the way in.
+pub(crate) fn percent_encode(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for &b in input.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(char::from(b));
+            }
+            // Every other byte (including each byte of multi-byte UTF-8) is encoded.
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Data structs used by templates
 // ─────────────────────────────────────────────────────────────────────────────
@@ -126,6 +145,8 @@ pub struct HealthResponse {
 /// Summary data for the tools browser accordion per D-08.
 pub struct ServerToolsData {
     pub name: String,
+    /// Pre-computed `/partials/tools/{encoded name}` URL.
+    pub detail_url: String,
     pub tool_count: usize,
     pub resource_count: usize,
     pub prompt_count: usize,
@@ -158,6 +179,8 @@ pub struct PromptDetail {
 /// A filter pill for the logs page server filter (D-11).
 pub struct ServerFilterPill {
     pub name: String,
+    /// Pre-computed `/logs?server={encoded name}` link.
+    pub href: String,
     /// Whether this pill is the currently active filter.
     pub active: bool,
 }
@@ -268,6 +291,7 @@ pub async fn tools_page(State(state): State<Arc<WebState>>) -> impl IntoResponse
             let caps = &snap.capabilities;
             ServerToolsData {
                 name: h.name.clone(),
+                detail_url: format!("/partials/tools/{}", percent_encode(&h.name)),
                 tool_count: caps.tools.len(),
                 resource_count: caps.resources.len(),
                 prompt_count: caps.prompts.len(),
@@ -348,12 +372,13 @@ pub async fn logs_page(
         .iter()
         .map(|h| ServerFilterPill {
             name: h.name.clone(),
+            href: format!("/logs?server={}", percent_encode(&h.name)),
             active: params.server.as_ref().is_some_and(|s| s == &h.name),
         })
         .collect();
 
     let sse_url = match &params.server {
-        Some(name) => format!("/logs/stream?server={name}"),
+        Some(name) => format!("/logs/stream?server={}", percent_encode(name)),
         None => "/logs/stream".to_string(),
     };
 
@@ -447,7 +472,11 @@ mod tests {
             100,
         ));
         let servers = super::super::new_server_views(&[]);
-        Arc::new(super::super::WebState { servers, log_agg })
+        Arc::new(super::super::WebState {
+            servers,
+            log_agg,
+            port: 3456,
+        })
     }
 
     #[tokio::test]
@@ -595,6 +624,7 @@ mod tests {
             Arc::new(super::super::WebState {
                 servers: views,
                 log_agg,
+                port: 3456,
             }),
             handles,
             senders,

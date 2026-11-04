@@ -22,8 +22,9 @@ pub struct LogParams {
 /// GET /logs/stream -- Server-Sent Events stream of live log lines.
 ///
 /// Bridges `LogAggregator.subscribe()` (broadcast::Receiver) to an SSE response
-/// via `BroadcastStream`. Lagged events are silently dropped -- the HTMX SSE
-/// extension reconnects automatically.
+/// via `BroadcastStream`. When the browser falls behind and the broadcast
+/// channel overwrites lines, the stream stays open and emits a visible
+/// "N log lines dropped" marker line instead of losing them silently.
 ///
 /// Per D-10: Uses SSE event name "log" for `sse-swap="log"` in the template.
 /// Per D-11: Filters by server name when `?server=name` query param is present.
@@ -34,28 +35,40 @@ pub async fn log_stream_handler(
     let rx = state.log_agg.subscribe();
     let filter_server = params.server;
 
-    let stream = BroadcastStream::new(rx).filter_map(
-        move |result: Result<crate::logs::LogLine, BroadcastStreamRecvError>| {
-            let filter = filter_server.clone();
-            async move {
-                // Drop lagged errors silently -- HTMX SSE extension auto-reconnects.
-                let line = result.ok()?;
-
-                // Apply server filter when set.
-                if let Some(ref name) = filter {
-                    if &line.server != name {
-                        return None;
-                    }
-                }
-
-                let data = render_log_line(&line);
-
-                Some(Ok(Event::default().event("log").data(data)))
-            }
-        },
-    );
+    let stream = BroadcastStream::new(rx).filter_map(move |result| {
+        let data = log_event_data(result, filter_server.as_deref());
+        async move { data.map(|d| Ok(Event::default().event("log").data(d))) }
+    });
 
     Sse::new(stream).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)))
+}
+
+/// Map one broadcast item to the HTML fragment for an SSE `log` event.
+///
+/// Returns `None` for lines filtered out by `filter`. A lag error becomes a
+/// visible marker line carrying the dropped count; it is never filtered since
+/// the dropped lines' servers are unknown.
+fn log_event_data(
+    result: Result<crate::logs::LogLine, BroadcastStreamRecvError>,
+    filter: Option<&str>,
+) -> Option<String> {
+    let line = match result {
+        Ok(line) => line,
+        Err(BroadcastStreamRecvError::Lagged(n)) => return Some(render_lag_marker(n)),
+    };
+    if let Some(name) = filter {
+        if line.server != name {
+            return None;
+        }
+    }
+    Some(render_log_line(&line))
+}
+
+/// Render the "lines dropped" marker, styled like a log line.
+fn render_lag_marker(dropped: u64) -> String {
+    format!(
+        "<div class=\"log-line\"><span style=\"color: #d7ba7d;\">[mcp-hub]</span> {dropped} log lines dropped (browser too slow)</div>"
+    )
 }
 
 /// Render a log line as the HTML fragment swapped into the page by HTMX.
@@ -91,6 +104,33 @@ mod tests {
     use super::*;
     use crate::logs::LogLine;
     use std::time::SystemTime;
+
+    #[test]
+    fn lagged_becomes_visible_marker() {
+        let data = log_event_data(Err(BroadcastStreamRecvError::Lagged(5)), Some("a"))
+            .expect("lag must produce an event");
+        assert!(data.contains("5 log lines dropped"), "got: {data}");
+        assert!(data.starts_with("<div class=\"log-line\">"), "got: {data}");
+    }
+
+    #[tokio::test]
+    async fn overflowed_receiver_yields_marker_then_lines() {
+        let (tx, rx) = tokio::sync::broadcast::channel(2);
+        for i in 0..5 {
+            let _ = tx.send(LogLine {
+                server: "a".to_string(),
+                timestamp: SystemTime::now(),
+                message: format!("m{i}"),
+            });
+        }
+        let mut stream = BroadcastStream::new(rx);
+        let first = stream.next().await.expect("item");
+        let data = log_event_data(first, None).expect("marker");
+        assert!(data.contains("3 log lines dropped"), "got: {data}");
+        let next = stream.next().await.expect("item");
+        let data = log_event_data(next, None).expect("line");
+        assert!(data.contains("m3"), "got: {data}");
+    }
 
     #[test]
     fn render_log_line_escapes_server_and_message() {
