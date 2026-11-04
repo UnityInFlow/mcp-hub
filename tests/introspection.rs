@@ -326,19 +326,93 @@ mod unix_tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
-    // Test 4: introspection timeout — server never responds to list requests
+    // Test 4: introspection timeouts
     // ─────────────────────────────────────────────────────────────────────────────
 
+    /// A server that reads stdin but never answers: `initialize` must fail with
+    /// a timeout error after the 10 s request timeout (virtual time, so the
+    /// test is instant and the silent child cannot race the clock).
+    #[tokio::test(start_paused = true)]
+    async fn introspection_times_out_when_initialize_is_never_answered() {
+        let mut child = tokio::process::Command::new("bash")
+            .arg("-c")
+            .arg("cat > /dev/null")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("bash should be available");
+        let stdin = child.stdin.take().expect("stdin should be piped");
+        let stdout = child.stdout.take().expect("stdout should be piped");
+        let stdin_shared: SharedStdin = Arc::new(Mutex::new(stdin));
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let (p, s) = (Arc::clone(&pending), Arc::clone(&stdin_shared));
+        tokio::spawn(async move { reader_task(stdout, p, s).await });
+
+        let id_alloc = Arc::new(IdAllocator::new());
+        let (tx, rx) = tokio::sync::watch::channel(ServerSnapshot::default());
+
+        let start = tokio::time::Instant::now();
+        let result = run_introspection("silent", &stdin_shared, &pending, &id_alloc, &tx).await;
+        let elapsed = start.elapsed();
+
+        child.kill().await.ok();
+
+        let err = result.expect_err("an unanswered initialize must be an error");
+        assert!(
+            err.to_string().to_lowercase().contains("time"),
+            "error should mention the timeout, got: {err}"
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_secs(10)
+                && elapsed <= std::time::Duration::from_secs(12),
+            "should fail at the 10 s request timeout, took {elapsed:?}"
+        );
+        assert!(
+            rx.borrow().capabilities.introspected_at.is_none(),
+            "no capabilities may be recorded after a failed handshake"
+        );
+    }
+
+    /// `initialize` succeeds but the list requests are never answered
+    /// (MOCK_SILENT_LISTS): each times out after 10 s, and introspection
+    /// degrades to empty capabilities instead of failing or hanging.
     #[tokio::test]
-    async fn introspection_timeout() {
-        // MOCK_SILENT_LISTS=1: initialize still responds, but list requests time out.
-        // We use a very short timeout by passing a custom request script inline,
-        // because the real 10s timeout would make the test too slow.
-        //
-        // Instead, spawn a server that responds to initialize correctly but then
-        // exits (causing RecvError on the list requests) — simulating a crash
-        // mid-introspection, which has the same graceful-degradation behaviour as
-        // a timeout.
+    async fn introspection_list_timeouts_yield_empty_capabilities() {
+        let (mut child, stdin_shared, pending, id_alloc) =
+            spawn_mock_server(&[("MOCK_SILENT_LISTS", "1")]).await;
+        let (tx, _rx) = tokio::sync::watch::channel(ServerSnapshot::default());
+
+        let start = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            run_introspection("silent-lists", &stdin_shared, &pending, &id_alloc, &tx),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        child.kill().await.ok();
+        child.wait().await.ok();
+
+        let caps = result
+            .expect("introspection must not hang past the request timeout")
+            .expect("list timeouts are non-fatal");
+        assert!(caps.tools.is_empty() && caps.resources.is_empty() && caps.prompts.is_empty());
+        assert!(
+            elapsed >= std::time::Duration::from_secs(9),
+            "lists should have waited for their 10 s timeout, took {elapsed:?}"
+        );
+        assert!(caps.introspected_at.is_some());
+    }
+
+    /// The server answers `initialize` and then exits. Depending on whether the
+    /// pipe is already closed when `notifications/initialized` is written this
+    /// is a prompt Err (broken pipe) or an Ok with empty capabilities (the list
+    /// requests fail fast); either way it must neither hang nor report any
+    /// capability.
+    #[tokio::test]
+    async fn introspection_fails_fast_when_server_exits_after_initialize() {
         let script = r#"
 line=$(head -1)
 method=$(echo "$line" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('method',''))" 2>/dev/null)
@@ -373,7 +447,7 @@ exit 0
 
         let id_alloc = Arc::new(IdAllocator::new());
         let initial_snapshot = ServerSnapshot::default();
-        let (tx, _rx) = tokio::sync::watch::channel(initial_snapshot);
+        let (tx, rx) = tokio::sync::watch::channel(initial_snapshot);
 
         let start = std::time::Instant::now();
 
@@ -402,29 +476,16 @@ exit 0
             elapsed.as_secs()
         );
 
-        // The introspection itself may return Ok (gracefully degraded) or Err (initialize
-        // succeeded but server exited before list requests). Both are acceptable — what
-        // matters is that it does not panic and does not block indefinitely.
-        // If Ok, capabilities should have empty lists for the timed-out methods.
-        if let Ok(Ok(caps)) = result {
-            // All list requests failed (stream closed) — all vecs should be empty.
-            assert_eq!(
-                caps.tools.len(),
-                0,
-                "tools should be empty when server exits mid-introspection"
-            );
-            assert_eq!(
-                caps.resources.len(),
-                0,
-                "resources should be empty when server exits mid-introspection"
-            );
-            assert_eq!(
-                caps.prompts.len(),
-                0,
-                "prompts should be empty when server exits mid-introspection"
-            );
+        let outcome = result.expect("introspection must not hang");
+        if let Ok(caps) = outcome {
+            assert!(caps.tools.is_empty(), "tools: {:?}", caps.tools);
+            assert!(caps.resources.is_empty(), "resources: {:?}", caps.resources);
+            assert!(caps.prompts.is_empty(), "prompts: {:?}", caps.prompts);
         }
-        // If Err, that is also acceptable (initialize failed because stream closed).
+        assert!(
+            rx.borrow().capabilities.tools.is_empty(),
+            "no tools may be recorded for a server that exited"
+        );
     }
 }
 
