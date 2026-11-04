@@ -36,6 +36,8 @@ pub struct SpawnedProcess {
 /// Spawn a child process for an MCP server.
 ///
 /// - Pipes stdin, stdout, and stderr (prevents pipe-buffer backpressure — PITFALL #2).
+///   For `transport = "http"` servers stdin is `/dev/null` and stdout is drained
+///   into the logs like stderr (nothing speaks JSON-RPC on those pipes).
 /// - On Unix, puts the child in its own process group so Ctrl+C is not forwarded
 ///   directly to the child (PROC-08, PITFALL #5).
 /// - Spawns a dedicated tokio task to drain stderr line-by-line.
@@ -49,10 +51,11 @@ pub fn spawn_server(
     env: &HashMap<String, String>,
     log_agg: Option<Arc<LogAggregator>>,
 ) -> anyhow::Result<SpawnedProcess> {
+    let http = config.is_http();
     let mut cmd = tokio::process::Command::new(&config.command);
     cmd.args(&config.args)
         .envs(env)
-        .stdin(Stdio::piped())
+        .stdin(if http { Stdio::null() } else { Stdio::piped() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(false); // explicit cleanup only
@@ -74,44 +77,22 @@ pub fn spawn_server(
         .id()
         .ok_or_else(|| anyhow::anyhow!("Failed to get PID for '{name}'"))?;
 
-    // Take stdout and stdin for the MCP health check task handoff.
-    let stdout = child.stdout.take();
+    // Stdio servers: stdout and stdin are handed to the MCP health check task.
+    // Http servers: stdout is drained into the logs below instead.
     let stdin = child.stdin.take();
+    let (stdout, http_stdout) = if http {
+        (None, child.stdout.take())
+    } else {
+        (child.stdout.take(), None)
+    };
 
-    // Drain stderr continuously to prevent pipe-buffer backpressure (PITFALL #2).
+    // Drain stderr (and stdout for http servers) continuously to prevent
+    // pipe-buffer backpressure (PITFALL #2).
+    if let Some(stdout) = http_stdout {
+        spawn_log_drain(name, stdout, log_agg.clone());
+    }
     if let Some(stderr) = child.stderr.take() {
-        let server_name = name.to_string();
-        if let Some(agg) = log_agg {
-            tokio::spawn(async move {
-                let mut reader = BufReader::new(stderr);
-                while let Some(line) = next_stderr_line(&mut reader, &server_name).await {
-                    // Push to the ring buffer and broadcast.
-                    agg.push(&server_name, line.clone()).await;
-                    // Also format and print to stderr (the log file in daemon mode).
-                    let log_line = crate::logs::LogLine {
-                        server: server_name.clone(),
-                        timestamp: std::time::SystemTime::now(),
-                        message: line,
-                    };
-                    // `eprintln!` panics if stderr is closed, which would kill this
-                    // drain and block the child on a full pipe; ignore write errors.
-                    use std::io::Write as _;
-                    let _ = writeln!(
-                        std::io::stderr(),
-                        "{}",
-                        crate::logs::format_log_line(&log_line, false)
-                    );
-                }
-            });
-        } else {
-            // Backward-compatible drain for tests and cases without a LogAggregator.
-            tokio::spawn(async move {
-                let mut reader = BufReader::new(stderr);
-                while let Some(line) = next_stderr_line(&mut reader, &server_name).await {
-                    tracing::debug!(server = %server_name, "{}", line);
-                }
-            });
-        }
+        spawn_log_drain(name, stderr, log_agg);
     }
 
     Ok(SpawnedProcess {
@@ -122,15 +103,59 @@ pub fn spawn_server(
     })
 }
 
-/// Read the next stderr line, skipping over-long lines and decoding lossily.
+/// Drain `pipe` line by line until EOF.
+///
+/// With a [`LogAggregator`] the lines are pushed to the ring buffer and written
+/// to the hub's stderr (the log file in daemon mode); without one they go to
+/// `tracing::debug!` (backward compat for tests).
+fn spawn_log_drain<R>(name: &str, pipe: R, log_agg: Option<Arc<LogAggregator>>)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let server_name = name.to_string();
+    if let Some(agg) = log_agg {
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(pipe);
+            while let Some(line) = next_stderr_line(&mut reader, &server_name).await {
+                // Push to the ring buffer and broadcast.
+                agg.push(&server_name, line.clone()).await;
+                // Also format and print to stderr (the log file in daemon mode).
+                let log_line = crate::logs::LogLine {
+                    server: server_name.clone(),
+                    timestamp: std::time::SystemTime::now(),
+                    message: line,
+                };
+                // `eprintln!` panics if stderr is closed, which would kill this
+                // drain and block the child on a full pipe; ignore write errors.
+                use std::io::Write as _;
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "{}",
+                    crate::logs::format_log_line(&log_line, false)
+                );
+            }
+        });
+    } else {
+        // Backward-compatible drain for tests and cases without a LogAggregator.
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(pipe);
+            while let Some(line) = next_stderr_line(&mut reader, &server_name).await {
+                tracing::debug!(server = %server_name, "{}", line);
+            }
+        });
+    }
+}
+
+/// Read the next line of a drained pipe (stderr, or stdout of http servers),
+/// skipping over-long lines and decoding lossily.
 ///
 /// Returns `None` only at EOF or on a genuine read error, so a huge or
 /// non-UTF-8 line cannot stop stderr draining (which would let the pipe fill
 /// and block the server) or grow memory without bound.
-async fn next_stderr_line(
-    reader: &mut BufReader<tokio::process::ChildStderr>,
-    server_name: &str,
-) -> Option<String> {
+async fn next_stderr_line<R>(reader: &mut BufReader<R>, server_name: &str) -> Option<String>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
     loop {
         match read_bounded_line(reader, MAX_LINE_BYTES).await {
             Ok(Some(BoundedLine::Line(line))) => return Some(line),
@@ -346,7 +371,11 @@ pub async fn run_server_supervisor(
             s.process_state = ProcessState::Running;
             s.pid = Some(pid);
             s.uptime_since = Some(std::time::Instant::now());
-            s.health = HealthStatus::Unknown;
+            s.health = if config.is_http() {
+                HealthStatus::NotChecked
+            } else {
+                HealthStatus::Unknown
+            };
             s.restart_count = total_restarts;
         });
 
@@ -453,6 +482,10 @@ pub async fn run_server_supervisor(
                     }
                 }
             });
+        } else if config.is_http() {
+            // Http transport: process supervision only. No stdio pipes were handed
+            // out (stdout is drained into the logs), so no pings or introspection.
+            tracing::debug!(server = %name, "http transport: stdio health checks skipped");
         } else {
             // Fallback: drain stdout to prevent pipe-buffer backpressure (PITFALL #2).
             tracing::warn!(

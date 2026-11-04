@@ -20,6 +20,9 @@ fn default_transport() -> String {
     "stdio".to_string()
 }
 
+/// `transport` value for servers reached over HTTP instead of stdio.
+pub const TRANSPORT_HTTP: &str = "http";
+
 fn default_web_port() -> u16 {
     3456
 }
@@ -30,6 +33,14 @@ pub struct HubGlobalConfig {
     /// Port for the web UI (default 3456). Per D-05, WEB-01.
     #[serde(default = "default_web_port")]
     pub web_port: u16,
+}
+
+impl ServerConfig {
+    /// True for `transport = "http"`: the process is supervised, but it does not
+    /// speak JSON-RPC on stdio, so stdio health checks and introspection are skipped.
+    pub fn is_http(&self) -> bool {
+        self.transport == TRANSPORT_HTTP
+    }
 }
 
 impl Default for HubGlobalConfig {
