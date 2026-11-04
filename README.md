@@ -31,7 +31,7 @@ mcp-hub gen-config --format claude   # paste into .mcp.json
 
 ## What it does not do
 
-- **It is not an MCP proxy or gateway.** It does not sit between your client and your servers and does not forward MCP traffic. `gen-config` writes each server's own `command`, `args` and `env` into the client config, so the client starts its own copy of the server. mcp-hub's copy is separate: it is the one that is supervised, health-checked, logged and shown in the web UI. If you want a single endpoint that aggregates many servers, use a proxy such as mcp-proxy or MetaMCP.
+- **It is not an MCP proxy or gateway.** It does not sit between your client and your servers and does not forward MCP traffic. `gen-config` writes each server's own `command`, `args` and `env` into the client config, so the client starts its own copy of the server. mcp-hub's copy is separate: it is the one that is supervised, health-checked, logged and shown in the web UI. If you want a single endpoint that aggregates many servers, use an MCP proxy or gateway instead.
 - **It does not install MCP servers.** `command` is whatever you would type in a terminal (`npx ...`, `uvx ...`, a local binary).
 - **It does not manage remote machines.** Everything runs on the local host, and the control socket is local.
 - **The web UI has no authentication.** It only binds to `127.0.0.1`; do not expose that port to other machines.
