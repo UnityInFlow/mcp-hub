@@ -3,9 +3,9 @@ name: Release
 # Trigger: push a v* tag (e.g., git tag v0.1.1 && git push origin v0.1.1)
 # NOTE: 0.1.0 is already published on crates.io (immutable); this pipeline ships
 # the binstall-metadata + prebuilt-binaries release as 0.1.1 (03-TOOLING-PINS.md).
-# This produces downloadable, cargo-binstall-resolvable binaries for 5 targets
-# (Linux x86_64/aarch64 gnu + musl, Windows x86_64) and publishes the crate to
-# crates.io -- all without manual intervention. The deliberate v* tag + the
+# This produces downloadable, cargo-binstall-resolvable binaries for 6 targets
+# (Linux x86_64/aarch64 gnu + musl, macOS x86_64/aarch64) and publishes the
+# crate to crates.io -- all without manual intervention. The deliberate v* tag + the
 # preflight dry-run ARE the gate (crates.io publish is immediate and yank-only;
 # there is no reviewable staging bundle, so there is intentionally NO human gate).
 on:
@@ -29,7 +29,7 @@ jobs:
   # ──────────────────────────────────────────────────────────────────────────
   preflight:
     name: Preflight (tag/version check + publish dry-run)
-    runs-on: [orangepi]
+    runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.extract-version.outputs.version }}
     steps:
@@ -71,7 +71,7 @@ jobs:
   test:
     name: Test gate (test + clippy + fmt)
     needs: preflight
-    runs-on: [orangepi]
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -92,21 +92,16 @@ jobs:
 
   # ──────────────────────────────────────────────────────────────────────────
   # JOB 3: build-binaries
-  # ONE self-hosted Linux runner cross-compiles ALL 5 targets via cargo-zigbuild
-  # (zig is host-arch-independent, so this whole matrix runs on a single Linux
-  # host -- no per-arch runner, no Docker/cross, no macОS runner). Replaces the
-  # old native build-linux-x64 (cross disabled) + build-linux-arm64 jobs.
-  #
-  # Runner: default [arc-runner-unityinflow]. The Hetzner X64 fleet has been
-  # intermittently offline across Phases 1-2; because zigbuild is host-arch-
-  # independent the entire matrix (incl. x86_64 + Windows) can also run on the
-  # ARM64 orangepi runner -- to flip, change `runs-on` below to [orangepi].
+  # ONE GitHub-hosted Linux runner (ubuntu-latest, x86_64) cross-compiles all
+  # four Linux targets via cargo-zigbuild (zig is host-arch-independent, so this
+  # whole matrix runs on a single Linux host -- no per-arch runner, no
+  # Docker/cross). macOS targets are built natively in the build-macos job.
   #
   # Assets are named after the CRATE (`mcp-server-hub-<target>-v<version>.<ext>`),
   # NOT the binary (`mcp-hub`), so cargo binstall's default {name} template
   # (name = crate = mcp-server-hub) resolves them (D-02 / HUB-04).
   #
-  # macOS is deferred to v2 (D-06 / HUB-V2-01) -- no macOS target here.
+  # macOS targets are built in the separate build-macos job (macos-14).
   # Windows is a REDUCED non-unix CLI: nix/axum/dirs/comfy-table/owo-colors/
   # dialoguer/tower-http/askama are [target.'cfg(unix)'.dependencies], so the
   # Windows binary has no daemon/web-UI/signal handling -- documented in the
@@ -116,7 +111,7 @@ jobs:
   build-binaries:
     name: Build ${{ matrix.target }}
     needs: test
-    runs-on: [orangepi]   # flip to [orangepi] if Hetzner X64 fleet is offline (zigbuild is host-arch-independent)
+    runs-on: ubuntu-latest
     strategy:
       # fail-fast disabled (#03-04): surface ALL target failures in one run instead
       # of one-at-a-time cancel-and-retry. The release job still requires every
@@ -148,9 +143,8 @@ jobs:
       - name: Install pinned zig + cargo-zigbuild
         run: |
           # Pinned versions (03-TOOLING-PINS.md): zig 0.14.1, cargo-zigbuild 0.23.0.
-          # Install zig from the official tarball matched to the HOST arch (the
-          # self-hosted runners have no pip3 — orangepi is ARM64; a Hetzner X64
-          # runner would be x86_64). zig itself cross-compiles to all targets,
+          # Install zig from the official tarball matched to the HOST arch
+          # (x86_64 on ubuntu-latest). zig itself cross-compiles to all targets,
           # so only the host arch matters here. Pin BOTH versions -- never `latest`.
           set -euo pipefail
           case "$(uname -m)" in
@@ -198,9 +192,9 @@ jobs:
             echo "Windows reduced-CLI build present (not executed on Linux host)."
           else
             # A cross-compiled binary can only be EXECUTED when its arch matches the
-            # runner's arch. The runner varies (orangepi=aarch64; Hetzner X64=x86_64),
-            # so decide host-vs-target arch at runtime rather than hardcoding a triple
-            # (a hardcoded x86_64 --version fails with "Exec format error" on aarch64).
+            # runner's arch. Decide host-vs-target arch at runtime rather than
+            # hardcoding a triple (running a foreign-arch binary fails with
+            # "Exec format error").
             BIN_PATH="target/${{ matrix.target }}/release/mcp-hub"
             test -f "$BIN_PATH" || { echo "ERROR: $BIN_PATH missing"; exit 1; }
             TARGET_ARCH="${{ matrix.target }}"; TARGET_ARCH="${TARGET_ARCH%%-*}"   # x86_64 | aarch64
@@ -220,17 +214,70 @@ jobs:
             mcp-server-hub-*
 
   # ──────────────────────────────────────────────────────────────────────────
+  # JOB 3b: build-macos
+  # Native macOS builds on macos-14 (Apple Silicon). The Apple toolchain
+  # cross-compiles x86_64 natively after `rustup target add`, so no zig is
+  # needed. Same flat, crate-named .tgz layout as the Linux job. Only the
+  # aarch64 build (host arch) is executed for the smoke test.
+  # ──────────────────────────────────────────────────────────────────────────
+  build-macos:
+    name: Build ${{ matrix.target }}
+    needs: test
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+          - target: x86_64-apple-darwin
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust stable + target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package (crate-named, binstall-compatible; flat archive)
+        run: |
+          VERSION="${GITHUB_REF##refs/tags/v}"
+          BIN="mcp-hub"
+          OUT="mcp-server-hub-${{ matrix.target }}-v${VERSION}.tgz"
+          SRC="target/${{ matrix.target }}/release"
+          # flat .tgz containing just the mcp-hub binary (no wrapping dir)
+          tar czf "$OUT" -C "$SRC" "$BIN"
+          shasum -a 256 "$OUT" > "$OUT.sha256"
+          echo "Packaged: $OUT"
+
+      - name: Smoke test (--version, host arch only)
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: |
+          BIN_PATH="target/${{ matrix.target }}/release/mcp-hub"
+          test -f "$BIN_PATH" || { echo "ERROR: $BIN_PATH missing"; exit 1; }
+          "$BIN_PATH" --version
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            mcp-server-hub-*
+
+  # ──────────────────────────────────────────────────────────────────────────
   # JOB 4: release
   # Requires ALL build-binaries matrix targets to succeed -- no partial release.
-  # Validates all 5 expected archives exist before creating the release,
-  # generates SHA256SUMS.txt, and creates the GitHub Release with the new
-  # crate-named assets. The macOS target and the tap-formula step are removed
-  # (both deferred to v2 per CONTEXT / D-06).
+  # Validates all 6 expected archives exist before creating the release,
+  # generates SHA256SUMS.txt, and creates the GitHub Release with the
+  # crate-named assets. The tap-formula step is deferred.
   # ──────────────────────────────────────────────────────────────────────────
   release:
     name: Create GitHub Release
-    needs: [build-binaries]
-    runs-on: [orangepi]
+    needs: [build-binaries, build-macos]
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
@@ -243,7 +290,7 @@ jobs:
           merge-multiple: true
           path: artifacts/
 
-      - name: Validate all 5 expected archives exist
+      - name: Validate all 6 expected archives exist
         run: |
           VERSION="${GITHUB_REF##refs/tags/v}"
           echo "Validating release artifacts for v${VERSION}..."
@@ -251,7 +298,9 @@ jobs:
             "mcp-server-hub-x86_64-unknown-linux-gnu-v${VERSION}.tgz" \
             "mcp-server-hub-aarch64-unknown-linux-gnu-v${VERSION}.tgz" \
             "mcp-server-hub-x86_64-unknown-linux-musl-v${VERSION}.tgz" \
-            "mcp-server-hub-aarch64-unknown-linux-musl-v${VERSION}.tgz"; do
+            "mcp-server-hub-aarch64-unknown-linux-musl-v${VERSION}.tgz" \
+            "mcp-server-hub-aarch64-apple-darwin-v${VERSION}.tgz" \
+            "mcp-server-hub-x86_64-apple-darwin-v${VERSION}.tgz"; do
             if test -f "artifacts/$f"; then
               echo "OK: $f"
             else
@@ -259,7 +308,7 @@ jobs:
               exit 1
             fi
           done
-          echo "All 4 Linux release artifacts validated (Windows deferred to v2)."
+          echo "All 6 release artifacts validated (Windows deferred to v2)."
 
       - name: Generate SHA256SUMS.txt
         run: |
@@ -270,6 +319,8 @@ jobs:
             "mcp-server-hub-aarch64-unknown-linux-gnu-v${VERSION}.tgz" \
             "mcp-server-hub-x86_64-unknown-linux-musl-v${VERSION}.tgz" \
             "mcp-server-hub-aarch64-unknown-linux-musl-v${VERSION}.tgz" \
+            "mcp-server-hub-aarch64-apple-darwin-v${VERSION}.tgz" \
+            "mcp-server-hub-x86_64-apple-darwin-v${VERSION}.tgz" \
             > SHA256SUMS.txt
           echo "Generated SHA256SUMS.txt:"
           cat SHA256SUMS.txt
@@ -304,10 +355,11 @@ jobs:
             | Linux aarch64 (gnu) | `mcp-server-hub-aarch64-unknown-linux-gnu-v<version>.tgz` |
             | Linux x86_64 (musl) | `mcp-server-hub-x86_64-unknown-linux-musl-v<version>.tgz` |
             | Linux aarch64 (musl) | `mcp-server-hub-aarch64-unknown-linux-musl-v<version>.tgz` |
+            | macOS Apple Silicon (aarch64) | `mcp-server-hub-aarch64-apple-darwin-v<version>.tgz` |
+            | macOS Intel (x86_64) | `mcp-server-hub-x86_64-apple-darwin-v<version>.tgz` |
 
-            > **Windows** and **macOS** prebuilt binaries are **deferred to v2**
-            > (HUB-V2-02 / HUB-V2-01). On those platforms install from source with
-            > `cargo install mcp-server-hub`.
+            > **Windows** prebuilt binaries are **deferred to v2** (HUB-V2-02).
+            > On Windows install from source with `cargo install mcp-server-hub`.
 
             ## Checksums
             See `SHA256SUMS.txt` for verification.
@@ -326,7 +378,7 @@ jobs:
   publish-crates:
     name: Publish to crates.io
     needs: release
-    runs-on: [orangepi]
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v5
