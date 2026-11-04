@@ -279,3 +279,63 @@ fn live_flag_cursor_without_daemon_errors() {
         .failure()
         .stderr(predicate::str::contains("daemon").or(predicate::str::contains("running")));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ${VAR} expansion (issue #36)
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn expansion_toml() -> &'static str {
+    r#"
+[servers.github]
+command = "npx"
+env = { GITHUB_PERSONAL_ACCESS_TOKEN = "${MY_TOKEN}" }
+"#
+}
+
+#[test]
+fn expanded_secret_appears_in_output_with_stderr_warning() {
+    let f = write_fixture(expansion_toml());
+    mcp_hub()
+        .args(["gen-config", "--format", "claude", "-c"])
+        .arg(f.path())
+        .env("MY_TOKEN", "abc")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "\"GITHUB_PERSONAL_ACCESS_TOKEN\": \"abc\"",
+        ))
+        .stdout(predicate::str::contains("${MY_TOKEN}").not())
+        .stderr(predicate::str::contains("MY_TOKEN"))
+        .stderr(predicate::str::contains("secret"));
+}
+
+#[test]
+fn expanded_non_secret_has_no_warning() {
+    let f = write_fixture(
+        r#"
+[servers.s]
+command = "node"
+env = { LEVEL = "${MY_LEVEL}" }
+"#,
+    );
+    mcp_hub()
+        .args(["gen-config", "--format", "claude", "-c"])
+        .arg(f.path())
+        .env("MY_LEVEL", "debug")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"LEVEL\": \"debug\""))
+        .stderr(predicate::str::contains("secret").not());
+}
+
+#[test]
+fn unset_variable_fails_gen_config() {
+    let f = write_fixture(expansion_toml());
+    mcp_hub()
+        .args(["gen-config", "--format", "claude", "-c"])
+        .arg(f.path())
+        .env_remove("MY_TOKEN")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("MY_TOKEN"));
+}
