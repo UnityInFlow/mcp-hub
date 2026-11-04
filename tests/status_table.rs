@@ -59,6 +59,37 @@ fn fatal_failed_snapshot() -> ServerSnapshot {
     }
 }
 
+/// Split a rendered table line into trimmed cell texts (borders dropped).
+fn cells_of(line: &str) -> Vec<String> {
+    line.split(['│', '|'])
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Look up the cell under `column` in the row whose first cell is `name`,
+/// so assertions cannot be satisfied by table borders or other columns.
+fn cell(output: &str, name: &str, column: &str) -> String {
+    let header = output
+        .lines()
+        .map(cells_of)
+        .find(|c| c.first().map(String::as_str) == Some("Name"))
+        .expect("header row");
+    let idx = header
+        .iter()
+        .position(|h| h == column)
+        .unwrap_or_else(|| panic!("no column {column}: {output}"));
+    let row = output
+        .lines()
+        .map(cells_of)
+        .find(|c| c.first().map(String::as_str) == Some(name))
+        .unwrap_or_else(|| panic!("no row for {name}: {output}"));
+    row.get(idx)
+        .cloned()
+        .unwrap_or_else(|| panic!("row too short: {row:?}"))
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Table column presence tests
 // ─────────────────────────────────────────────────────────────────────────────
@@ -129,16 +160,14 @@ fn status_table_running_healthy_server() {
         output.contains("1234"),
         "Table must contain PID 1234: {output}"
     );
+    assert_eq!(cell(&output, "my-server", "PID"), "1234");
     // Uptime in HH:MM:SS format (server ran for 3661 seconds = ~01:01:01)
+    let uptime = cell(&output, "my-server", "Uptime");
     assert!(
-        output.contains(':'),
-        "Table must contain uptime in HH:MM:SS format: {output}"
+        uptime.starts_with("01:01:0") && uptime.len() == 8,
+        "Uptime cell must be ~01:01:01, got {uptime:?}"
     );
-    // Restart count
-    assert!(
-        output.contains('0'),
-        "Table must contain restart count 0: {output}"
-    );
+    assert_eq!(cell(&output, "my-server", "Restarts"), "0");
     // Transport
     assert!(
         output.contains("stdio"),
@@ -164,16 +193,10 @@ fn status_table_fatal_failed_server() {
         output.contains("failed"),
         "Table must contain 'failed' health: {output}"
     );
-    // No PID — should show dash placeholder
-    assert!(
-        output.contains('-'),
-        "Table must show '-' for missing PID: {output}"
-    );
-    // Restart count of 5
-    assert!(
-        output.contains('5'),
-        "Table must contain restart count 5: {output}"
-    );
+    // No PID and no uptime — each shows the dash placeholder in its own cell.
+    assert_eq!(cell(&output, "crashed", "PID"), "-");
+    assert_eq!(cell(&output, "crashed", "Uptime"), "-");
+    assert_eq!(cell(&output, "crashed", "Restarts"), "5");
 }
 
 #[test]

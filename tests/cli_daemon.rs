@@ -18,12 +18,29 @@ mod daemon_tests {
     // Helpers
     // ─────────────────────────────────────────────────────────────────────────
 
+    /// Defaults the socket/PID to throwaway paths so a call that forgets
+    /// `env_overrides()` can never reach a developer's real daemon. Later
+    /// `.envs(...)` calls override these.
     fn mcp_hub() -> Command {
-        Command::cargo_bin("mcp-hub").expect("mcp-hub binary not found")
+        let mut cmd = Command::cargo_bin("mcp-hub").expect("mcp-hub binary not found");
+        let tmp = std::env::temp_dir();
+        let id = std::process::id();
+        cmd.env(
+            "MCP_HUB_SOCKET",
+            tmp.join(format!("mcp-hub-test-{id}.sock")),
+        );
+        cmd.env("MCP_HUB_PID", tmp.join(format!("mcp-hub-test-{id}.pid")));
+        cmd
     }
 
     /// Write a minimal mcp-hub TOML config with a single `sleep`-based server.
     fn write_minimal_config(dir: &TempDir) -> NamedTempFile {
+        write_config_with_sleep(dir, "9999")
+    }
+
+    /// Like [`write_minimal_config`] but with a caller-chosen `sleep` duration,
+    /// so a test can recognise (and reap) its own server process by command line.
+    fn write_config_with_sleep(dir: &TempDir, secs: &str) -> NamedTempFile {
         let mut f = NamedTempFile::new_in(dir.path()).expect("tempfile");
         writeln!(
             f,
@@ -33,10 +50,11 @@ web_port = {}
 
 [servers.test-server]
 command = "sleep"
-args = ["9999"]
+args = ["{}"]
 transport = "stdio"
 "#,
-            free_port()
+            free_port(),
+            secs
         )
         .expect("write config");
         f
@@ -44,12 +62,29 @@ transport = "stdio"
 
     /// Pick a free TCP port so parallel test daemons never fight over the
     /// default web UI port (a bind failure is fatal for `start --daemon`).
+    ///
+    /// The port is only reserved by *this* function: the listener is dropped
+    /// before the daemon binds, so two parallel tests could be handed the same
+    /// ephemeral port by the kernel. A process-wide set of already handed-out
+    /// ports makes that impossible within this test binary (the only place the
+    /// race can happen, as test binaries run one after another).
     fn free_port() -> u16 {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .expect("bind ephemeral port")
-            .local_addr()
-            .expect("local addr")
-            .port()
+        use std::collections::HashSet;
+        use std::sync::{Mutex, OnceLock};
+
+        static HANDED_OUT: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+        let handed_out = HANDED_OUT.get_or_init(|| Mutex::new(HashSet::new()));
+        loop {
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .expect("bind ephemeral port")
+                .local_addr()
+                .expect("local addr")
+                .port();
+            let mut guard = handed_out.lock().expect("port set lock");
+            if guard.insert(port) {
+                return port;
+            }
+        }
     }
 
     /// Read the PID from a PID file. Returns None if the file does not exist or
@@ -315,7 +350,10 @@ transport = "stdio"
     fn stale_socket_cleanup() {
         let paths = TestDaemonPaths::new();
         let cfg_dir = TempDir::new().expect("cfg tempdir");
-        let config = write_minimal_config(&cfg_dir);
+        // A unique sleep duration marks this test's servers: `kill -9` on the
+        // daemon orphans its (own process group) server, which we reap below.
+        let marker = format!("7{}", std::process::id());
+        let config = write_config_with_sleep(&cfg_dir, &marker);
 
         // Start the first daemon instance.
         mcp_hub()
@@ -355,8 +393,11 @@ transport = "stdio"
             Duration::from_secs(8),
         );
 
-        // Stop the second daemon.
+        // Stop the second daemon, then reap the server orphaned by `kill -9`.
         let _ = mcp_hub().arg("stop").envs(paths.env_overrides()).output();
+        let _ = std::process::Command::new("pkill")
+            .args(["-f", &format!("sleep {marker}")])
+            .output();
 
         assert!(
             second_start.status.success(),
