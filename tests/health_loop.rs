@@ -74,9 +74,7 @@ async fn missed_pings_drive_unknown_to_degraded_to_failed() {
                 HealthStatus::Degraded {
                     consecutive_misses, ..
                 } => Some(("degraded", consecutive_misses)),
-                HealthStatus::Failed { consecutive_misses } => {
-                    Some(("failed", consecutive_misses))
-                }
+                HealthStatus::Failed { consecutive_misses } => Some(("failed", consecutive_misses)),
                 HealthStatus::Healthy { .. } | HealthStatus::Unknown => None,
             };
             if let Some(step) = step {

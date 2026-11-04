@@ -197,12 +197,12 @@ async fn test_shutdown_process_terminates_child() {
     // Verify the process is no longer running (on Unix).
     #[cfg(unix)]
     {
-        use nix::sys::signal::{kill, Signal};
+        use nix::sys::signal::kill;
         use nix::unistd::Pid;
 
         // Sending signal 0 probes liveness without delivering a real signal.
         // An ESRCH error means the process does not exist — i.e., it was terminated.
-        let result = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+        let result = kill(Pid::from_raw(pid as i32), None);
         assert!(
             result.is_err(),
             "process with PID {pid} should no longer be alive after shutdown_process"
@@ -276,7 +276,7 @@ mod process_group {
     ///
     /// Zombies still answer `kill(pid, 0)`; in containers PID 1 may not reap
     /// orphans, so a killed process can linger as a zombie. Treat state `Z` as dead.
-    fn is_alive(pid: i32) -> bool {
+    pub(super) fn is_alive(pid: i32) -> bool {
         if kill(Pid::from_raw(pid), None).is_err() {
             return false;
         }
@@ -419,5 +419,202 @@ mod process_group {
             sleep_dead,
             "group member `sleep` (pid {sleep_pid}) survived SIGKILL escalation"
         );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Supervisor end-to-end: restart, backoff, Restart command, stop_all_servers
+//
+// Note: the "stable window resets the failure counter" path is not covered
+// here — `BackoffConfig::stable_window_secs` is a fixed 60 s with no config
+// override, so a faithful test would need a 60 s wall-clock wait.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(unix)]
+mod supervisor_e2e {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use mcp_hub::logs::LogAggregator;
+    use mcp_hub::supervisor::{
+        start_single_server, stop_all_servers, ServerHandle, SupervisorCommand,
+    };
+    use mcp_hub::types::{ProcessState, ServerSnapshot};
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
+    use tokio_util::sync::CancellationToken;
+
+    use super::make_server_config;
+    use super::process_group::is_alive;
+
+    async fn start(name: &str, command: &str, args: &[&str], restart_delay: u64) -> ServerHandle {
+        let mut config = make_server_config(command, args);
+        config.restart_delay = Some(restart_delay);
+        let token = CancellationToken::new();
+        let log_agg = Arc::new(LogAggregator::new(&[name.to_string()], 16));
+        start_single_server(name, &config, &token, &log_agg).await
+    }
+
+    /// Wait up to `secs` for a snapshot matching `pred`.
+    async fn wait_state(
+        handle: &mut ServerHandle,
+        secs: u64,
+        pred: impl Fn(&ServerSnapshot) -> bool,
+    ) -> Option<ServerSnapshot> {
+        tokio::time::timeout(Duration::from_secs(secs), handle.state_rx.wait_for(pred))
+            .await
+            .ok()?
+            .ok()
+            .map(|s| s.clone())
+    }
+
+    fn force_kill(pid: u32) {
+        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+    }
+
+    /// Always stop the supervisor (and its child) before any assertion runs.
+    async fn finish(handle: ServerHandle) {
+        stop_all_servers(vec![handle]).await;
+    }
+
+    #[tokio::test]
+    async fn crashed_server_is_restarted_with_new_pid() {
+        let mut h = start("flap", "bash", &["-c", "sleep 0.3; exit 1"], 0).await;
+
+        let first = wait_state(&mut h, 10, |s| {
+            matches!(s.process_state, ProcessState::Running)
+        })
+        .await;
+        let second = match &first {
+            Some(f) => {
+                let old = f.pid;
+                wait_state(&mut h, 10, |s| {
+                    matches!(s.process_state, ProcessState::Running)
+                        && s.pid != old
+                        && s.restart_count >= 1
+                })
+                .await
+            }
+            None => None,
+        };
+        if let Some(pid) = second.as_ref().and_then(|s| s.pid) {
+            force_kill(pid);
+        }
+        finish(h).await;
+
+        let first = first.expect("server should reach Running");
+        let second = second.expect("server should be restarted into Running with a new pid");
+        assert_ne!(first.pid, second.pid, "restart must spawn a new process");
+        assert_eq!(first.restart_count, 0);
+        assert!(second.restart_count >= 1, "restart_count must increment");
+    }
+
+    #[tokio::test]
+    async fn backoff_delay_grows_between_attempts() {
+        // restart_delay = 1 -> delays of roughly 1 s, 2 s, 4 s (±30 % jitter).
+        let mut h = start("crasher", "sh", &["-c", "exit 1"], 1).await;
+
+        let mut remaining = Vec::new();
+        for attempt in 1..=3u32 {
+            let snap = wait_state(&mut h, 15, |s| {
+                matches!(s.process_state, ProcessState::Backoff { attempt: a, .. } if a == attempt)
+            })
+            .await;
+            match snap.map(|s| s.process_state) {
+                Some(ProcessState::Backoff { until, .. }) => {
+                    remaining.push(until.saturating_duration_since(Instant::now()));
+                }
+                Some(_) | None => break,
+            }
+        }
+        finish(h).await;
+
+        assert_eq!(remaining.len(), 3, "expected Backoff attempts 1..=3");
+        // Jitter ranges are [0.7, 1.3] s for attempt 1 and [2.8, 5.2] s for 3.
+        assert!(
+            remaining[2] > remaining[0],
+            "backoff must grow: attempt 1 {:?} vs attempt 3 {:?}",
+            remaining[0],
+            remaining[2]
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_command_replaces_running_process() {
+        let mut h = start("sleeper", "sleep", &["300"], 0).await;
+
+        let first = wait_state(&mut h, 10, |s| {
+            matches!(s.process_state, ProcessState::Running)
+        })
+        .await;
+        let old_pid = first.as_ref().and_then(|s| s.pid);
+        if old_pid.is_some() {
+            let _ = h.cmd_tx.send(SupervisorCommand::Restart).await;
+        }
+        let second = wait_state(&mut h, 15, |s| {
+            matches!(s.process_state, ProcessState::Running) && s.pid != old_pid
+        })
+        .await;
+        let new_pid = second.as_ref().and_then(|s| s.pid);
+        let old_alive = old_pid.is_some_and(|p| is_alive(p as i32));
+        if let Some(p) = old_pid {
+            force_kill(p);
+        }
+        finish(h).await;
+        let new_alive = new_pid.is_some_and(|p| is_alive(p as i32));
+        if let Some(p) = new_pid {
+            force_kill(p);
+        }
+
+        let old_pid = old_pid.expect("server should reach Running");
+        let second = second.expect("Restart should bring up a new Running process");
+        assert_ne!(second.pid, Some(old_pid), "Restart must give a new pid");
+        assert!(
+            !old_alive,
+            "old process {old_pid} must be gone after Restart"
+        );
+        assert!(!new_alive, "new process must be stopped by shutdown");
+        assert_eq!(second.restart_count, 1, "Restart counts as one restart");
+    }
+
+    #[tokio::test]
+    async fn stop_all_servers_leaves_no_live_child() {
+        let mut a = start("a", "sleep", &["300"], 0).await;
+        let mut b = start("b", "sleep", &["301"], 0).await;
+        let sa = wait_state(&mut a, 10, |s| {
+            matches!(s.process_state, ProcessState::Running)
+        })
+        .await;
+        let sb = wait_state(&mut b, 10, |s| {
+            matches!(s.process_state, ProcessState::Running)
+        })
+        .await;
+        let (rx_a, rx_b) = (a.state_rx.clone(), b.state_rx.clone());
+
+        stop_all_servers(vec![a, b]).await;
+
+        let pids: Vec<u32> = [&sa, &sb]
+            .iter()
+            .filter_map(|s| s.as_ref().and_then(|s| s.pid))
+            .collect();
+        let alive: Vec<u32> = pids
+            .iter()
+            .copied()
+            .filter(|p| is_alive(*p as i32))
+            .collect();
+        alive.iter().for_each(|p| force_kill(*p));
+
+        assert_eq!(pids.len(), 2, "both servers should have reached Running");
+        assert!(
+            alive.is_empty(),
+            "children still alive after stop: {alive:?}"
+        );
+        for rx in [rx_a, rx_b] {
+            let state = rx.borrow().process_state.clone();
+            assert!(
+                matches!(state, ProcessState::Stopped),
+                "expected Stopped, got {state}"
+            );
+        }
     }
 }
