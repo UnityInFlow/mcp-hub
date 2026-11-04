@@ -10,8 +10,31 @@ use tempfile::NamedTempFile;
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Socket/PID overrides that point at throwaway paths, so a test can never
+/// reach (or stop) a developer's real daemon in `~/.config/mcp-hub`.
+fn isolated_env() -> [(&'static str, String); 2] {
+    let tmp = std::env::temp_dir();
+    let id = std::process::id();
+    [
+        (
+            "MCP_HUB_SOCKET",
+            tmp.join(format!("mcp-hub-test-{id}.sock"))
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        (
+            "MCP_HUB_PID",
+            tmp.join(format!("mcp-hub-test-{id}.pid"))
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    ]
+}
+
 fn mcp_hub() -> Command {
-    Command::cargo_bin("mcp-hub").expect("mcp-hub binary not found")
+    let mut cmd = Command::cargo_bin("mcp-hub").expect("mcp-hub binary not found");
+    cmd.envs(isolated_env());
+    cmd
 }
 
 fn write_toml(content: &str) -> NamedTempFile {
@@ -240,6 +263,7 @@ fn spawn_hub_collecting(
             "--config",
             config_path.to_str().unwrap(),
         ])
+        .envs(isolated_env())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

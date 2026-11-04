@@ -9,6 +9,20 @@ use assert_cmd::Command;
 use clap::Parser;
 use mcp_hub::cli::{Cli, Commands};
 
+/// A `mcp-hub` command whose socket/PID point at throwaway paths, so these
+/// tests can never reach a developer's real daemon.
+fn mcp_hub() -> Command {
+    let mut cmd = Command::cargo_bin("mcp-hub").expect("Failed to find mcp-hub binary");
+    let tmp = std::env::temp_dir();
+    let id = std::process::id();
+    cmd.env(
+        "MCP_HUB_SOCKET",
+        tmp.join(format!("mcp-hub-test-{id}.sock")),
+    );
+    cmd.env("MCP_HUB_PID", tmp.join(format!("mcp-hub-test-{id}.pid")));
+    cmd
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI subprocess tests
 // ─────────────────────────────────────────────────────────────────────────────
@@ -17,7 +31,7 @@ use mcp_hub::cli::{Cli, Commands};
 fn logs_subcommand_prints_daemon_required() {
     // When no daemon is running, `mcp-hub logs` should fail with an error
     // mentioning the socket or daemon.
-    let mut cmd = Command::cargo_bin("mcp-hub").expect("Failed to find mcp-hub binary");
+    let mut cmd = mcp_hub();
     cmd.arg("logs");
     cmd.assert()
         .failure()
@@ -29,7 +43,7 @@ fn logs_subcommand_prints_daemon_required() {
 fn logs_follow_subcommand_prints_daemon_required() {
     // `--follow` is parsed but not yet implemented in daemon mode.
     // The command should fail mentioning the socket/daemon.
-    let mut cmd = Command::cargo_bin("mcp-hub").expect("Failed to find mcp-hub binary");
+    let mut cmd = mcp_hub();
     cmd.args(["logs", "--follow"]);
     cmd.assert()
         .failure()
@@ -40,7 +54,7 @@ fn logs_follow_subcommand_prints_daemon_required() {
 #[test]
 fn logs_subcommand_with_server_filter() {
     // Providing --server flag should also fail gracefully when no daemon is running.
-    let mut cmd = Command::cargo_bin("mcp-hub").expect("Failed to find mcp-hub binary");
+    let mut cmd = mcp_hub();
     cmd.args(["logs", "--server", "foo"]);
     cmd.assert()
         .failure()
@@ -52,7 +66,7 @@ fn logs_subcommand_with_server_filter() {
 fn status_subcommand_prints_daemon_required() {
     // When no daemon is running, `mcp-hub status` should fail with an error
     // mentioning the socket or daemon.
-    let mut cmd = Command::cargo_bin("mcp-hub").expect("Failed to find mcp-hub binary");
+    let mut cmd = mcp_hub();
     cmd.arg("status");
     cmd.assert()
         .failure()
