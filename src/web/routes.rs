@@ -71,7 +71,8 @@ impl ServerCardData {
         let state = snap.process_state.to_string();
 
         let health_class = match &snap.health {
-            HealthStatus::Unknown => "unknown",
+            // Same grey badge as `unknown`: nothing to report either way.
+            HealthStatus::Unknown | HealthStatus::NotChecked => "unknown",
             HealthStatus::Healthy { .. } => "healthy",
             HealthStatus::Degraded { .. } => "degraded",
             HealthStatus::Failed { .. } => "failed",
@@ -397,7 +398,7 @@ pub async fn logs_page(
 ///
 /// Overall status: `failed` if any server is `HealthStatus::Failed` or in
 /// `ProcessState::Fatal` (HTTP 503),
-/// `healthy` if there are no servers or all are `Healthy`, otherwise `degraded`
+/// `healthy` if there are no servers or all are `Healthy` or `NotChecked`, otherwise `degraded`
 /// (HTTP 200: the hub still serves, only a failed server should page).
 pub async fn health_handler(State(state): State<Arc<WebState>>) -> impl IntoResponse {
     let views = state.servers.read().await;
@@ -413,7 +414,8 @@ pub async fn health_handler(State(state): State<Arc<WebState>>) -> impl IntoResp
                     any_failed = true;
                     all_healthy = false;
                 }
-                HealthStatus::Healthy { .. } => {}
+                // NotChecked (http transport) is supervised only: counts as OK.
+                HealthStatus::Healthy { .. } | HealthStatus::NotChecked => {}
                 HealthStatus::Degraded { .. } | HealthStatus::Unknown => all_healthy = false,
             }
             // A server that gave up restarting is dead regardless of the last

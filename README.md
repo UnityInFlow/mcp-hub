@@ -149,6 +149,8 @@ max_retries = 10         # Consecutive crashes before marking Fatal (default: 10
 restart_delay = 1        # Base restart backoff delay in seconds (default: 1)
 ```
 
+`transport = "http"` servers are spawned and supervised like any other (restart with backoff, process-group kill, stdout and stderr in the logs; stdin is `/dev/null`), but health checks and MCP introspection only work over stdio, so their health shows `not checked` and counts as OK for `GET /health`. An optional `url` that would enable HTTP health checks is a possible follow-up (see [#59](https://github.com/UnityInFlow/mcp-hub/issues/59)).
+
 ### Environment variable expansion
 
 `env` values and `args` may reference the environment `mcp-hub` itself runs in, so secrets can stay out of the config file:
