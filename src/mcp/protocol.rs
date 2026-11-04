@@ -1,6 +1,5 @@
 // Phase 3 introspection types — not all are wired yet; allow dead_code
 // until Plans 02 and 03 use these types.
-#![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
 

@@ -99,10 +99,6 @@ pub struct DaemonState {
     pub log_agg: Arc<LogAggregator>,
     /// Cancelled when the daemon receives a `Stop` command or SIGTERM.
     pub shutdown: CancellationToken,
-    /// Whether to use ANSI colors in log output.
-    /// Reserved for future use when log output is colorized in the daemon.
-    #[allow(dead_code)]
-    pub color: bool,
     /// Explicit `--config` path used by reloads (`None` = default search).
     pub config_path: Option<std::path::PathBuf>,
     /// The config the running servers were started from; reloads diff against it.
@@ -265,7 +261,6 @@ pub async fn bind_control_socket(_sock_path: &Path) -> anyhow::Result<ControlLis
 ///
 /// Convenience wrapper over [`bind_control_socket`] + [`serve_control_socket`].
 /// The daemon binary binds and serves separately; this is the library entry point.
-#[allow(dead_code)]
 pub async fn run_control_socket(sock_path: &Path, state: Arc<DaemonState>) -> anyhow::Result<()> {
     run_control_socket_with_limits(sock_path, state, ControlLimits::default()).await
 }

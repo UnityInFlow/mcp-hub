@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use axum::http::header;
 /// Embedded static assets -- per D-04, all assets compiled into the binary.
 use axum::response::IntoResponse;

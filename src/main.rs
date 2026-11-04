@@ -200,7 +200,6 @@ async fn run_daemon_inner(
         handles: Arc::new(tokio::sync::Mutex::new(handles)),
         log_agg: Arc::clone(&log_agg),
         shutdown: shutdown.clone(),
-        color: false,
         config_path: config_path.map(std::path::Path::to_path_buf),
         // Reloads diff against this, so it must be what the servers started from.
         current_config: tokio::sync::Mutex::new(config),

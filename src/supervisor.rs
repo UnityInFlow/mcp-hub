@@ -185,8 +185,8 @@ pub async fn shutdown_process(mut child: tokio::process::Child, pid: u32) -> any
             // Child exited within the grace period.
             Ok(())
         }
-        _ => {
-            // Timeout or wait error — escalate to SIGKILL.
+        Ok(Err(_)) | Err(_) => {
+            // Wait error or timeout (`Elapsed`) — escalate to SIGKILL.
             tracing::warn!(pid, "Grace period elapsed; sending SIGKILL");
             // SIGKILL the whole group: members that ignored SIGTERM must not survive.
             #[cfg(unix)]
@@ -773,7 +773,10 @@ pub async fn wait_for_initial_states(handles: &mut [ServerHandle], timeout: Dura
                         break;
                     }
                 }
-                _ => break, // Running, Backoff, Fatal, Stopping
+                ProcessState::Running
+                | ProcessState::Backoff { .. }
+                | ProcessState::Fatal
+                | ProcessState::Stopping => break,
             }
         }
     }
