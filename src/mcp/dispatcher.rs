@@ -384,7 +384,6 @@ pub async fn send_request<T: serde::Serialize>(
 /// # Errors
 /// - Serialization fails.
 /// - Writing to stdin fails (process died) or times out (server not reading).
-#[allow(dead_code)] // used in Phase 3 Plan 02 for notifications/initialized
 pub async fn send_notification<T: serde::Serialize>(
     stdin: &SharedStdin,
     notification: &T,

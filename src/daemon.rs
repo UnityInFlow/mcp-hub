@@ -210,10 +210,10 @@ pub fn write_pid_file(path: &std::path::Path) -> anyhow::Result<PidFileLock> {
         };
 
         let locked = lock.metadata().map_err(|e| fail(&e))?;
-        let linked = match std::fs::metadata(path) {
-            Ok(m) => m.dev() == locked.dev() && m.ino() == locked.ino(),
-            Err(_) => false,
-        };
+        // A path that cannot be stat'ed is no longer linked to the locked file.
+        let linked = std::fs::metadata(path)
+            .map(|m| m.dev() == locked.dev() && m.ino() == locked.ino())
+            .unwrap_or(false);
         if !linked {
             continue;
         }
@@ -291,6 +291,8 @@ pub fn check_existing_daemon(
             ),
             Err(e) => anyhow::bail!("Failed to lock PID file {}: {e}", pid_path.display()),
         },
+        // `io::ErrorKind` is non-exhaustive; any open failure (missing file
+        // included) means there is no PID file to lock.
         Err(_) => None,
     };
 
@@ -388,7 +390,8 @@ fn pid_is_alive(pid: i32) -> bool {
     match kill(Pid::from_raw(pid), None) {
         Ok(()) | Err(Errno::EPERM) => !is_zombie(pid),
         Err(Errno::ESRCH) => false,
-        // Anything else cannot be a live process we could be racing with.
+        // `Errno` is non-exhaustive; anything else cannot be a live process we
+        // could be racing with.
         Err(_) => false,
     }
 }

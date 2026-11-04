@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::collections::{HashMap, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
@@ -239,7 +237,7 @@ pub(crate) fn format_system_time(t: SystemTime) -> String {
         .as_secs();
 
     // Civil time from Unix epoch — proleptic Gregorian calendar.
-    let mut days = (secs / 86400) as u32;
+    let days = (secs / 86400) as u32;
     let time_secs = secs % 86400;
 
     let hour = time_secs / 3600;
@@ -258,9 +256,6 @@ pub(crate) fn format_system_time(t: SystemTime) -> String {
     let day = doy - (153 * mp + 2) / 5 + 1;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if month <= 2 { y + 1 } else { y };
-
-    // Suppress the unused mut warning — `days` is consumed above.
-    let _ = &mut days;
 
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }

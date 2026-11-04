@@ -37,7 +37,6 @@ mod hardening {
             handles: Arc::new(tokio::sync::Mutex::new(vec![])),
             log_agg: Arc::new(LogAggregator::new(&[], 1000)),
             shutdown: shutdown.clone(),
-            color: false,
             config_path: None,
             current_config: tokio::sync::Mutex::new(mcp_hub::config::HubConfig {
                 hub: Default::default(),

@@ -382,7 +382,6 @@ async fn control_socket_round_trip() {
         handles: Arc::new(tokio::sync::Mutex::new(vec![])),
         log_agg: Arc::clone(&log_agg),
         shutdown: shutdown.clone(),
-        color: false,
         config_path: None,
         current_config: tokio::sync::Mutex::new(HubConfig {
             hub: Default::default(),
