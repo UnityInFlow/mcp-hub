@@ -1,0 +1,139 @@
+//! Commands that talk to a running daemon over the control socket
+//! (`stop`, `restart`, `status`, `logs`, `reload`, `gen-config --live`).
+
+use anyhow::Context as _;
+
+use crate::cli::{GenConfigArgs, LogsArgs, RestartArgs};
+use crate::control::{self, DaemonRequest, DaemonResponse};
+use crate::{config, daemon, gen_config};
+
+/// Send `request` to the daemon and turn a failure response into an error.
+///
+/// `failure_prefix` is prepended to the daemon's error message (`None` uses the
+/// message as is). The error flows to `main`, which prints it and exits 1.
+async fn send_checked(
+    request: &DaemonRequest,
+    timeout_secs: u64,
+    failure_prefix: Option<&str>,
+) -> anyhow::Result<DaemonResponse> {
+    let sock = daemon::socket_path()?;
+    let response = control::send_daemon_command(&sock, request, timeout_secs).await?;
+    if response.ok {
+        return Ok(response);
+    }
+    let message = response
+        .error
+        .unwrap_or_else(|| "unknown error".to_string());
+    match failure_prefix {
+        Some(prefix) => anyhow::bail!("{prefix}: {message}"),
+        None => anyhow::bail!("{message}"),
+    }
+}
+
+/// `mcp-hub stop`: ask the daemon to shut down.
+pub async fn stop() -> anyhow::Result<()> {
+    send_checked(&DaemonRequest::Stop, 5, None).await?;
+    println!("Daemon stop command sent. Shutting down...");
+    Ok(())
+}
+
+/// `mcp-hub restart <name>`: restart one managed server.
+pub async fn restart(args: RestartArgs) -> anyhow::Result<()> {
+    let server_name = args.name;
+    send_checked(
+        &DaemonRequest::Restart {
+            name: server_name.clone(),
+        },
+        10,
+        None,
+    )
+    .await?;
+    println!("Restart signal sent to '{server_name}'.");
+    Ok(())
+}
+
+/// `mcp-hub status`: print the daemon's status JSON.
+pub async fn status() -> anyhow::Result<()> {
+    let response = send_checked(&DaemonRequest::Status, 5, Some("Status failed")).await?;
+    if let Some(data) = response.data {
+        println!("{}", serde_json::to_string_pretty(&data)?);
+    }
+    Ok(())
+}
+
+/// `mcp-hub logs`: print recent log lines from the daemon.
+pub async fn logs(args: LogsArgs) -> anyhow::Result<()> {
+    let request = DaemonRequest::Logs {
+        server: args.server,
+        lines: args.lines,
+    };
+    let response = send_checked(&request, 5, Some("Logs failed")).await?;
+    if let Some(lines) = response.data.as_ref().and_then(|d| d.as_array()) {
+        for line in lines {
+            if let Some(s) = line.as_str() {
+                println!("{s}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `mcp-hub reload`: ask the daemon to re-read its config and apply the diff.
+pub async fn reload() -> anyhow::Result<()> {
+    // Replacing servers can take up to 5 s each to shut down.
+    let response = send_checked(&DaemonRequest::Reload, 30, Some("Reload failed")).await?;
+    match response.data {
+        Some(data) => {
+            let summary: control::ReloadSummary = serde_json::from_value(data)
+                .context("Daemon returned an invalid reload summary")?;
+            println!("Reload complete: {summary}.");
+        }
+        None => println!("Reload complete."),
+    }
+    Ok(())
+}
+
+/// `mcp-hub gen-config`: render a Claude Code / Cursor MCP config to stdout.
+pub async fn gen_config(
+    config_path: Option<&std::path::Path>,
+    args: GenConfigArgs,
+) -> anyhow::Result<()> {
+    let (config, secret_vars) =
+        config::find_and_load_config_report(config_path).context("Failed to load config")?;
+
+    if config.servers.is_empty() {
+        eprintln!("\u{26a0} No servers configured in mcp-hub.toml");
+    }
+
+    if !secret_vars.is_empty() {
+        eprintln!(
+            "warning: gen-config is writing secret values expanded from {} to stdout; \
+             do not commit or share the output",
+            secret_vars.join(", ")
+        );
+    }
+
+    let live_info: Option<Vec<gen_config::ServerLiveInfo>> = if args.live {
+        let sock = daemon::socket_path()?;
+        let response = control::send_daemon_command(&sock, &DaemonRequest::Status, 5).await?;
+        Some(gen_config::parse_live_info(&response)?)
+    } else {
+        None
+    };
+
+    let rendered = match args.format.as_str() {
+        "claude" => gen_config::render_claude_config(&config, live_info.as_deref())?,
+        "cursor" => gen_config::render_cursor_config(&config, live_info.as_deref())?,
+        other => {
+            anyhow::bail!("Unknown format '{other}'. Use --format claude or --format cursor.")
+        }
+    };
+
+    // Annotations go to stderr; stdout is the bare JSON document so it
+    // can be redirected straight into .mcp.json / Cursor's config.
+    for note in &rendered.notes {
+        eprintln!("{note}");
+    }
+    print!("{}", rendered.json);
+    Ok(())
+}
