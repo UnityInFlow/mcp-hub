@@ -71,8 +71,8 @@ comfy-table = "7"
 owo-colors = { version = "4", features = ["supports-colors"] }
 rand = "0.10"
 axum = "0.8"
-askama = "0.15"
-askama_web = { version = "0.15", features = ["axum-0.8"] }
+askama = "0.16"
+askama_web = { version = "0.16", features = ["axum-0.8"] }
 tower-http = { version = "0.6", features = ["timeout", "cors"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = "0.3"
