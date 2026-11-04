@@ -227,11 +227,9 @@ pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_MAX_REQUEST_BYTES: usize = 64 * 1024;
 
 /// After rejecting an oversized request, discard at most this many further bytes...
-#[cfg(unix)]
 const OVERSIZE_DRAIN_BYTES: u64 = 1024 * 1024;
 
 /// ...and for at most this long, so the error response reaches the client.
-#[cfg(unix)]
 const OVERSIZE_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Per-connection limits enforced by the control socket.
@@ -253,14 +251,8 @@ impl Default for ControlLimits {
 }
 
 /// A bound control socket listener, ready to be served.
-#[cfg(unix)]
 pub type ControlListener = tokio::net::UnixListener;
 
-/// Placeholder: Unix domain sockets are not available on this platform.
-#[cfg(not(unix))]
-pub struct ControlListener;
-
-#[cfg(unix)]
 /// Bind a Unix domain socket at `sock_path`, replacing any leftover socket file.
 ///
 /// Split from [`serve_control_socket`] so the daemon can tell its parent
@@ -290,13 +282,6 @@ pub async fn bind_control_socket(sock_path: &Path) -> anyhow::Result<ControlList
     Ok(listener)
 }
 
-#[cfg(not(unix))]
-/// Stub: Unix domain socket IPC is not supported on non-Unix platforms.
-pub async fn bind_control_socket(_sock_path: &Path) -> anyhow::Result<ControlListener> {
-    anyhow::bail!("Unix domain socket IPC is not supported on this platform. Use foreground mode.")
-}
-
-#[cfg(unix)]
 /// Bind a Unix domain socket at `sock_path` and accept control connections.
 ///
 /// Convenience wrapper over [`bind_control_socket`] + [`serve_control_socket`].
@@ -305,7 +290,6 @@ pub async fn run_control_socket(sock_path: &Path, state: Arc<DaemonState>) -> an
     run_control_socket_with_limits(sock_path, state, ControlLimits::default()).await
 }
 
-#[cfg(unix)]
 /// Like [`run_control_socket`], but with explicit per-connection limits.
 pub async fn run_control_socket_with_limits(
     sock_path: &Path,
@@ -316,7 +300,6 @@ pub async fn run_control_socket_with_limits(
     serve_control_socket_with_limits(listener, sock_path, state, limits).await
 }
 
-#[cfg(unix)]
 /// Accept control connections on an already-bound `listener`.
 ///
 /// Each connection receives exactly one request and sends exactly one response
@@ -330,7 +313,6 @@ pub async fn serve_control_socket(
     serve_control_socket_with_limits(listener, sock_path, state, ControlLimits::default()).await
 }
 
-#[cfg(unix)]
 /// Like [`serve_control_socket`], but with explicit per-connection limits:
 /// idle clients are dropped after `limits.read_timeout` and request lines are
 /// capped at `limits.max_request_bytes`.
@@ -369,27 +351,10 @@ pub async fn serve_control_socket_with_limits(
     Ok(())
 }
 
-#[cfg(not(unix))]
-/// Stub: Unix domain socket IPC is not supported on non-Unix platforms.
-pub async fn run_control_socket(_sock_path: &Path, _state: Arc<DaemonState>) -> anyhow::Result<()> {
-    anyhow::bail!("Unix domain socket IPC is not supported on this platform. Use foreground mode.")
-}
-
-#[cfg(not(unix))]
-/// Stub: Unix domain socket IPC is not supported on non-Unix platforms.
-pub async fn serve_control_socket(
-    _listener: ControlListener,
-    _sock_path: &Path,
-    _state: Arc<DaemonState>,
-) -> anyhow::Result<()> {
-    anyhow::bail!("Unix domain socket IPC is not supported on this platform. Use foreground mode.")
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Per-connection handler (Unix only)
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[cfg(unix)]
 /// Read one request line, dispatch it, and write one response line.
 ///
 /// The request must arrive within `limits.read_timeout` and be at most
@@ -478,7 +443,6 @@ async fn handle_connection(
     Ok(())
 }
 
-#[cfg(unix)]
 /// Serve a `LogsFollow` request: ack, replay the tail, then stream live lines.
 ///
 /// Returns when the client disconnects, a write fails, or the daemon shuts down.
@@ -592,7 +556,6 @@ where
 // Request dispatch (Unix only)
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[cfg(unix)]
 /// Route a `DaemonRequest` to the appropriate handler and return a response.
 async fn dispatch_request(request: DaemonRequest, state: &DaemonState) -> DaemonResponse {
     match request {
@@ -686,7 +649,6 @@ async fn dispatch_request(request: DaemonRequest, state: &DaemonState) -> Daemon
 // Client-side helper
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[cfg(unix)]
 /// Connect to a running daemon and send a single request, returning the response.
 ///
 /// Both the connection and the response read are bounded by `timeout_secs`.
@@ -731,7 +693,6 @@ pub async fn send_daemon_command(
     Ok(response)
 }
 
-#[cfg(unix)]
 /// Open a streaming request: send `request`, read the initial response, and
 /// return the still-open line reader for the follow-up events.
 ///
@@ -787,7 +748,6 @@ pub async fn open_daemon_stream(
     })
 }
 
-#[cfg(unix)]
 /// An open streaming connection to the daemon (see [`open_daemon_stream`]).
 pub struct DaemonStream {
     lines: tokio::io::Lines<tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>>,
@@ -795,7 +755,6 @@ pub struct DaemonStream {
     _writer: tokio::net::unix::OwnedWriteHalf,
 }
 
-#[cfg(unix)]
 impl DaemonStream {
     /// Next event from the daemon; `None` at end of stream.
     pub async fn next_event(&mut self) -> anyhow::Result<Option<FollowEvent>> {
@@ -808,38 +767,6 @@ impl DaemonStream {
             None => Ok(None),
         }
     }
-}
-
-#[cfg(not(unix))]
-/// Stub: streaming is not supported on non-Unix platforms.
-pub async fn open_daemon_stream(
-    _sock_path: &Path,
-    _request: &DaemonRequest,
-    _timeout_secs: u64,
-) -> anyhow::Result<DaemonStream> {
-    anyhow::bail!("Unix domain socket IPC is not supported on this platform. Use foreground mode.")
-}
-
-#[cfg(not(unix))]
-/// Placeholder: streaming is not available on this platform.
-pub struct DaemonStream;
-
-#[cfg(not(unix))]
-impl DaemonStream {
-    /// Never reached: [`open_daemon_stream`] always fails on this platform.
-    pub async fn next_event(&mut self) -> anyhow::Result<Option<FollowEvent>> {
-        Ok(None)
-    }
-}
-
-#[cfg(not(unix))]
-/// Stub: Unix domain socket IPC is not supported on non-Unix platforms.
-pub async fn send_daemon_command(
-    _sock_path: &Path,
-    _request: &DaemonRequest,
-    _timeout_secs: u64,
-) -> anyhow::Result<DaemonResponse> {
-    anyhow::bail!("Unix domain socket IPC is not supported on this platform. Use foreground mode.")
 }
 
 #[cfg(test)]

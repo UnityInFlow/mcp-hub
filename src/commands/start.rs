@@ -162,7 +162,6 @@ async fn run_daemon_inner(
 
     // Install signal handlers up front so every later step can use `?`
     // without stranding already-started servers over a handler failure.
-    #[cfg(unix)]
     let (mut sighup, mut sigterm) = {
         use tokio::signal::unix::{signal, SignalKind};
         (
@@ -240,7 +239,6 @@ async fn run_daemon_inner(
     // Block until a shutdown signal (SIGTERM, Ctrl+C) or a Stop
     // command via the control socket cancels the token.
     // SIGHUP triggers a config reload without stopping the daemon.
-    #[cfg(unix)]
     loop {
         tokio::select! {
             _ = sighup.recv() => {
@@ -261,19 +259,6 @@ async fn run_daemon_inner(
             _ = shutdown.cancelled() => {
                 // Stop command received via control socket.
                 break;
-            }
-        }
-    }
-
-    #[cfg(not(unix))]
-    {
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => {
-                result.context("Failed to listen for Ctrl+C")?;
-                tracing::info!("Ctrl+C received — shutting down daemon");
-            }
-            _ = shutdown.cancelled() => {
-                // Stop command received via control socket.
             }
         }
     }

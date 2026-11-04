@@ -86,7 +86,6 @@ fn remove_pid_file_is_idempotent() {
 // Duplicate daemon check test (Unix only)
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[cfg(unix)]
 #[test]
 fn check_existing_daemon_with_no_socket() {
     use mcp_hub::daemon::check_existing_daemon;
@@ -191,7 +190,6 @@ fn check_existing_daemon_live_mcp_hub_pid_without_lock_is_running() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn check_existing_daemon_dead_pid_cleans_stale_files() {
     use mcp_hub::daemon::check_existing_daemon;
@@ -210,7 +208,6 @@ fn check_existing_daemon_dead_pid_cleans_stale_files() {
     assert!(!pid.exists(), "stale PID file should be removed");
 }
 
-#[cfg(unix)]
 #[test]
 fn check_existing_daemon_unreadable_pid_file_is_stale() {
     use mcp_hub::daemon::check_existing_daemon;
@@ -226,7 +223,6 @@ fn check_existing_daemon_unreadable_pid_file_is_stale() {
     assert!(!pid.exists());
 }
 
-#[cfg(unix)]
 #[test]
 fn pid_file_lock_blocks_second_writer_and_check() {
     use mcp_hub::daemon::check_existing_daemon;

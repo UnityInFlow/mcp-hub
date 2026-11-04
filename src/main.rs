@@ -17,10 +17,8 @@ fn main() -> anyhow::Result<()> {
     // Detect whether `--daemon` was requested so we can fork before Tokio starts.
     let is_daemon = matches!(cli.command, Commands::Start { daemon: true, .. });
 
-    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut startup: Option<DaemonStartup> = None;
 
-    #[cfg(unix)]
     if is_daemon {
         let log_file = if let Commands::Start { log_file, .. } = &cli.command {
             log_file.clone()
@@ -54,11 +52,6 @@ fn main() -> anyhow::Result<()> {
             pid,
             pid_lock,
         });
-    }
-
-    #[cfg(not(unix))]
-    if is_daemon {
-        anyhow::bail!("Daemon mode is not supported on Windows. Use foreground mode instead.");
     }
 
     // Build the Tokio runtime *after* the fork so threads are not duplicated.

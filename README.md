@@ -36,7 +36,7 @@ mcp-hub gen-config --format claude   # paste into .mcp.json
 - **It does not manage remote machines.** Everything runs on the local host, and the control socket is local.
 - **The web UI has no authentication.** It only binds to `127.0.0.1`; do not expose that port to other machines.
 - **One daemon per user.** The control socket lives in a single per-user location (`~/.config/mcp-hub/` on Linux), so you cannot run several independent daemons for different projects ([#21](https://github.com/UnityInFlow/mcp-hub/issues/21)).
-- **No Windows support yet.** Linux and macOS only ([#30](https://github.com/UnityInFlow/mcp-hub/issues/30)).
+- **Linux and macOS only (Unix-like systems); Windows is not supported** ([#30](https://github.com/UnityInFlow/mcp-hub/issues/30)).
 - **No Homebrew formula yet** ([#7](https://github.com/UnityInFlow/mcp-hub/issues/7)); use `cargo binstall` or `cargo install`.
 
 ## Naming
@@ -74,8 +74,8 @@ Prebuilt targets built by the release workflow (v0.1.1 shipped Linux only; macOS
 | macOS Apple Silicon (aarch64) | `aarch64-apple-darwin` | `mcp-server-hub-aarch64-apple-darwin-v<version>.tgz` |
 | macOS Intel (x86_64) | `x86_64-apple-darwin` | `mcp-server-hub-x86_64-apple-darwin-v<version>.tgz` |
 
-> **Windows** is not supported yet ([#30](https://github.com/UnityInFlow/mcp-hub/issues/30)).
-> The daemon, Unix-socket control channel, web UI and signal handling are Unix-only.
+> **Windows** is not supported ([#30](https://github.com/UnityInFlow/mcp-hub/issues/30)).
+> mcp-hub targets Unix-like systems only: it relies on Unix sockets, process groups and signals.
 
 After installing, verify with:
 

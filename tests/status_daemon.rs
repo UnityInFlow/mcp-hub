@@ -3,7 +3,6 @@
 ///
 /// Every daemon here uses throwaway socket, PID and log paths so a test can
 /// never touch the real `~/.config/mcp-hub`.
-#[cfg(unix)]
 mod status_daemon_tests {
     use std::collections::HashSet;
     use std::io::Write as _;

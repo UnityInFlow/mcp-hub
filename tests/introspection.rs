@@ -5,7 +5,6 @@
 //! Tests use a bash-based mock MCP server (tests/fixtures/mock-mcp-server.sh)
 //! that handles all relevant methods with configurable behaviour via env vars.
 
-#[cfg(unix)]
 mod unix_tests {
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -487,15 +486,4 @@ exit 0
             "no tools may be recorded for a server that exited"
         );
     }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Non-unix stubs
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[cfg(not(unix))]
-#[test]
-fn introspection_tests_require_unix() {
-    // bash-based integration tests are Unix-only.
-    // On Windows, these would need a PowerShell or cmd equivalent.
 }

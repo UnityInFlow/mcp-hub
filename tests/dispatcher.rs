@@ -18,7 +18,6 @@ fn make_pending() -> PendingMap {
 }
 
 /// Bash echo server: reads lines and echoes `{"jsonrpc":"2.0","result":{},"id":<id>}`.
-#[cfg(unix)]
 const ECHO_SCRIPT: &str = r#"
 while IFS= read -r line; do
     id=$(echo "$line" | sed 's/.*"id":\([0-9]*\).*/\1/')
@@ -28,7 +27,6 @@ done
 
 /// Spawn an echo responder and wire up the dispatcher.
 /// Returns (child, SharedStdin, PendingMap).
-#[cfg(unix)]
 async fn spawn_echo_dispatcher() -> (tokio::process::Child, SharedStdin, PendingMap) {
     let mut child = tokio::process::Command::new("bash")
         .arg("-c")
@@ -58,7 +56,6 @@ async fn spawn_echo_dispatcher() -> (tokio::process::Child, SharedStdin, Pending
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[cfg(unix)]
 #[tokio::test]
 async fn dispatcher_send_request_returns_correct_response() {
     use mcp_hub::mcp::protocol::PingRequest;
@@ -80,7 +77,6 @@ async fn dispatcher_send_request_returns_correct_response() {
     assert!(response.result.is_some(), "response should have result");
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn dispatcher_send_request_times_out_when_no_response() {
     // A server that reads but never responds.
@@ -130,7 +126,6 @@ async fn dispatcher_send_request_times_out_when_no_response() {
     );
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn reader_task_drains_pending_map_on_stdout_close() {
     // A server that exits immediately without responding.
@@ -181,7 +176,6 @@ async fn reader_task_drains_pending_map_on_stdout_close() {
     );
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn dispatcher_concurrent_requests() {
     use mcp_hub::mcp::protocol::PingRequest;
@@ -225,7 +219,6 @@ async fn dispatcher_concurrent_requests() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Spawn `bash -c <script>` and wire up the dispatcher around it.
-#[cfg(unix)]
 async fn spawn_script_dispatcher(
     script: &'static str,
 ) -> (tokio::process::Child, SharedStdin, PendingMap) {
@@ -255,7 +248,6 @@ async fn spawn_script_dispatcher(
 
 /// For each request, first emits a server-initiated `roots/list` request that
 /// reuses the request's id, then the real response.
-#[cfg(unix)]
 const COLLIDING_SERVER_REQUEST_SCRIPT: &str = r#"
 while IFS= read -r line; do
     id=$(echo "$line" | sed 's/.*"id":\([0-9]*\).*/\1/')
@@ -264,7 +256,6 @@ while IFS= read -r line; do
 done
 "#;
 
-#[cfg(unix)]
 #[tokio::test]
 async fn server_initiated_request_with_colliding_id_is_not_routed_as_response() {
     use mcp_hub::mcp::protocol::PingRequest;
@@ -287,7 +278,6 @@ async fn server_initiated_request_with_colliding_id_is_not_routed_as_response() 
 }
 
 /// Reads two requests, then answers them in reverse order.
-#[cfg(unix)]
 const OUT_OF_ORDER_SCRIPT: &str = r#"
 IFS= read -r first
 IFS= read -r second
@@ -298,7 +288,6 @@ echo "{\"jsonrpc\":\"2.0\",\"id\":$id1,\"result\":{\"for\":$id1}}"
 cat > /dev/null
 "#;
 
-#[cfg(unix)]
 #[tokio::test]
 async fn out_of_order_responses_are_routed_by_id() {
     use mcp_hub::mcp::protocol::PingRequest;
@@ -335,7 +324,6 @@ async fn out_of_order_responses_are_routed_by_id() {
 
 /// For each request emits noise (non-JSON, unmatched string id, null id) before
 /// the real response.
-#[cfg(unix)]
 const NOISY_SERVER_SCRIPT: &str = r#"
 while IFS= read -r line; do
     id=$(echo "$line" | sed 's/.*"id":\([0-9]*\).*/\1/')
@@ -346,7 +334,6 @@ while IFS= read -r line; do
 done
 "#;
 
-#[cfg(unix)]
 #[tokio::test]
 async fn non_json_and_unmatched_string_id_lines_do_not_stop_the_reader() {
     use mcp_hub::mcp::protocol::PingRequest;
@@ -375,7 +362,6 @@ async fn non_json_and_unmatched_string_id_lines_do_not_stop_the_reader() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// A request whose serialised form is far larger than any pipe buffer.
-#[cfg(unix)]
 fn padded_request(id: u64, pad_bytes: usize) -> serde_json::Value {
     serde_json::json!({
         "jsonrpc": "2.0",
@@ -385,7 +371,6 @@ fn padded_request(id: u64, pad_bytes: usize) -> serde_json::Value {
     })
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn send_request_times_out_when_server_never_reads_stdin() {
     // Never reads stdin, so a large write fills the pipe and blocks.
@@ -414,7 +399,6 @@ async fn send_request_times_out_when_server_never_reads_stdin() {
     );
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn send_request_removes_pending_entry_on_write_error() {
     use mcp_hub::mcp::protocol::PingRequest;
@@ -443,7 +427,6 @@ async fn send_request_removes_pending_entry_on_write_error() {
     assert!(saw_write_error, "expected a stdin write error");
 }
 
-#[cfg(unix)]
 const OVERLONG_LINE_SCRIPT: &str = r#"
 IFS= read -r line
 id=$(echo "$line" | sed 's/.*"id":\([0-9]*\).*/\1/')
@@ -453,7 +436,6 @@ echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"ok\":true}}"
 cat > /dev/null
 "#;
 
-#[cfg(unix)]
 #[tokio::test]
 async fn overlong_stdout_line_is_skipped_and_routing_continues() {
     use mcp_hub::mcp::protocol::PingRequest;
@@ -466,7 +448,6 @@ async fn overlong_stdout_line_is_skipped_and_routing_continues() {
     assert_eq!(response.result, Some(serde_json::json!({"ok": true})));
 }
 
-#[cfg(unix)]
 const INVALID_UTF8_SCRIPT: &str = r#"
 IFS= read -r line
 id=$(echo "$line" | sed 's/.*"id":\([0-9]*\).*/\1/')
@@ -475,7 +456,6 @@ echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"ok\":true}}"
 cat > /dev/null
 "#;
 
-#[cfg(unix)]
 #[tokio::test]
 async fn invalid_utf8_line_does_not_stop_the_reader() {
     use mcp_hub::mcp::protocol::PingRequest;
@@ -490,7 +470,6 @@ async fn invalid_utf8_line_does_not_stop_the_reader() {
 
 /// Emits server-initiated requests and a notification, then records every
 /// line it receives on stdin into the file named by `$OUT`.
-#[cfg(unix)]
 const SERVER_REQUEST_SCRIPT: &str = r#"
 echo '{"jsonrpc":"2.0","id":7,"method":"roots/list"}'
 echo '{"jsonrpc":"2.0","method":"notifications/x"}'
@@ -500,7 +479,6 @@ while IFS= read -r line; do
 done
 "#;
 
-#[cfg(unix)]
 #[tokio::test]
 async fn server_initiated_requests_get_method_not_found_and_notifications_do_not() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -607,14 +585,4 @@ fn id_allocator_increments_monotonically() {
 fn id_allocator_default_matches_new() {
     let alloc = IdAllocator::default();
     assert_eq!(alloc.next_id(), 1, "default() should start at 1");
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Non-unix stubs
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[cfg(not(unix))]
-#[test]
-fn dispatcher_tests_require_unix() {
-    // bash-based integration tests are Unix-only.
 }
