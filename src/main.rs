@@ -103,7 +103,7 @@ async fn async_main(cli: Cli, startup: Option<DaemonStartup>) -> anyhow::Result<
         }
         Commands::Stop => client::stop().await,
         Commands::Restart(args) => client::restart(args).await,
-        Commands::Status => client::status().await,
+        Commands::Status { json } => client::status(json, color).await,
         Commands::Logs(args) => client::logs(args).await,
         Commands::Reload => client::reload().await,
         Commands::Init => init::run_init_wizard(),

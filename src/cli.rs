@@ -48,7 +48,11 @@ pub enum Commands {
     Restart(RestartArgs),
 
     /// Show status of all servers (name, state, health, PID, uptime, restarts).
-    Status,
+    Status {
+        /// Print the daemon's raw status response as JSON (for scripts).
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Show server logs.
     Logs(LogsArgs),
