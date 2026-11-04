@@ -86,7 +86,6 @@ tempfile = "3"
 tokio-test = "0.4"
 # `start_paused` virtual time for the slow Degraded -> Failed health test.
 tokio = { version = "1", features = ["test-util"] }
-portpicker = "0.1"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 
