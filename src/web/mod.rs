@@ -11,15 +11,58 @@ use tokio_util::sync::CancellationToken;
 
 use crate::logs::LogAggregator;
 use crate::supervisor::ServerHandle;
+use crate::types::ServerSnapshot;
+
+/// Read-only view of one supervised server: its name and snapshot receiver.
+///
+/// A `watch::Receiver` is cheap to clone and reading it never blocks, so the
+/// web UI can serve status without touching the supervisor's `handles` mutex.
+#[derive(Clone)]
+pub struct ServerView {
+    pub name: String,
+    pub state_rx: tokio::sync::watch::Receiver<ServerSnapshot>,
+}
+
+/// Shared, independently locked list of [`ServerView`]s.
+///
+/// Writers (startup and config reload) hold the write lock only for the
+/// instant it takes to swap the vector, never across an `.await` on process
+/// shutdown, so readers are never stalled by a slow reload.
+pub type SharedServerViews = Arc<tokio::sync::RwLock<Vec<ServerView>>>;
+
+/// Build a [`SharedServerViews`] from the current supervisor handles.
+pub fn new_server_views(handles: &[ServerHandle]) -> SharedServerViews {
+    Arc::new(tokio::sync::RwLock::new(views_from_handles(handles)))
+}
+
+/// Replace the published views with ones matching `handles`.
+///
+/// Called after the supervisor's handle list changes (config reload). The
+/// views keep serving the previous snapshot set until this swap.
+pub async fn publish_server_views(views: &SharedServerViews, handles: &[ServerHandle]) {
+    let fresh = views_from_handles(handles);
+    *views.write().await = fresh;
+}
+
+fn views_from_handles(handles: &[ServerHandle]) -> Vec<ServerView> {
+    handles
+        .iter()
+        .map(|h| ServerView {
+            name: h.name.clone(),
+            state_rx: h.state_rx.clone(),
+        })
+        .collect()
+}
 
 /// Shared state for web UI route handlers.
 ///
-/// Holds read-only references to supervisor watch channels and the log
-/// aggregator. The web server never mutates server handles -- it only
-/// reads snapshots via `state_rx.borrow().clone()`.
+/// Holds read-only snapshot receivers and the log aggregator. The web server
+/// never touches the supervisor's `handles` mutex (which a config reload holds
+/// across process shutdowns); it reads `state_rx.borrow().clone()` from its
+/// own [`SharedServerViews`].
 pub struct WebState {
-    /// Server handles -- cloned Arc from DaemonState for read-only access.
-    pub handles: Arc<tokio::sync::Mutex<Vec<ServerHandle>>>,
+    /// Snapshot receivers for every supervised server.
+    pub servers: SharedServerViews,
     /// Log aggregator for SSE streaming and log history.
     pub log_agg: Arc<LogAggregator>,
 }
