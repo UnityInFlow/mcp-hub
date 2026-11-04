@@ -58,20 +58,33 @@ pub enum Commands {
     /// Equivalent to sending SIGHUP to the daemon process.
     Reload,
 
-    /// Generate a Claude Code or Cursor config snippet from the hub's server list.
+    /// Generate a Claude Code, Cursor, Codex CLI or Gemini CLI config snippet from the hub's server list.
     GenConfig(GenConfigArgs),
 
     /// Interactively add a new MCP server to ./mcp-hub.toml.
     Init,
 }
 
+/// Client config formats supported by `gen-config`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum GenConfigFormat {
+    /// Claude Code `mcpServers` JSON (.mcp.json / ~/.claude.json).
+    Claude,
+    /// Cursor `mcpServers` JSON (~/.cursor/mcp.json).
+    Cursor,
+    /// Codex CLI `[mcp_servers.<name>]` TOML (~/.codex/config.toml).
+    Codex,
+    /// Gemini CLI `mcpServers` JSON (~/.gemini/settings.json).
+    Gemini,
+}
+
 /// Arguments for the `gen-config` subcommand.
 #[derive(Debug, clap::Args)]
 #[command(name = "gen-config")]
 pub struct GenConfigArgs {
-    /// Output format: 'claude' or 'cursor'.
-    #[arg(long, short = 'f', value_name = "FORMAT")]
-    pub format: String,
+    /// Output format.
+    #[arg(long, short = 'f', value_enum, value_name = "FORMAT")]
+    pub format: GenConfigFormat,
 
     /// Connect to the running daemon and include introspected tool/resource/prompt info as comments.
     #[arg(long)]

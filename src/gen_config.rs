@@ -1,12 +1,14 @@
-//! Config generation module for Claude Code and Cursor config snippets.
+//! Config generation module for Claude Code, Cursor, Codex CLI and Gemini CLI.
 //!
 //! Provides pure rendering functions that convert a `HubConfig` into
-//! ready-to-paste JSON blocks for the target editor's MCP server config.
+//! ready-to-paste config documents (JSON, or TOML for Codex CLI) for the
+//! target client's MCP server config.
 //! All rendering is offline — no daemon connection required.
 
 use anyhow::Context as _;
 use chrono::Utc;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 
 use crate::config::{self, HubConfig};
 use crate::control::DaemonResponse;
@@ -31,10 +33,12 @@ pub struct ServerLiveInfo {
 
 /// Result of rendering a config snippet.
 ///
-/// `json` is a strict JSON document (with trailing newline) destined for
-/// stdout so it can be redirected straight into `.mcp.json` or Cursor's
-/// config. `notes` are human-readable `//` lines (version header, destination
-/// hint, warnings, `--live` summary) destined for stderr.
+/// `json` is the config document (with trailing newline) destined for stdout
+/// so it can be redirected straight into the client's config file. It is JSON
+/// for every format except Codex CLI, where it is TOML (the field name is kept
+/// for API stability). `notes` are human-readable comment lines (`//` for
+/// JSON formats, `#` for TOML: version header, destination hint, warnings,
+/// `--live` summary) destined for stderr.
 pub struct RenderedConfig {
     pub json: String,
     pub notes: Vec<String>,
@@ -56,8 +60,8 @@ pub fn render_claude_config(
     config: &HubConfig,
     live_info: Option<&[ServerLiveInfo]>,
 ) -> anyhow::Result<RenderedConfig> {
-    let destination_hint = "// Paste into mcpServers in ~/.claude.json or .mcp.json";
-    render_config_internal(config, live_info, destination_hint)
+    let destination_hint = "Paste into mcpServers in ~/.claude.json or .mcp.json";
+    render_json_config(config, live_info, destination_hint, false)
 }
 
 /// Render a Cursor `mcpServers` JSON block from `config`.
@@ -68,8 +72,70 @@ pub fn render_cursor_config(
     config: &HubConfig,
     live_info: Option<&[ServerLiveInfo]>,
 ) -> anyhow::Result<RenderedConfig> {
-    let destination_hint = "// Paste into ~/.cursor/mcp.json or .cursor/mcp.json";
-    render_config_internal(config, live_info, destination_hint)
+    let destination_hint = "Paste into ~/.cursor/mcp.json or .cursor/mcp.json";
+    render_json_config(config, live_info, destination_hint, false)
+}
+
+/// Render a Gemini CLI `mcpServers` JSON block from `config`.
+///
+/// Same shape as the Claude format; additionally emits `cwd` when a server
+/// sets one (supported by Gemini CLI's stdio transport). Destination is the
+/// user-scope `~/.gemini/settings.json` or project-scope `.gemini/settings.json`.
+pub fn render_gemini_config(
+    config: &HubConfig,
+    live_info: Option<&[ServerLiveInfo]>,
+) -> anyhow::Result<RenderedConfig> {
+    let destination_hint =
+        "Paste into mcpServers in ~/.gemini/settings.json or .gemini/settings.json";
+    render_json_config(config, live_info, destination_hint, true)
+}
+
+/// Render a Codex CLI `[mcp_servers.<name>]` TOML document from `config`.
+///
+/// The document is built with the `toml` serializer so names that are not
+/// bare keys (`my.server`, `a b`) are quoted correctly. `env` is omitted when
+/// empty and `cwd` when unset. Notes use `#` comments.
+pub fn render_codex_config(
+    config: &HubConfig,
+    live_info: Option<&[ServerLiveInfo]>,
+) -> anyhow::Result<RenderedConfig> {
+    let mut notes = header_notes(
+        "#",
+        "Append to ~/.codex/config.toml (or .codex/config.toml in a trusted project)",
+    );
+    notes.extend(build_warnings(config, "#"));
+
+    let mut servers = toml::Table::new();
+    for entry in collect_entries(config)? {
+        let mut table = toml::Table::new();
+        table.insert("command".to_string(), toml::Value::String(entry.command));
+        table.insert(
+            "args".to_string(),
+            toml::Value::Array(entry.args.into_iter().map(toml::Value::String).collect()),
+        );
+        if !entry.env.is_empty() {
+            let env: toml::Table = entry
+                .env
+                .into_iter()
+                .map(|(k, v)| (k, toml::Value::String(v)))
+                .collect();
+            table.insert("env".to_string(), toml::Value::Table(env));
+        }
+        if let Some(cwd) = entry.cwd {
+            table.insert("cwd".to_string(), toml::Value::String(cwd));
+        }
+        servers.insert(entry.name, toml::Value::Table(table));
+    }
+
+    let mut root = toml::Table::new();
+    root.insert("mcp_servers".to_string(), toml::Value::Table(servers));
+    let doc = toml::to_string(&root).context("Failed to serialize Codex CLI TOML")?;
+
+    if let Some(info) = live_info {
+        notes.extend(live_summary_lines(info, "#"));
+    }
+
+    Ok(RenderedConfig { json: doc, notes })
 }
 
 /// Parse a daemon `Status` response into a `Vec<ServerLiveInfo>`.
@@ -122,55 +188,80 @@ pub fn parse_live_info(response: &DaemonResponse) -> anyhow::Result<Vec<ServerLi
 // Private helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Shared rendering logic for both Claude and Cursor output formats.
-fn render_config_internal(
-    config: &HubConfig,
-    live_info: Option<&[ServerLiveInfo]>,
-    destination_hint: &str,
-) -> anyhow::Result<RenderedConfig> {
-    let version = env!("CARGO_PKG_VERSION");
-    let timestamp = iso_timestamp();
+/// One stdio server ready to be rendered, with env already resolved.
+struct ServerEntry {
+    name: String,
+    command: String,
+    args: Vec<String>,
+    env: BTreeMap<String, String>,
+    cwd: Option<String>,
+}
 
-    let mut notes = vec![
-        format!("// Generated by mcp-hub v{version} at {timestamp}"),
-        destination_hint.to_string(),
-    ];
-
-    // Collect warnings for http-transport servers (excluded from output).
-    let warnings = build_warnings(config);
-    notes.extend(warnings);
-
-    // Sort server names alphabetically for deterministic output.
+/// Collect the non-http servers in alphabetical order with resolved env.
+///
+/// HTTP transport servers are excluded (see [`build_warnings`]).
+fn collect_entries(config: &HubConfig) -> anyhow::Result<Vec<ServerEntry>> {
     let mut names: Vec<&String> = config.servers.keys().collect();
     names.sort();
 
-    let mut mcp_servers: serde_json::Map<String, Value> = serde_json::Map::new();
-
-    for name in &names {
-        let server = &config.servers[*name];
-
-        // HTTP transport servers are excluded from the mcpServers block.
+    let mut entries = Vec::new();
+    for name in names {
+        let server = &config.servers[name];
         if server.transport == "http" {
             continue;
         }
-
         let resolved_env = config::resolve_env(server)
             .with_context(|| format!("Failed to resolve env for server '{name}'"))?;
-
-        let entry = json!({
-            "command": server.command,
-            "args": server.args,
-            "env": resolved_env,
+        entries.push(ServerEntry {
+            name: name.clone(),
+            command: server.command.clone(),
+            args: server.args.clone(),
+            env: resolved_env.into_iter().collect(),
+            cwd: server.cwd.clone(),
         });
+    }
+    Ok(entries)
+}
 
-        mcp_servers.insert((*name).clone(), entry);
+/// Version/timestamp header plus destination hint, as comment lines.
+fn header_notes(prefix: &str, destination_hint: &str) -> Vec<String> {
+    let version = env!("CARGO_PKG_VERSION");
+    let timestamp = iso_timestamp();
+    vec![
+        format!("{prefix} Generated by mcp-hub v{version} at {timestamp}"),
+        format!("{prefix} {destination_hint}"),
+    ]
+}
+
+/// Shared rendering logic for the `mcpServers` JSON formats (Claude, Cursor,
+/// Gemini). `with_cwd` adds a `cwd` key for servers that set one.
+fn render_json_config(
+    config: &HubConfig,
+    live_info: Option<&[ServerLiveInfo]>,
+    destination_hint: &str,
+    with_cwd: bool,
+) -> anyhow::Result<RenderedConfig> {
+    let mut notes = header_notes("//", destination_hint);
+    notes.extend(build_warnings(config, "//"));
+
+    let mut mcp_servers: serde_json::Map<String, Value> = serde_json::Map::new();
+    for entry in collect_entries(config)? {
+        let mut value = json!({
+            "command": entry.command,
+            "args": entry.args,
+            "env": entry.env,
+        });
+        if let (true, Some(cwd), Some(obj)) = (with_cwd, entry.cwd, value.as_object_mut()) {
+            obj.insert("cwd".to_string(), Value::String(cwd));
+        }
+        mcp_servers.insert(entry.name, value);
     }
 
     let output_json = json!({ "mcpServers": Value::Object(mcp_servers) });
     let json_str = serde_json::to_string_pretty(&output_json)?;
 
     if let Some(info) = live_info {
-        notes.extend(live_summary_lines(info));
+        notes.extend(live_summary_lines(info, "//"));
     }
 
     Ok(RenderedConfig {
@@ -190,7 +281,7 @@ fn iso_timestamp() -> String {
 ///
 /// These lines are prepended to the output before the JSON block so the user
 /// knows which servers were intentionally excluded.
-fn build_warnings(config: &HubConfig) -> Vec<String> {
+fn build_warnings(config: &HubConfig, prefix: &str) -> Vec<String> {
     let mut warnings = Vec::new();
     let mut names: Vec<&String> = config.servers.keys().collect();
     names.sort();
@@ -198,7 +289,7 @@ fn build_warnings(config: &HubConfig) -> Vec<String> {
         let server = &config.servers[name];
         if server.transport == "http" {
             warnings.push(format!(
-                "// WARNING: '{name}' uses http transport -- manual URL config required"
+                "{prefix} WARNING: '{name}' uses http transport -- manual URL config required"
             ));
         }
     }
@@ -209,7 +300,7 @@ fn build_warnings(config: &HubConfig) -> Vec<String> {
 ///
 /// Example: `// filesystem: running, tools=[read, write], resources=0, prompts=0`
 /// Servers that are not running are flagged with a `WARNING:` prefix.
-fn live_summary_lines(live_info: &[ServerLiveInfo]) -> Vec<String> {
+fn live_summary_lines(live_info: &[ServerLiveInfo], comment: &str) -> Vec<String> {
     live_info
         .iter()
         .map(|info| {
@@ -219,7 +310,7 @@ fn live_summary_lines(live_info: &[ServerLiveInfo]) -> Vec<String> {
                 "WARNING: "
             };
             format!(
-                "// {prefix}{}: {}, tools=[{}], resources={}, prompts={}",
+                "{comment} {prefix}{}: {}, tools=[{}], resources={}, prompts={}",
                 info.name,
                 info.state,
                 info.tool_names.join(", "),
@@ -517,5 +608,93 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&rendered.json).unwrap();
         assert!(value["mcpServers"]["env"].is_object());
         assert_eq!(value["mcpServers"]["other"]["env"]["K"], "v");
+    }
+
+    // ── Codex CLI / Gemini CLI ────────────────────────────────────────────────
+
+    #[test]
+    fn test_codex_toml_round_trip_with_quoted_names() {
+        let mut server = make_server("npx", vec!["-y", "pkg"]);
+        server.env.insert("K".to_string(), "v\"q".to_string());
+        let config = make_config(vec![
+            ("my.server", server),
+            ("a b", make_server("node", vec![])),
+        ]);
+        let rendered = render_codex_config(&config, None).unwrap();
+        let value: toml::Value = toml::from_str(&rendered.json).unwrap();
+        assert_eq!(
+            value["mcp_servers"]["my.server"]["command"].as_str(),
+            Some("npx")
+        );
+        assert_eq!(
+            value["mcp_servers"]["my.server"]["args"][1].as_str(),
+            Some("pkg")
+        );
+        assert_eq!(
+            value["mcp_servers"]["my.server"]["env"]["K"].as_str(),
+            Some("v\"q")
+        );
+        assert!(value["mcp_servers"]["a b"].get("env").is_none());
+        assert!(rendered.json.contains("[mcp_servers.\"my.server\"]"));
+    }
+
+    #[test]
+    fn test_codex_notes_use_hash_comments() {
+        let mut http = make_server("http://x", vec![]);
+        http.transport = "http".to_string();
+        let config = make_config(vec![("remote", http), ("s", make_server("cmd", vec![]))]);
+        let live = live_info("s", "running", &["t"]);
+        let rendered = render_codex_config(&config, Some(&live)).unwrap();
+        assert!(
+            rendered.notes.iter().all(|n| n.starts_with("# ")),
+            "{:?}",
+            rendered.notes
+        );
+        assert!(rendered
+            .notes
+            .iter()
+            .any(|n| n.contains("~/.codex/config.toml")));
+        assert!(rendered
+            .notes
+            .iter()
+            .any(|n| n.contains("WARNING: 'remote'")));
+        assert!(rendered
+            .notes
+            .iter()
+            .any(|n| n == "# s: running, tools=[t], resources=1, prompts=2"));
+        assert!(!rendered.json.contains("remote"));
+        assert!(!rendered.json.contains('#'));
+    }
+
+    #[test]
+    fn test_codex_zero_servers_parses() {
+        let rendered = render_codex_config(&make_config(vec![]), None).unwrap();
+        assert!(
+            toml::from_str::<toml::Value>(&rendered.json).is_ok(),
+            "{}",
+            rendered.json
+        );
+    }
+
+    #[test]
+    fn test_gemini_includes_cwd_but_claude_does_not() {
+        let mut server = make_server("node", vec![]);
+        server.cwd = Some("/work".to_string());
+        let config = make_config(vec![("s", server)]);
+        let gemini: serde_json::Value =
+            serde_json::from_str(&render_gemini_config(&config, None).unwrap().json).unwrap();
+        assert_eq!(gemini["mcpServers"]["s"]["cwd"], "/work");
+        let claude: serde_json::Value =
+            serde_json::from_str(&render_claude_config(&config, None).unwrap().json).unwrap();
+        assert!(claude["mcpServers"]["s"].get("cwd").is_none());
+    }
+
+    #[test]
+    fn test_gemini_hint() {
+        let rendered = render_gemini_config(&make_config(vec![]), None).unwrap();
+        assert!(rendered
+            .notes
+            .iter()
+            .any(|n| n.contains("~/.gemini/settings.json")));
     }
 }
