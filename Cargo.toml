@@ -2,7 +2,7 @@
 name = "mcp-server-hub"
 version = "0.1.1"
 edition = "2021"
-description = "PM2 for MCP servers — manage, monitor, and configure your MCP servers"
+description = "PM2 for MCP servers — manage, monitor, and configure your MCP servers. Installs the mcp-hub binary."
 license = "MIT"
 repository = "https://github.com/UnityInFlow/mcp-hub"
 keywords = ["mcp", "process-manager", "ai", "developer-tools"]
