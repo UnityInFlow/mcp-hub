@@ -803,16 +803,20 @@ fn wait_for_ready(pipe: &mut std::fs::File, timeout: std::time::Duration) -> Rea
 /// Note: `nix::unistd::daemon()` is only available on Linux/FreeBSD/Solaris;
 /// this implementation works on any Unix including macOS.
 pub fn daemonize_process(log_path: &std::path::Path) -> anyhow::Result<ReadyNotifier> {
-    use nix::fcntl::OFlag;
-    use nix::unistd::{fork, pipe2, ForkResult};
+    use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+    use nix::unistd::{fork, pipe, ForkResult};
 
     // Open the log before forking: a bad path is reported on the terminal.
     let log_file = open_log_file(log_path)?;
 
     // CLOEXEC so the managed MCP servers never inherit the pipe and keep the
-    // parent waiting after the daemon is done with it.
-    let (read_fd, write_fd) =
-        pipe2(OFlag::O_CLOEXEC).map_err(|e| anyhow::anyhow!("pipe failed: {e}"))?;
+    // parent waiting after the daemon is done with it. macOS has no pipe2(),
+    // so set the flag after pipe(); no other thread exists yet to fork in between.
+    let (read_fd, write_fd) = pipe().map_err(|e| anyhow::anyhow!("pipe failed: {e}"))?;
+    for fd in [&read_fd, &write_fd] {
+        fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
+            .map_err(|e| anyhow::anyhow!("fcntl failed: {e}"))?;
+    }
 
     // First fork — parent waits for readiness, child continues.
     // SAFETY: called before Tokio runtime is created; no threads exist yet.
